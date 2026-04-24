@@ -1,0 +1,8 @@
+{
+  "api": {
+    "api_password": "这里填写你的kabu API密码",
+    "api_password_env": "KABU_API_PASSWORD",
+    "production_url": "http://localhost:18080/kabusapi",
+    "sandbox_url": "http://localhost:18081/kabusapi"
+  }
+}

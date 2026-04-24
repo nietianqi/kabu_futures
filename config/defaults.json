@@ -1,0 +1,110 @@
+{
+  "symbols": {
+    "primary": "NK225micro",
+    "filter": "TOPIXmini",
+    "deriv_month": 0,
+    "_deriv_month_note": "0 means nearest contract. Use yyyyMM such as 202606 to force the June 2026 contract.",
+    "rollover_business_days_before_last_trade": 3
+  },
+  "minute_engine": {
+    "orb_minutes": 5,
+    "atr_period": 14,
+    "risk_per_trade_pct": 0.25,
+    "stop_ticks_min": 6,
+    "stop_ticks_max": 12,
+    "stop_atr_mult": 0.8,
+    "take_profit_r": 1.5,
+    "breakeven_after_r": 1.0,
+    "max_hold_minutes": 45
+  },
+  "micro_engine": {
+    "mode": "observe_only",
+    "qty": 1,
+    "depth_levels": 5,
+    "imbalance_entry": 0.3,
+    "imbalance_exit": 0.1,
+    "microprice_entry_ticks": 0.15,
+    "spread_ticks_required": 1,
+    "take_profit_ticks": 2,
+    "stop_loss_ticks": 3,
+    "time_stop_seconds": 20,
+    "max_hold_seconds": 30,
+    "min_order_interval_seconds": 3,
+    "max_new_entries_per_minute": 6,
+    "websocket_latency_stop_ms": 500,
+    "consecutive_loss_stop": 5,
+    "avg_slippage_stop_ticks": 2
+  },
+  "nt_spread": {
+    "enabled": true,
+    "mode": "shadow",
+    "zscore_windows": [20, 60, 250],
+    "entry_zscore": 2.0,
+    "exit_zscore": 0.5,
+    "stop_expansion_sigma": 1.0,
+    "min_history": 20,
+    "risk_per_trade_pct": 0.5,
+    "max_hold_days": 15,
+    "micro225_multiplier": 10,
+    "topix_mini_multiplier": 1000,
+    "default_micro_per_topix_mini": 7
+  },
+  "lead_lag": {
+    "enabled": true,
+    "optional_external_data": true,
+    "us_open_start": "22:30",
+    "us_open_end": "00:00",
+    "morning_handoff_start": "08:45",
+    "morning_handoff_end": "09:30",
+    "min_factor_alignment": 2,
+    "event_risk_veto": true
+  },
+  "alpha_stack": {
+    "enabled": true,
+    "block_directional_when_nt_conflicts": true,
+    "reduce_directional_when_nt_active": true,
+    "external_factor_optional": true,
+    "external_factor_conflict_veto": true,
+    "max_external_score_adjustment": 10
+  },
+  "multi_timeframe": {
+    "enabled": true,
+    "regime_score_max": 30,
+    "bias_score_max": 30,
+    "setup_score_max": 25,
+    "execution_score_max": 15,
+    "min_total_score_to_trade": 70,
+    "min_execution_score_to_chase": 10,
+    "score_70_79_position_scale": "micro225_1",
+    "score_80_89_position_scale": "standard_minute_position",
+    "score_90_plus_position_scale": "extend_target_only",
+    "hard_veto_extreme_higher_timeframe_reversal": true,
+    "hard_veto_daily_extreme_volatility": true,
+    "hard_veto_hourly_minute_strong_conflict": true,
+    "hard_veto_book_latency_or_depth_failure": true
+  },
+  "risk": {
+    "account_daily_loss_pct": 1.0,
+    "account_daily_loss_r": 3.0,
+    "max_micro225_net_qty": 3,
+    "margin_buffer_ratio": 1.5,
+    "directional_risk_per_trade_pct_min": 0.25,
+    "directional_risk_per_trade_pct_max": 0.4,
+    "micro_risk_per_trade_pct_min": 0.05,
+    "micro_risk_per_trade_pct_max": 0.1,
+    "nt_spread_risk_pct": 0.5,
+    "max_portfolio_nikkei_beta": 0.3,
+    "night_size_scale": 0.5,
+    "event_risk_position_scale": 0.5
+  },
+  "api": {
+    "api_password": "",
+    "api_password_env": "KABU_API_PASSWORD",
+    "production_url": "http://localhost:18080/kabusapi",
+    "sandbox_url": "http://localhost:18081/kabusapi",
+    "order_requests_per_second": 5,
+    "info_requests_per_second": 10,
+    "max_registered_symbols": 50,
+    "max_active_orders_same_symbol": 5
+  }
+}
