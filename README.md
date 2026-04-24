@@ -94,6 +94,23 @@ Notes for kabu futures data:
 
 - `TradingVolume` is cumulative, so the bar builder converts it to per-bar incremental volume before computing VWAP and volume ratios.
 - kabu can occasionally emit equal best quotes such as `BidPrice == AskPrice`; the normalizer records `market_data_error` and skips those snapshots instead of reconnecting.
+- **kabu Bid/Ask reversal**: kabu PUSH board encodes `BidPrice` as the best *sell* quote and `AskPrice` as the best *buy* quote, the opposite of standard market data conventions. `KabuBoardNormalizer` corrects this mapping so that `OrderBook.best_bid_price` is always the highest buyer price and `best_ask_price` the lowest seller price. This is also documented in `OrderBook` class docstring in `models.py`.
+
+## Signal Flow
+
+```
+kabu WebSocket
+  -> KabuBoardNormalizer.normalize()
+  -> OrderBook
+  -> DualStrategyEngine.on_order_book()
+     -> BarBuilder (1-min) -> MinuteStrategyEngine.on_bar() -> Signal
+     -> BookFeatureEngine.update() -> BookFeatures
+        -> MicroStrategyEngine.evaluate_book() -> Signal
+     -> MultiTimeframeScorer.score() -> MultiTimeframeScore
+     -> StrategyArbiter (NT-spread + lead-lag veto) -> StrategyIntent
+     -> RiskManager / OrderThrottle -> allow / reject
+     -> [Signal list] -> PaperExecutionController.on_signal()
+```
 
 ## kabu API Token And Symbol Register
 

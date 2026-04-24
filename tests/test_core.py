@@ -18,7 +18,7 @@ from kabu_futures.alpha import (
     compute_micro225_per_topix_mini,
 )
 from kabu_futures.api import build_future_registration_symbols, extract_symbol_code
-from kabu_futures.config import default_config
+from kabu_futures.config import default_config, load_json_config
 from kabu_futures.engine import DualStrategyEngine
 from kabu_futures.indicators import BarBuilder
 from kabu_futures.live import _should_print_tick, tick_to_dict, signal_to_dict
@@ -56,6 +56,27 @@ def book(ts: datetime, bid_qty: float = 100, ask_qty: float = 50, bid: float = 5
         buy_levels=(Level(bid, bid_qty), Level(bid - 5, 80), Level(bid - 10, 60)),
         sell_levels=(Level(ask, ask_qty), Level(ask + 5, 40), Level(ask + 10, 30)),
     )
+
+
+class ConfigTests(unittest.TestCase):
+    def test_load_json_config_validates_inconsistent_micro_thresholds(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = pathlib.Path(temp_dir) / "bad_config.json"
+            path.write_text(
+                '{"micro_engine":{"imbalance_entry":0.1,"imbalance_exit":0.2}}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "imbalance_entry"):
+                load_json_config(path)
+
+    def test_dual_strategy_engine_validates_manual_config(self) -> None:
+        base_cfg = default_config()
+        bad_cfg = replace(
+            base_cfg,
+            micro_engine=replace(base_cfg.micro_engine, imbalance_entry=0.1, imbalance_exit=0.2),
+        )
+        with self.assertRaisesRegex(ValueError, "imbalance_entry"):
+            DualStrategyEngine(bad_cfg)
 
 
 class MicrostructureTests(unittest.TestCase):
@@ -363,7 +384,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
             recorder.write_book(book(datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)))
             recorder.write("heartbeat", {"books": 1})
             recorder.close()
-            books = read_recorded_books(path)
+            books = list(read_recorded_books(path))
             self.assertEqual(len(books), 1)
             self.assertEqual(books[0].symbol, "NK225micro")
 
@@ -592,7 +613,10 @@ class MultiTimeframeTests(unittest.TestCase):
             engine.on_order_book(book(event_ts, bid_qty=100, ask_qty=100), now=event_ts)
         final_ts = ts + timedelta(milliseconds=450)
         signals = engine.on_order_book(book(final_ts, bid_qty=300, ask_qty=20), now=final_ts)
-        self.assertTrue(any(signal.engine == "risk" and signal.reason == "execution_score_below_threshold" for signal in signals))
+        risk_signals = [signal for signal in signals if signal.engine == "risk" and signal.reason == "execution_score_below_threshold"]
+        self.assertEqual(len(risk_signals), 1)
+        self.assertEqual(risk_signals[0].score, 0)
+        self.assertEqual(risk_signals[0].signal_horizon, "system")
 
 
 class AlphaStackTests(unittest.TestCase):

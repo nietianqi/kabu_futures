@@ -4,6 +4,7 @@ from collections import Counter
 
 from .config import MultiTimeframeConfig
 from .models import BookFeatures, Direction, MultiTimeframeScore, MultiTimeframeSnapshot, Signal
+from .utils import opposite
 
 
 def _clamp_score(value: int, maximum: int) -> int:
@@ -25,10 +26,6 @@ def _majority_direction(directions: list[Direction]) -> Direction:
     if len(most_common) > 1 and most_common[0][1] == most_common[1][1]:
         return "flat"
     return most_common[0][0]
-
-
-def _opposite(left: Direction, right: Direction) -> bool:
-    return (left == "long" and right == "short") or (left == "short" and right == "long")
 
 
 class MultiTimeframeScorer:
@@ -70,9 +67,9 @@ class MultiTimeframeScorer:
         if signal_direction == "flat":
             return 15
         aligned = sum(1 for direction in long_terms if direction == signal_direction)
-        opposite = sum(1 for direction in long_terms if _opposite(direction, signal_direction))
+        conflicting = sum(1 for direction in long_terms if opposite(direction, signal_direction))
         neutral = sum(1 for direction in long_terms if direction == "flat")
-        return _clamp_score(12 + aligned * 5 + neutral * 2 - opposite * 6, self.config.regime_score_max)
+        return _clamp_score(12 + aligned * 5 + neutral * 2 - conflicting * 6, self.config.regime_score_max)
 
     def _bias_score(self, snapshot: MultiTimeframeSnapshot, signal_direction: Direction) -> tuple[int, Direction]:
         bias = _majority_direction([snapshot.daily_trend, snapshot.hourly_trend])
@@ -81,11 +78,11 @@ class MultiTimeframeScorer:
         score = 15
         if snapshot.daily_trend == signal_direction:
             score += 8
-        elif _opposite(snapshot.daily_trend, signal_direction):
+        elif opposite(snapshot.daily_trend, signal_direction):
             score -= 10
         if snapshot.hourly_trend == signal_direction:
             score += 10
-        elif _opposite(snapshot.hourly_trend, signal_direction):
+        elif opposite(snapshot.hourly_trend, signal_direction):
             score -= 12
         return _clamp_score(score, self.config.bias_score_max), bias
 
@@ -96,7 +93,7 @@ class MultiTimeframeScorer:
         close_location = _metadata_float(minute_signal, "close_location", 0.5)
         volume_ratio = _metadata_float(minute_signal, "volume_ratio", 1.0)
         if minute_signal.engine == "minute_orb":
-            return min(self.config.setup_score_max, int(round(17 + quality * 8 + max(0.0, volume_ratio - 1.0) * 2)))
+            return min(self.config.setup_score_max, int(round(17 + quality * 8 + max(0.0, volume_ratio - 1.0) * 2)))  # *2: excess volume above 1x adds up to 2 bonus points (capped by setup_score_max)
         if minute_signal.engine == "minute_vwap":
             return min(self.config.setup_score_max, int(round(15 + quality * 8 + abs(close_location - 0.5) * 3)))
         if minute_signal.engine == "directional_intraday":
@@ -134,7 +131,7 @@ class MultiTimeframeScorer:
             self.config.hard_veto_hourly_minute_strong_conflict
             and minute_signal is not None
             and snapshot.hourly_trend != "flat"
-            and _opposite(snapshot.hourly_trend, minute_signal.direction)
+            and opposite(snapshot.hourly_trend, minute_signal.direction)
             and minute_signal.confidence >= 0.65
         ):
             return "hourly_minute_strong_conflict"
@@ -146,7 +143,7 @@ class MultiTimeframeScorer:
             return "book_latency_or_depth_failure"
         if signal_direction != "flat":
             long_term_bias = _majority_direction([snapshot.yearly_trend, snapshot.monthly_trend, snapshot.weekly_trend])
-            if long_term_bias != "flat" and _opposite(long_term_bias, signal_direction):
+            if long_term_bias != "flat" and opposite(long_term_bias, signal_direction):
                 return "higher_timeframe_opposite_bias"
         return None
 

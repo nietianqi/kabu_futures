@@ -2,20 +2,23 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .config import load_json_config, default_config
 from .engine import DualStrategyEngine
 from .models import Level, OrderBook
 from .paper_execution import PaperExecutionController, TradeMode
 
+_log = logging.getLogger(__name__)
+
 
 def parse_book(row: dict[str, Any]) -> OrderBook:
     buy_levels = tuple(Level(float(item["price"]), float(item["qty"])) for item in row.get("buy_levels", []))
     sell_levels = tuple(Level(float(item["price"]), float(item["qty"])) for item in row.get("sell_levels", []))
     received_at = row.get("received_at")
-    return OrderBook(
+    book = OrderBook(
         symbol=str(row["symbol"]),
         timestamp=datetime.fromisoformat(str(row["timestamp"])),
         best_bid_price=float(row["best_bid_price"]),
@@ -29,6 +32,8 @@ def parse_book(row: dict[str, Any]) -> OrderBook:
         received_at=datetime.fromisoformat(str(received_at)) if received_at else None,
         raw_symbol=str(row["raw_symbol"]) if row.get("raw_symbol") else None,
     )
+    book.validate()
+    return book
 
 
 def replay_jsonl(
@@ -63,17 +68,22 @@ def replay_jsonl(
     return emitted
 
 
-def read_recorded_books(path: str | Path) -> list[OrderBook]:
-    books: list[OrderBook] = []
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
-        if not line.strip():
+def read_recorded_books(path: str | Path) -> Iterator[OrderBook]:
+    """Yield OrderBook objects from a JSONL file line by line (no full-file load)."""
+    for line in Path(path).open(encoding="utf-8"):
+        line = line.strip()
+        if not line:
             continue
-        row = json.loads(line)
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            _log.warning("Skipping malformed JSONL line: %s", exc)
+            continue
         kind = row.get("kind")
-        if kind == "book":
-            payload = row["payload"]
-            payload["timestamp"] = payload["timestamp"]
-            books.append(parse_book(payload))
-        elif kind is None:
-            books.append(parse_book(row))
-    return books
+        try:
+            if kind == "book":
+                yield parse_book(row["payload"])
+            elif kind is None:
+                yield parse_book(row)
+        except (ValueError, KeyError) as exc:
+            _log.warning("Skipping invalid book record: %s", exc)

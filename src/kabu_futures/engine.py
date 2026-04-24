@@ -27,8 +27,11 @@ from .strategies import MicroStrategyEngine, MinuteStrategyEngine
 
 
 class DualStrategyEngine:
+    """Orchestrates minute-bar, micro-book, NT-spread, and lead-lag engines into a unified signal pipeline."""
+
     def __init__(self, config: StrategyConfig | None = None) -> None:
         self.config = config or default_config()
+        self.config.validate()
         self.minute_engine = MinuteStrategyEngine(
             self.config.minute_engine,
             self.config.symbols,
@@ -89,7 +92,7 @@ class DualStrategyEngine:
                 if allowed:
                     signals.append(scored_minute_signal)
                 else:
-                    signals.append(Signal("risk", minute_signal.symbol, "flat", 0.0, reason=reason, metadata=scored_minute_signal.metadata))
+                    signals.append(Signal("risk", minute_signal.symbol, "flat", 0.0, reason=reason, score=0, signal_horizon="system", metadata=scored_minute_signal.metadata))
 
         if book.symbol == self.config.symbols.primary:
             micro_signal, micro_evaluation = self.micro_engine.evaluate_book(
@@ -153,7 +156,18 @@ class DualStrategyEngine:
                         else intent.veto_reason or intent.reason
                     )
                     evaluation_metadata["reject_stage"] = reject_stage
-                    signals.append(Signal("risk", book.symbol, "flat", 0.0, reason=reason, metadata=scored_micro_signal.metadata))
+                    signals.append(
+                        Signal(
+                            "risk",
+                            book.symbol,
+                            "flat",
+                            0.0,
+                            reason=reason,
+                            score=0,
+                            signal_horizon="system",
+                            metadata=scored_micro_signal.metadata,
+                        )
+                    )
                     self.latest_signal_evaluations[-1] = replace(
                         micro_evaluation,
                         decision="reject",

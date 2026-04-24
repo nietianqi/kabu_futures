@@ -43,6 +43,8 @@ def session_key(ts: datetime) -> str:
 
 
 class MinuteStrategyEngine:
+    """Minute-bar ORB, VWAP-pullback, and trend-continuation signal generator."""
+
     def __init__(self, config: MinuteEngineConfig, symbols: SymbolsConfig, tick_size: float = 5.0) -> None:
         self.config = config
         self.symbols = symbols
@@ -109,13 +111,13 @@ class MinuteStrategyEngine:
         topix_long = self._topix_allows("long")
         topix_short = self._topix_allows("short")
         quality_long = (
-            close_location >= 0.65
-            and range_ratio >= 1.10
-            and volume_ratio >= 1.00
+            close_location >= 0.65  # bar closed in top 35%, showing bullish conviction
+            and range_ratio >= 1.10  # breakout bar at least 10% wider than average range
+            and volume_ratio >= 1.00  # at least average volume to validate the move
             and trend_bias == "long"
         )
         quality_short = (
-            close_location <= 0.35
+            close_location <= 0.35  # bar closed in bottom 35%, showing bearish conviction
             and range_ratio >= 1.10
             and volume_ratio >= 1.00
             and trend_bias == "short"
@@ -320,6 +322,8 @@ class MinuteStrategyEngine:
 
 
 class MicroStrategyEngine:
+    """Tick-level order-book imbalance and OFI scalping signal generator."""
+
     def __init__(self, config: MicroEngineConfig, tick_size: float = 5.0) -> None:
         self.config = config
         self.features = BookFeatureEngine(config, tick_size=tick_size)

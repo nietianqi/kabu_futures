@@ -18,10 +18,7 @@ from .models import (
     SignalHorizon,
     StrategyIntent,
 )
-
-
-def opposite(left: Direction, right: Direction) -> bool:
-    return (left == "long" and right == "short") or (left == "short" and right == "long")
+from .utils import opposite
 
 
 def zscore(values: list[float] | tuple[float, ...], window: int) -> float | None:
@@ -89,6 +86,7 @@ class NTRatioSpreadEngine:
 
     def __init__(self, config: NTSpreadConfig) -> None:
         self.config = config
+        # Default windows: 20 ~= 1 month, 60 ~= 1 quarter, 250 ~= 1 year.
         self.ratios: deque[float] = deque(maxlen=max(config.zscore_windows))
         self.last_signal: AlphaSignal | None = None
 

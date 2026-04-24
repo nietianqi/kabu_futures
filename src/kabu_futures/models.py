@@ -23,15 +23,24 @@ SignalHorizon = Literal["micro", "intraday", "swing", "event_filter", "system"]
 StrategyAction = Literal["allow", "reject", "observe_only", "flatten_only"]
 SignalDecision = Literal["allow", "reject"]
 
-
 @dataclass(frozen=True)
 class Level:
+    """Single price level in an order book depth snapshot."""
+
     price: float
     qty: float
 
 
 @dataclass(frozen=True)
 class OrderBook:
+    """Normalised order book snapshot from kabu PUSH board data.
+
+    Note: kabu encodes the best *sell* quote as BidPrice and best *buy* quote as AskPrice,
+    which is the reverse of typical market data conventions. KabuBoardNormalizer corrects
+    this so best_bid_price is always the highest buyer price and best_ask_price the lowest
+    seller price.
+    """
+
     symbol: str
     timestamp: datetime
     best_bid_price: float
@@ -62,6 +71,8 @@ class OrderBook:
 
 @dataclass(frozen=True)
 class Bar:
+    """Completed OHLCV bar aggregated from tick data by BarBuilder."""
+
     symbol: str
     start: datetime
     end: datetime
@@ -82,6 +93,8 @@ class Bar:
 
 @dataclass(frozen=True)
 class Signal:
+    """Tradeable or informational signal emitted by a strategy engine."""
+
     engine: EngineName
     symbol: str
     direction: Direction
@@ -122,6 +135,8 @@ class SignalEvaluation:
 
 @dataclass(frozen=True)
 class BookFeatures:
+    """Derived microstructure features computed from a single OrderBook snapshot."""
+
     timestamp: datetime
     symbol: str
     spread_ticks: float
@@ -320,6 +335,8 @@ class TradeTick:
 
 @dataclass
 class PositionState:
+    """Mutable tracker for a single instrument's open position."""
+
     symbol: str
     direction: Direction = "flat"
     qty: int = 0

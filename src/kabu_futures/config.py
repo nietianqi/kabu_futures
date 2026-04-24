@@ -145,9 +145,28 @@ class StrategyConfig:
     tick_size: float = 5.0
     micro225_tick_value: float = 50.0
 
+    def validate(self) -> None:
+        """Raise ValueError if parameter combinations are inconsistent."""
+        m = self.micro_engine
+        if m.imbalance_entry <= m.imbalance_exit:
+            raise ValueError(
+                f"imbalance_entry ({m.imbalance_entry}) must be greater than imbalance_exit ({m.imbalance_exit})"
+            )
+        if m.stop_loss_ticks <= 0:
+            raise ValueError(f"stop_loss_ticks must be positive, got {m.stop_loss_ticks}")
+        if m.take_profit_ticks <= 0:
+            raise ValueError(f"take_profit_ticks must be positive, got {m.take_profit_ticks}")
+        if self.tick_size <= 0:
+            raise ValueError(f"tick_size must be positive, got {self.tick_size}")
+        windows = self.nt_spread.zscore_windows
+        if len(windows) < 1 or any(w <= 0 for w in windows):
+            raise ValueError(f"nt_spread.zscore_windows must be positive integers, got {windows}")
+
 
 def default_config() -> StrategyConfig:
-    return StrategyConfig()
+    config = StrategyConfig()
+    config.validate()
+    return config
 
 
 def _merge_dataclass(cls: type, values: dict[str, Any]) -> Any:
@@ -157,7 +176,7 @@ def _merge_dataclass(cls: type, values: dict[str, Any]) -> Any:
 
 def load_json_config(path: str | Path) -> StrategyConfig:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    return StrategyConfig(
+    config = StrategyConfig(
         symbols=_merge_dataclass(SymbolsConfig, data.get("symbols", {})),
         minute_engine=_merge_dataclass(MinuteEngineConfig, data.get("minute_engine", {})),
         micro_engine=_merge_dataclass(MicroEngineConfig, data.get("micro_engine", {})),
@@ -168,3 +187,5 @@ def load_json_config(path: str | Path) -> StrategyConfig:
         risk=_merge_dataclass(RiskConfig, data.get("risk", {})),
         api=_merge_dataclass(ApiConfig, data.get("api", {})),
     )
+    config.validate()
+    return config
