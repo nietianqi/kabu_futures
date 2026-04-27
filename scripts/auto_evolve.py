@@ -1,14 +1,14 @@
-"""auto_evolve.py — Single-command AI evolution pipeline.
+"""auto_evolve.py -- Single-command AI evolution pipeline.
 
 Runs the complete evolution loop in one shot:
-    1. analyze  → signal attribution + paper PnL
-    2. tune     → imbalance grid search
-    3. walk_forward → rolling train/test validation
-    4. promote  → champion/challenger gate decision
+    1. analyze      -> signal attribution + paper PnL
+    2. tune         -> imbalance grid search
+    3. walk_forward -> rolling train/test validation
+    4. promote      -> champion/challenger gate decision
 
-All outputs are written to ``--output-dir`` (default: reports/).
-The script never modifies live config; it only produces JSON reports and
-a final decision file.
+All outputs are written to --output-dir (default: reports/).
+The script never modifies live config; it only produces JSON reports
+and a final decision file.
 
 Usage::
 
@@ -16,10 +16,10 @@ Usage::
     python scripts/auto_evolve.py logs/ --train-size 2 --output-dir reports/
 
 Exit codes:
-    0 → promote (stable candidate found; review decision_YYYYMMDD.json)
-    1 → hold    (borderline; accumulate more data)
-    2 → reject  (no stable candidate or gates failed)
-    3 → no_data (insufficient days to run walk_forward)
+    0 -> promote  (stable candidate found; review decision_YYYYMMDD.json)
+    1 -> hold     (borderline; accumulate more data)
+    2 -> reject   (no stable candidate or gates failed)
+    3 -> no_data  (insufficient days to run walk_forward)
 """
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="auto_evolve.py",
         description=(
-            "End-to-end AI evolution pipeline: analyze → tune → walk_forward → promote. "
+            "End-to-end AI evolution pipeline: analyze -> tune -> walk_forward -> promote. "
             "Report-only; never rewrites live config."
         ),
     )
@@ -54,8 +54,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSONL log file, or directory of JSONL files (one per trading session).",
     )
     parser.add_argument("--config", default=str(ROOT / "config" / "local.json"))
-    parser.add_argument("--champion", default=str(ROOT / "reports" / "champion.json"),
-                        help="Champion metrics JSON. Skipped if file does not exist.")
+    parser.add_argument(
+        "--champion",
+        default=str(ROOT / "reports" / "champion.json"),
+        help="Champion metrics JSON. Skipped if file does not exist.",
+    )
     parser.add_argument("--train-size", type=int, default=1)
     parser.add_argument("--test-size", type=int, default=1)
     parser.add_argument("--step", type=int, default=1)
@@ -88,7 +91,10 @@ def _float_tuple(value: str) -> tuple[float, ...]:
 
 def _write(path: Path, data: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2, default=str) + "\n",
+        encoding="utf-8",
+    )
 
 
 def main() -> int:
@@ -104,25 +110,25 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Step 1: Analyze
     # ------------------------------------------------------------------
-    print("=== [1/4] 分析日志 ===")
+    print("=== [1/4] Analyze logs ===")
     baseline_report = analyze_micro_log(args.path, config, max_books=args.max_books)
     analyze_out = out / f"analyze_{today}.json"
     _write(analyze_out, baseline_report)
     signals_total = baseline_report["signals"]["total"]
     paper_trades = baseline_report["paper"]["trades"]
     print(f"  books={baseline_report['books']}  signals={signals_total}  paper_trades={paper_trades}")
-    print(f"  → {analyze_out}")
+    print(f"  -> {analyze_out}")
 
     # ------------------------------------------------------------------
     # Step 2: Check available days
     # ------------------------------------------------------------------
-    print("=== [2/4] 检查日志天数 ===")
+    print("=== [2/4] Check available days ===")
     grouped = split_books_by_day(args.path)
     days = sorted(grouped.keys())
-    print(f"  可用天数: {len(days)} ({', '.join(days) or 'none'})")
+    print(f"  available days: {len(days)} ({', '.join(days) or 'none'})")
 
     if len(days) < args.min_days:
-        print(f"  天数不足（需要 ≥ {args.min_days} 天），跳过 walk_forward。")
+        print(f"  insufficient days (need >= {args.min_days}), skipping walk_forward.")
         decision_data = {
             "decision": "no_data",
             "reason": f"only {len(days)} days available, need {args.min_days}",
@@ -130,13 +136,13 @@ def main() -> int:
             "days": days,
         }
         _write(out / f"decision_{today}.json", decision_data)
-        print(f"  → {out / f'decision_{today}.json'}")
+        print(f"  -> {out / f'decision_{today}.json'}")
         return 3
 
     # ------------------------------------------------------------------
     # Step 3: Tune (+ optional regime-aware tuning)
     # ------------------------------------------------------------------
-    print("=== [3/4] 参数调优 ===")
+    print("=== [3/4] Parameter grid search ===")
     tune_report = tune_micro_params(
         args.path,
         config,
@@ -149,42 +155,45 @@ def main() -> int:
     best = tune_report.get("best")
     decision_flag = tune_report.get("decision", "no_change")
     print(f"  decision={decision_flag}  best={best['parameters'] if best else None}")
-    print(f"  → {tune_out}")
+    print(f"  -> {tune_out}")
 
     # Optional: regime-aware tuning
     if args.regime:
         try:
             from kabu_futures.regime import split_books_by_regime
             from kabu_futures.walk_forward import _iter_books_from_source
+            from kabu_futures.tuning import evaluate_micro_config, _rank_key
+            from dataclasses import replace
+
             all_books = list(_iter_books_from_source(args.path))
             regime_books = split_books_by_regime(all_books)
             for regime_name, r_books in regime_books.items():
                 if regime_name == "warmup" or len(r_books) < 500:
                     continue
-                from kabu_futures.tuning import evaluate_micro_config, _rank_key
-                from dataclasses import replace
                 r_candidates: list[dict] = []
                 for imbalance in imbalance_grid:
                     params = {"imbalance_entry": float(imbalance)}
                     try:
-                        r_cfg = replace(config, micro_engine=replace(config.micro_engine, imbalance_entry=float(imbalance)))
+                        r_cfg = replace(
+                            config,
+                            micro_engine=replace(config.micro_engine, imbalance_entry=float(imbalance)),
+                        )
                         r_cfg.validate()
                     except ValueError:
                         continue
                     r_candidates.append(evaluate_micro_config(r_books, r_cfg, params))
                 ranked = sorted(r_candidates, key=_rank_key, reverse=True)
-                regime_report = {"regime": regime_name, "books": len(r_books), "candidates": ranked}
                 regime_out = out / f"tune_{regime_name}_{today}.json"
-                _write(regime_out, regime_report)
+                _write(regime_out, {"regime": regime_name, "books": len(r_books), "candidates": ranked})
                 best_r = ranked[0] if ranked else None
-                print(f"  [{regime_name}] books={len(r_books)}  best={best_r['parameters'] if best_r else None}  → {regime_out}")
+                print(f"  [{regime_name}] books={len(r_books)}  best={best_r['parameters'] if best_r else None}  -> {regime_out}")
         except Exception as exc:
             print(f"  [warning] regime tuning error: {exc}", file=sys.stderr)
 
     # ------------------------------------------------------------------
     # Step 4: Walk-forward
     # ------------------------------------------------------------------
-    print("=== [4/4] Walk-forward 验证 ===")
+    print("=== [4/4] Walk-forward validation ===")
     wf_report = walk_forward_micro(
         args.path,
         config,
@@ -200,7 +209,7 @@ def main() -> int:
     s = wf_report["summary"]
     print(f"  windows={s['windows']}  pass_rate={s['pass_rate']:.0%}  stable={s['stable']}")
     print(f"  baseline_trades={s['total_baseline_test_trades']}  candidate_trades={s['total_candidate_test_trades']}")
-    print(f"  → {wf_out}")
+    print(f"  -> {wf_out}")
 
     # ------------------------------------------------------------------
     # Step 5: Promotion check
@@ -227,12 +236,12 @@ def main() -> int:
     _write(decision_out, promotion.to_dict())
 
     print(f"\n{'='*50}")
-    print(f"  最终决策: {promotion.decision.upper()}")
-    print(f"  通过门槛: {promotion.passed_gates}")
-    print(f"  失败门槛: {promotion.failed_gates}")
+    print(f"  DECISION: {promotion.decision.upper()}")
+    print(f"  passed:   {promotion.passed_gates}")
+    print(f"  failed:   {promotion.failed_gates}")
     if promotion.veto_reasons:
-        print(f"  Veto: {promotion.veto_reasons}")
-    print(f"  → {decision_out}")
+        print(f"  veto:     {promotion.veto_reasons}")
+    print(f"  -> {decision_out}")
     print(f"{'='*50}")
 
     exit_codes = {"promote": 0, "hold": 1, "reject": 2, "no_data": 3}

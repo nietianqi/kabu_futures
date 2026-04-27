@@ -4,7 +4,7 @@ from collections import Counter
 from dataclasses import replace
 from itertools import product
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 from .config import StrategyConfig
 from .engine import DualStrategyEngine
@@ -13,12 +13,22 @@ from .paper_execution import ExecutionEvent, PaperExecutionController, PaperFill
 from .replay import read_recorded_books
 
 
+def _iter_books(source: str | Path) -> Iterator[OrderBook]:
+    """Yield books from a single JSONL file or a directory of JSONL files."""
+    p = Path(source)
+    if p.is_dir():
+        for jsonl_file in sorted(p.glob("*.jsonl")):
+            yield from read_recorded_books(jsonl_file)
+    else:
+        yield from read_recorded_books(p)
+
+
 DEFAULT_IMBALANCE_GRID = (0.18, 0.20, 0.22, 0.25, 0.30)
 
 
 def load_books(path: str | Path, max_books: int | None = None) -> list[OrderBook]:
     books: list[OrderBook] = []
-    for book in read_recorded_books(path):
+    for book in _iter_books(path):
         books.append(book)
         if max_books is not None and len(books) >= max_books:
             break

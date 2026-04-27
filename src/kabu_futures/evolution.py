@@ -11,6 +11,17 @@ from .engine import DualStrategyEngine
 from .models import Direction, OrderBook
 from .paper_execution import ExecutionEvent, PaperExecutionController, PaperFillModel
 from .replay import read_recorded_books
+from typing import Iterator
+
+
+def _iter_books(source: str | Path) -> Iterator[OrderBook]:
+    """Yield books from a single JSONL file or a directory of JSONL files."""
+    p = Path(source)
+    if p.is_dir():
+        for jsonl_file in sorted(p.glob("*.jsonl")):
+            yield from read_recorded_books(jsonl_file)
+    else:
+        yield from read_recorded_books(p)
 
 
 DEFAULT_MARKOUT_SECONDS = (0.5, 1.0, 3.0, 5.0, 30.0, 60.0)
@@ -64,7 +75,7 @@ def analyze_micro_log(
     exits: list[ExecutionEvent] = []
     entries = 0
 
-    for book in read_recorded_books(path):
+    for book in _iter_books(path):
         books += 1
         event_time = _event_time(book)
         _update_pending_markouts(book, pending_markouts, markout_values, markout_by_reason, config.tick_size)
