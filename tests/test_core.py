@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 import pathlib
 import sys
 import unittest
+import warnings
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from dataclasses import replace
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from kabu_futures.alpha import (
     NTRatioSpreadEngine,
@@ -21,9 +23,9 @@ from kabu_futures.api import build_future_registration_symbols, extract_symbol_c
 from kabu_futures.config import default_config, load_json_config
 from kabu_futures.engine import DualStrategyEngine
 from kabu_futures.indicators import BarBuilder
-from kabu_futures.live import _should_print_tick, tick_to_dict, signal_to_dict
+from kabu_futures.live import SignalEvaluationLogger, _should_print_tick, tick_to_dict, signal_to_dict
 from kabu_futures.microstructure import BookFeatureEngine, RollingPercentile, microprice, percentile, weighted_imbalance
-from kabu_futures.marketdata import BufferedJsonlMarketRecorder, KabuBoardNormalizer, MarketDataError, signal_evaluation_to_dict
+from kabu_futures.marketdata import BufferedJsonlMarketRecorder, KabuBoardNormalizer, MarketDataError, MarketDataSkip, signal_evaluation_to_dict
 from kabu_futures.models import (
     AlphaSignal,
     Bar,
@@ -38,11 +40,20 @@ from kabu_futures.models import (
 )
 from kabu_futures.multitimeframe import MultiTimeframeScorer
 from kabu_futures.execution import MicroTradeManager
+from kabu_futures.evolution import analyze_micro_log, calculate_markout_ticks
 from kabu_futures.orders import KabuFutureOrderBuilder
 from kabu_futures.paper_execution import PaperExecutionController
 from kabu_futures.replay import read_recorded_books, replay_jsonl
 from kabu_futures.risk import OrderThrottle
 from kabu_futures.strategies import MicroStrategyEngine, MinuteStrategyEngine
+from kabu_futures.tuning import evaluate_micro_config, evaluate_strategy_config, tune_micro_params, write_challenger_micro_engine
+from kabu_futures.promotion import (
+    PromotionThresholds,
+    decision_to_dict,
+    evaluate_challenger,
+)
+from kabu_futures.regime import RegimeClassifier
+from kabu_futures.walk_forward import make_windows, walk_forward_micro
 
 
 def book(ts: datetime, bid_qty: float = 100, ask_qty: float = 50, bid: float = 50000, ask: float = 50005) -> OrderBook:
@@ -324,6 +335,20 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         with self.assertRaises(MarketDataError):
             KabuBoardNormalizer().normalize(payload)
 
+    def test_kabu_normalizer_skips_locked_quote_without_market_data_error(self) -> None:
+        payload = {
+            "Symbol": "NK225micro",
+            "BidPrice": 50000,
+            "BidQty": 10,
+            "AskPrice": 50000,
+            "AskQty": 20,
+            "CurrentPriceTime": "2026-04-23T09:00:00+09:00",
+        }
+        with self.assertRaises(MarketDataSkip) as ctx:
+            KabuBoardNormalizer().normalize(payload)
+        self.assertEqual(ctx.exception.reason, "locked_quote")
+        self.assertEqual(ctx.exception.metadata["raw_bid_price"], 50000)
+
     def test_live_signal_serialization_keeps_metadata(self) -> None:
         signal = Signal("risk", "NK225micro", "flat", 0.0, reason="market_data_error", metadata={"raw": "bad"})
         serialized = signal_to_dict(signal)
@@ -344,6 +369,57 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertEqual(serialized["reason"], "imbalance_not_met")
         self.assertEqual(serialized["candidate_direction"], "long")
         self.assertEqual(serialized["metadata"]["spread_ok"], True)
+
+    def test_signal_eval_summary_aggregates_consecutive_rejects(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "market.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            logger = SignalEvaluationLogger(recorder, "summary")
+            ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+            logger.write(SignalEvaluation("micro_book", "NK225micro", ts, "reject", "imbalance_not_met", "long", {"imbalance": 0.1}))
+            logger.write(
+                SignalEvaluation(
+                    "micro_book",
+                    "NK225micro",
+                    ts + timedelta(seconds=1),
+                    "reject",
+                    "imbalance_not_met",
+                    "long",
+                    {"imbalance": 0.2},
+                )
+            )
+            logger.flush()
+            recorder.close()
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["kind"], "signal_eval_summary")
+            self.assertEqual(rows[0]["payload"]["count"], 2)
+            self.assertEqual(rows[0]["payload"]["reason"], "imbalance_not_met")
+            self.assertEqual(rows[0]["payload"]["last_metadata"]["imbalance"], 0.2)
+
+    def test_signal_eval_summary_preserves_allow_events(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "market.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            logger = SignalEvaluationLogger(recorder, "summary")
+            ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+            logger.write(SignalEvaluation("micro_book", "NK225micro", ts, "reject", "imbalance_not_met", "long", {}))
+            logger.write(
+                SignalEvaluation(
+                    "micro_book",
+                    "NK225micro",
+                    ts + timedelta(seconds=1),
+                    "allow",
+                    "micro_book_long",
+                    "long",
+                    {"imbalance": 0.6},
+                )
+            )
+            recorder.close()
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([row["kind"] for row in rows], ["signal_eval_summary", "signal_eval"])
+            self.assertEqual(rows[1]["payload"]["decision"], "allow")
+            self.assertEqual(rows[1]["payload"]["reason"], "micro_book_long")
 
     def test_tick_console_payload_contains_prices(self) -> None:
         b = book(datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc), bid=50000, ask=50005)
@@ -388,6 +464,18 @@ class MarketDataAndExecutionTests(unittest.TestCase):
             self.assertEqual(len(books), 1)
             self.assertEqual(books[0].symbol, "NK225micro")
 
+    def test_read_recorded_books_closes_file_without_resource_warning(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "market.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            recorder.write_book(book(datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)))
+            recorder.close()
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ResourceWarning)
+                books = list(read_recorded_books(path))
+            self.assertEqual(len(books), 1)
+            self.assertFalse([warning for warning in caught if issubclass(warning.category, ResourceWarning)])
+
     def test_replay_jsonl_accepts_buffered_live_log_format(self) -> None:
         with TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "market.jsonl"
@@ -399,6 +487,149 @@ class MarketDataAndExecutionTests(unittest.TestCase):
             events = replay_jsonl(path, trade_mode="paper")
             self.assertEqual(events[-1]["event"], "paper_summary")
             self.assertEqual(events[-1]["paper_trades"], 0)
+
+    def test_tune_micro_params_reports_no_change_when_sample_is_too_small(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "market.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            recorder.write_book(book(datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)))
+            recorder.close()
+            cfg = default_config()
+            report = tune_micro_params(
+                path,
+                cfg,
+                grid={
+                    "imbalance_entry": (0.22,),
+                    "microprice_entry_ticks": (cfg.micro_engine.microprice_entry_ticks,),
+                    "take_profit_ticks": (cfg.micro_engine.take_profit_ticks,),
+                    "stop_loss_ticks": (cfg.micro_engine.stop_loss_ticks,),
+                },
+                min_trades=1,
+                top_n=3,
+            )
+            self.assertEqual(report["decision"], "no_change")
+            self.assertEqual(report["books"], 1)
+            self.assertEqual(report["parameter_trials"], 1)
+            self.assertIn("baseline", report)
+
+    def test_write_challenger_micro_engine_only_writes_recommended_payload(self) -> None:
+        with TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "challenger.json"
+            self.assertFalse(write_challenger_micro_engine({"decision": "no_change"}, output))
+            self.assertFalse(output.exists())
+            report = {
+                "decision": "recommended",
+                "recommended": {
+                    "parameters": {
+                        "imbalance_entry": 0.26,
+                        "microprice_entry_ticks": 0.10,
+                        "take_profit_ticks": 2,
+                        "stop_loss_ticks": 3,
+                    }
+                },
+            }
+            self.assertTrue(write_challenger_micro_engine(report, output))
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(sorted(payload.keys()), ["micro_engine"])
+            self.assertEqual(payload["micro_engine"]["imbalance_entry"], 0.26)
+
+    def test_calculate_markout_ticks_handles_long_and_short(self) -> None:
+        self.assertEqual(calculate_markout_ticks("long", 50005, 50015, 5), 2.0)
+        self.assertEqual(calculate_markout_ticks("short", 50005, 49995, 5), 2.0)
+        self.assertEqual(calculate_markout_ticks("flat", 50005, 50015, 5), 0.0)
+
+    def test_analyze_micro_log_reports_trade_stats_and_markout(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "market.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=20, flush_interval_seconds=60.0)
+            ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+            for idx in range(4):
+                recorder.write_book(book(ts + timedelta(milliseconds=100 * idx), bid_qty=101, ask_qty=99))
+            recorder.write_book(book(ts + timedelta(milliseconds=500), bid_qty=400, ask_qty=20))
+            recorder.write_book(book(ts + timedelta(seconds=1), bid=50005, ask=50010, bid_qty=400, ask_qty=20))
+            recorder.write_book(book(ts + timedelta(milliseconds=1500), bid=50010, ask=50015, bid_qty=400, ask_qty=20))
+            recorder.close()
+
+            base_cfg = default_config()
+            cfg = replace(
+                base_cfg,
+                micro_engine=replace(
+                    base_cfg.micro_engine,
+                    imbalance_entry=0.20,
+                    microprice_entry_ticks=0.05,
+                    take_profit_ticks=1,
+                    min_order_interval_seconds=0,
+                ),
+            )
+            report = analyze_micro_log(path, cfg, markout_seconds=(0.5, 1.0))
+
+            self.assertEqual(report["books"], 7)
+            self.assertGreaterEqual(report["evaluations"]["decisions"].get("reject", 0), 1)
+            self.assertEqual(report["paper"]["trades"], 1)
+            self.assertEqual(report["paper"]["exit_reasons"]["take_profit"], 1)
+            self.assertEqual(report["paper"]["by_engine"]["micro_book"]["trades"], 1)
+            self.assertEqual(report["signals"]["by_reason"]["micro_book_long"], 1)
+            self.assertEqual(report["markout"]["entries"], 1)
+            self.assertEqual(report["markout"]["summary"]["0.5"]["count"], 1)
+            self.assertEqual(report["markout"]["by_engine"]["micro_book"]["0.5"]["count"], 1)
+            self.assertGreater(report["markout"]["summary"]["0.5"]["avg_ticks"], 0)
+            self.assertEqual(report["metrics"]["trades"], 1)
+            self.assertEqual(report["metrics"]["parameters"]["imbalance_entry"], 0.20)
+            self.assertIn("2026-04-23T09:00:00+00:00", report["hourly"])
+
+    def test_analyze_micro_log_handles_no_trades(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "market.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            recorder.write_book(book(datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc), bid_qty=100, ask_qty=100))
+            recorder.close()
+            report = analyze_micro_log(path, default_config())
+            self.assertEqual(report["books"], 1)
+            self.assertEqual(report["paper"]["trades"], 0)
+            self.assertEqual(report["markout"]["entries"], 0)
+            self.assertEqual(report["markout"]["summary"], {})
+
+    def test_analyze_micro_log_executes_minute_signal_without_non_micro_reject(self) -> None:
+        class FakeEngine:
+            def __init__(self, config: object) -> None:
+                self.latest_signal_evaluations: list[SignalEvaluation] = []
+                self.latest_book_features = None
+                self.calls = 0
+
+            def on_order_book(self, order_book: OrderBook, now: datetime | None = None) -> list[Signal]:
+                self.calls += 1
+                if self.calls == 1:
+                    return [
+                        Signal(
+                            "minute_vwap",
+                            "NK225micro",
+                            "long",
+                            0.8,
+                            50005,
+                            "trend_pullback_long",
+                            {"atr": 30.0},
+                        )
+                    ]
+                return []
+
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "market.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+            recorder.write_book(book(ts, bid=50000, ask=50005))
+            recorder.write_book(book(ts + timedelta(seconds=1), bid=50050, ask=50055))
+            recorder.close()
+            with patch("kabu_futures.evolution.DualStrategyEngine", FakeEngine):
+                report = analyze_micro_log(path, default_config(), markout_seconds=(0.5,))
+
+        self.assertEqual(report["signals"]["by_reason"]["trend_pullback_long"], 1)
+        self.assertEqual(report["paper"]["trades"], 1)
+        self.assertEqual(report["paper"]["events"]["paper_entry"], 1)
+        self.assertEqual(report["paper"]["events"]["paper_exit"], 1)
+        self.assertEqual(report["paper"]["by_engine"]["minute_vwap"]["trades"], 1)
+        self.assertEqual(report["markout"]["by_engine"]["minute_vwap"]["0.5"]["count"], 1)
+        self.assertNotIn("execution_reject", report["paper"]["events"])
+        self.assertEqual(report["paper"]["execution_reject_reasons"], {})
 
     def test_micro_trade_manager_exits_on_take_profit(self) -> None:
         cfg = default_config()
@@ -498,6 +729,93 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertEqual(events[0].event_type, "paper_exit")
         self.assertEqual(events[0].reason, "time_stop")
 
+    def test_minute_signal_creates_paper_entry(self) -> None:
+        cfg = default_config()
+        controller = PaperExecutionController(cfg, trade_mode="paper")
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        signal = Signal("minute_vwap", "NK225micro", "long", 0.8, 50005, "trend_pullback_long", {"atr": 30.0})
+        events = controller.on_signal(signal, book(ts, bid=50000, ask=50005))
+        self.assertEqual(events[0].event_type, "paper_entry")
+        self.assertEqual(events[0].metadata["engine"], "minute_vwap")
+        self.assertNotEqual(events[0].reason, "non_micro_signal")
+        heartbeat = controller.heartbeat_metadata()
+        self.assertIsNotNone(heartbeat["paper_position"])
+        self.assertIsNotNone(heartbeat["paper_minute_position"])
+
+    def test_minute_long_exits_on_take_profit_with_positive_pnl(self) -> None:
+        cfg = default_config()
+        controller = PaperExecutionController(cfg, trade_mode="paper")
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        controller.on_signal(Signal("minute_vwap", "NK225micro", "long", 0.8, 50005, "trend_pullback_long", {"atr": 30.0}), book(ts))
+        events = controller.on_book(book(ts + timedelta(minutes=1), bid=50050, ask=50055))
+        self.assertEqual(events[0].event_type, "paper_exit")
+        self.assertEqual(events[0].reason, "take_profit")
+        self.assertGreater(events[0].pnl_ticks or 0, 0)
+
+    def test_minute_long_exits_on_stop_loss_with_negative_pnl(self) -> None:
+        cfg = default_config()
+        controller = PaperExecutionController(cfg, trade_mode="paper")
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        controller.on_signal(Signal("minute_vwap", "NK225micro", "long", 0.8, 50005, "trend_pullback_long", {"atr": 30.0}), book(ts))
+        events = controller.on_book(book(ts + timedelta(minutes=1), bid=49975, ask=49980))
+        self.assertEqual(events[0].event_type, "paper_exit")
+        self.assertEqual(events[0].reason, "stop_loss")
+        self.assertLess(events[0].pnl_ticks or 0, 0)
+
+    def test_minute_position_exits_on_max_hold_minutes(self) -> None:
+        cfg = default_config()
+        controller = PaperExecutionController(cfg, trade_mode="paper")
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        controller.on_signal(Signal("directional_intraday", "NK225micro", "long", 0.8, 50005, "trend_continuation_long", {"atr": 30.0}), book(ts))
+        exit_ts = ts + timedelta(minutes=cfg.minute_engine.max_hold_minutes + 1)
+        events = controller.on_book(book(exit_ts, bid=50000, ask=50005))
+        self.assertEqual(events[0].event_type, "paper_exit")
+        self.assertEqual(events[0].reason, "max_hold_minutes")
+
+    def test_minute_breakeven_stop_after_profit_reaches_r(self) -> None:
+        cfg = default_config()
+        controller = PaperExecutionController(cfg, trade_mode="paper")
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        controller.on_signal(Signal("minute_orb", "NK225micro", "long", 0.8, 50005, "orb_breakout_long", {"atr": 30.0}), book(ts))
+        self.assertEqual(controller.on_book(book(ts + timedelta(minutes=1), bid=50035, ask=50040)), [])
+        events = controller.on_book(book(ts + timedelta(minutes=2), bid=50005, ask=50010))
+        self.assertEqual(events[0].event_type, "paper_exit")
+        self.assertEqual(events[0].reason, "breakeven_stop")
+        self.assertEqual(events[0].pnl_ticks, 0.0)
+
+    def test_micro_signal_rejected_when_minute_position_exists(self) -> None:
+        cfg = default_config()
+        controller = PaperExecutionController(cfg, trade_mode="paper")
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        controller.on_signal(Signal("minute_vwap", "NK225micro", "long", 0.8, 50005, "trend_pullback_long", {"atr": 30.0}), book(ts))
+        events = controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts + timedelta(seconds=1)))
+        self.assertEqual(events[0].event_type, "execution_reject")
+        self.assertEqual(events[0].reason, "already_has_position")
+
+    def test_minute_signal_rejected_when_micro_position_exists(self) -> None:
+        cfg = default_config()
+        controller = PaperExecutionController(cfg, trade_mode="paper")
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts))
+        signal = Signal("minute_vwap", "NK225micro", "long", 0.8, 50005, "trend_pullback_long", {"atr": 30.0})
+        events = controller.on_signal(signal, book(ts + timedelta(seconds=1)))
+        self.assertEqual(events[0].event_type, "execution_reject")
+        self.assertEqual(events[0].reason, "already_has_position")
+
+    def test_heartbeat_aggregates_micro_and_minute_paper_trades(self) -> None:
+        cfg = default_config()
+        controller = PaperExecutionController(cfg, trade_mode="paper")
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        controller.on_signal(Signal("minute_vwap", "NK225micro", "long", 0.8, 50005, "trend_pullback_long", {"atr": 30.0}), book(ts))
+        controller.on_book(book(ts + timedelta(minutes=1), bid=50050, ask=50055))
+        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts + timedelta(minutes=2)))
+        controller.on_book(book(ts + timedelta(minutes=2, seconds=2), bid=50015, ask=50020))
+        heartbeat = controller.heartbeat_metadata()
+        self.assertEqual(heartbeat["paper_trades"], 2)
+        self.assertEqual(heartbeat["paper_minute_trades"], 1)
+        self.assertEqual(heartbeat["paper_micro_trades"], 1)
+        self.assertGreater(heartbeat["paper_pnl_ticks"], 0)
+
     def test_paper_rejects_new_signal_when_position_exists(self) -> None:
         cfg = default_config()
         controller = PaperExecutionController(cfg, trade_mode="paper")
@@ -513,7 +831,9 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         controller = PaperExecutionController(cfg, trade_mode="observe")
         ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
         events = controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts))
-        self.assertEqual(events, [])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].event_type, "execution_skip")
+        self.assertEqual(events[0].reason, "observe_mode")
         heartbeat = controller.heartbeat_metadata()
         self.assertIsNone(heartbeat["paper_position"])
         self.assertEqual(heartbeat["paper_trades"], 0)
@@ -714,6 +1034,272 @@ class AlphaStackTests(unittest.TestCase):
         )
         self.assertFalse(intent.allowed)
         self.assertEqual(intent.veto_reason, "portfolio_beta_limit")
+
+
+class TuningInvalidComboTests(unittest.TestCase):
+    def test_evaluate_micro_config_does_not_execute_minute_signals(self) -> None:
+        class FakeEngine:
+            latest_signal_evaluations: list[SignalEvaluation] = []
+            latest_book_features = None
+
+            def __init__(self, config: object) -> None:
+                pass
+
+            def on_order_book(self, order_book: OrderBook, now: datetime | None = None) -> list[Signal]:
+                return [Signal("minute_vwap", "NK225micro", "long", 0.8, order_book.mid_price, "trend_pullback_long")]
+
+        class FakeExecution:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            def on_book(self, order_book: OrderBook, features: object = None) -> list[object]:
+                return []
+
+            def on_signal(self, signal: Signal, order_book: OrderBook) -> list[object]:
+                raise AssertionError("minute signals must not execute during micro tuning")
+
+            def heartbeat_metadata(self) -> dict[str, object]:
+                return {"paper_pnl_yen": 0.0}
+
+        cfg = default_config()
+        with patch("kabu_futures.tuning.DualStrategyEngine", FakeEngine), patch(
+            "kabu_futures.tuning.PaperExecutionController",
+            FakeExecution,
+        ):
+            result = evaluate_micro_config(
+                [book(datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc))],
+                cfg,
+                {"imbalance_entry": cfg.micro_engine.imbalance_entry},
+            )
+        self.assertEqual(result["trades"], 0)
+        self.assertEqual(result["signals"]["minute_vwap:long:trend_pullback_long"], 1)
+
+    def test_evaluate_strategy_config_executes_minute_signals(self) -> None:
+        class FakeEngine:
+            def __init__(self, config: object) -> None:
+                self.latest_signal_evaluations: list[SignalEvaluation] = []
+                self.latest_book_features = None
+                self.calls = 0
+
+            def on_order_book(self, order_book: OrderBook, now: datetime | None = None) -> list[Signal]:
+                self.calls += 1
+                if self.calls == 1:
+                    return [Signal("minute_vwap", "NK225micro", "long", 0.8, 50005, "trend_pullback_long", {"atr": 30.0})]
+                return []
+
+        cfg = default_config()
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        with patch("kabu_futures.tuning.DualStrategyEngine", FakeEngine):
+            result = evaluate_strategy_config(
+                [
+                    book(ts, bid=50000, ask=50005),
+                    book(ts + timedelta(seconds=1), bid=50050, ask=50055),
+                ],
+                cfg,
+                {"imbalance_entry": cfg.micro_engine.imbalance_entry},
+            )
+        self.assertEqual(result["trades"], 1)
+        self.assertEqual(result["by_engine"]["minute_vwap"]["trades"], 1)
+        self.assertEqual(result["paper_events"]["paper_entry"], 1)
+        self.assertNotIn("non_micro_signal", result["execution_reject_reasons"])
+
+    def test_tune_micro_params_skips_invalid_combo_without_crashing(self) -> None:
+        # Invalid imbalance grid (some values <= imbalance_exit=0.10) should be skipped, not crash.
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "tiny.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            for second in range(3):
+                recorder.write_book(book(datetime(2026, 4, 23, 9, 0, second, tzinfo=timezone.utc)))
+            recorder.close()
+
+            cfg = default_config()
+            grid = {
+                "imbalance_entry": (0.05, 0.30),  # 0.05 < imbalance_exit=0.10 -> invalid
+                "microprice_entry_ticks": (0.15,),
+                "take_profit_ticks": (2,),
+                "stop_loss_ticks": (3,),
+            }
+            report = tune_micro_params(path, cfg, grid=grid, min_trades=1, max_books=10)
+            self.assertIn("invalid_combos", report)
+            self.assertGreater(len(report["invalid_combos"]), 0)
+            self.assertEqual(report["decision"], "no_change")
+
+
+class PromotionGateTests(unittest.TestCase):
+    def test_promote_when_all_hard_gates_pass(self) -> None:
+        champion = {
+            "net_pnl_ticks": 10.0,
+            "max_drawdown_ticks": 4.0,
+            "trades": 200,
+            "avg_pnl_ticks": 0.05,
+            "avg_slippage_ticks": 0.5,
+            "max_consecutive_losses": 3,
+            "parameters": {"imbalance_entry": 0.30, "take_profit_ticks": 2},
+        }
+        challenger = {
+            "net_pnl_ticks": 14.0,
+            "max_drawdown_ticks": 4.5,
+            "trades": 210,
+            "avg_pnl_ticks": 0.067,
+            "avg_markout_ticks_3s": 0.8,
+            "avg_slippage_ticks": 0.5,
+            "max_consecutive_losses": 3,
+            "observation_days": 14,
+            "parameters": {"imbalance_entry": 0.32, "take_profit_ticks": 2},
+        }
+        wf_summary = {"pass_rate": 0.75}
+        result = evaluate_challenger(champion, challenger, walk_forward_summary=wf_summary)
+        self.assertEqual(result.decision, "promote")
+        self.assertIn("net_pnl_improvement", result.passed_gates)
+        self.assertIn("walk_forward_stable", result.passed_gates)
+
+    def test_reject_when_pnl_does_not_improve(self) -> None:
+        champion = {"net_pnl_ticks": 10.0, "max_drawdown_ticks": 4.0, "trades": 200, "avg_pnl_ticks": 0.05}
+        challenger = {
+            "net_pnl_ticks": 8.0,  # worse
+            "max_drawdown_ticks": 4.0,
+            "trades": 210,
+            "avg_pnl_ticks": 0.04,
+            "observation_days": 14,
+        }
+        result = evaluate_challenger(champion, challenger)
+        self.assertEqual(result.decision, "reject")
+        self.assertTrue(any("net_pnl_delta" in failed for failed in result.failed_gates))
+
+    def test_veto_when_parameter_jump_too_large(self) -> None:
+        champion = {
+            "net_pnl_ticks": 10.0,
+            "max_drawdown_ticks": 4.0,
+            "trades": 200,
+            "avg_pnl_ticks": 0.05,
+            "parameters": {"imbalance_entry": 0.30},
+        }
+        challenger = {
+            "net_pnl_ticks": 14.0,
+            "max_drawdown_ticks": 4.5,
+            "trades": 210,
+            "avg_pnl_ticks": 0.067,
+            "observation_days": 14,
+            "parameters": {"imbalance_entry": 0.10},  # 67% drop -> veto
+        }
+        result = evaluate_challenger(champion, challenger)
+        self.assertEqual(result.decision, "reject")
+        self.assertTrue(any("imbalance_entry" in v for v in result.veto_triggers))
+
+    def test_hold_when_borderline(self) -> None:
+        # Net PnL improves but a couple of secondary gates miss.
+        champion = {"net_pnl_ticks": 10.0, "max_drawdown_ticks": 4.0, "trades": 300, "avg_pnl_ticks": 0.03}
+        challenger = {
+            "net_pnl_ticks": 11.0,
+            "max_drawdown_ticks": 4.2,
+            "trades": 50,  # below threshold given 14 days obs
+            "avg_pnl_ticks": 0.04,
+            "observation_days": 14,
+            "avg_markout_ticks_3s": 0.2,  # below min markout threshold
+            "parameters": {"imbalance_entry": 0.30},
+        }
+        result = evaluate_challenger(champion, challenger)
+        self.assertIn(result.decision, ("hold", "reject"))
+        self.assertGreater(len(result.failed_gates), 0)
+
+    def test_decision_to_dict_is_json_friendly(self) -> None:
+        result = evaluate_challenger(
+            {"net_pnl_ticks": 10.0, "max_drawdown_ticks": 4.0, "trades": 100, "avg_pnl_ticks": 0.1},
+            {"net_pnl_ticks": 12.0, "max_drawdown_ticks": 4.0, "trades": 150, "avg_pnl_ticks": 0.08, "observation_days": 14},
+        )
+        payload = decision_to_dict(result)
+        json.dumps(payload)  # Should serialise without error
+        self.assertIn("decision", payload)
+        self.assertIsInstance(payload["passed_gates"], list)
+
+
+class RegimeClassifierTests(unittest.TestCase):
+    def test_warmup_returns_warmup_label(self) -> None:
+        classifier = RegimeClassifier(window_seconds=60.0, warmup_samples=10, history_size=100)
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        for i in range(5):
+            label = classifier.update(book(ts + timedelta(seconds=i)))
+            self.assertEqual(label, "warmup")
+
+    def test_high_vol_detected_after_volatility_spike(self) -> None:
+        classifier = RegimeClassifier(window_seconds=10.0, warmup_samples=5, history_size=100, high_vol_quantile=0.5)
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        # Calm period: same prices
+        for i in range(50):
+            classifier.update(book(ts + timedelta(seconds=i), bid=50000, ask=50005))
+        # Volatile spike: alternating prices
+        labels: list[str] = []
+        for i in range(50, 80):
+            offset = 100 if i % 2 == 0 else -100
+            labels.append(classifier.update(book(ts + timedelta(seconds=i), bid=50000 + offset, ask=50005 + offset)))
+        self.assertIn("high_vol", labels)
+
+
+class WalkForwardTests(unittest.TestCase):
+    def test_make_windows_basic(self) -> None:
+        days = ["2026-04-20", "2026-04-21", "2026-04-22", "2026-04-23", "2026-04-24", "2026-04-25"]
+        windows = make_windows(days, train_size=3, test_size=1, step=1)
+        self.assertEqual(len(windows), 3)
+        self.assertEqual(windows[0].train_days, ("2026-04-20", "2026-04-21", "2026-04-22"))
+        self.assertEqual(windows[0].test_day, "2026-04-23")
+        self.assertEqual(windows[0].test_days, ("2026-04-23",))
+        self.assertEqual(windows[2].test_day, "2026-04-25")
+
+    def test_make_windows_supports_multi_day_test_window(self) -> None:
+        days = ["d1", "d2", "d3", "d4", "d5"]
+        windows = make_windows(days, train_size=2, test_size=2, step=1)
+        self.assertEqual(len(windows), 2)
+        self.assertEqual(windows[0].train_days, ("d1", "d2"))
+        self.assertEqual(windows[0].test_days, ("d3", "d4"))
+        self.assertEqual(windows[1].test_days, ("d4", "d5"))
+
+    def test_make_windows_step_two(self) -> None:
+        days = ["d1", "d2", "d3", "d4", "d5", "d6", "d7"]
+        windows = make_windows(days, train_size=3, step=2)
+        self.assertEqual(len(windows), 2)
+        self.assertEqual(windows[0].test_day, "d4")
+        self.assertEqual(windows[1].test_day, "d6")
+
+    def test_make_windows_validates_positive_args(self) -> None:
+        with self.assertRaises(ValueError):
+            make_windows(["d1", "d2"], train_size=0)
+
+    def test_make_windows_returns_empty_when_not_enough_days(self) -> None:
+        windows = make_windows(["d1", "d2"], train_size=5)
+        self.assertEqual(windows, [])
+
+    def test_walk_forward_accepts_split_logs_and_reports_insufficient_trades(self) -> None:
+        with TemporaryDirectory() as tmp:
+            first = pathlib.Path(tmp) / "live_20260423_090000.jsonl"
+            second = pathlib.Path(tmp) / "live_20260424_090000.jsonl"
+            recorder = BufferedJsonlMarketRecorder(first, batch_size=10, flush_interval_seconds=60.0)
+            recorder.write_book(book(datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)))
+            recorder.close()
+            recorder = BufferedJsonlMarketRecorder(second, batch_size=10, flush_interval_seconds=60.0)
+            recorder.write_book(book(datetime(2026, 4, 24, 9, 0, tzinfo=timezone.utc)))
+            recorder.close()
+
+            report = walk_forward_micro([first, second], default_config(), train_size=1, test_size=1, min_trades=1)
+
+        self.assertEqual(report["days"], ["2026-04-23", "2026-04-24"])
+        self.assertEqual(report["summary"]["window_count"], 1)
+        self.assertEqual(report["windows"][0]["train_days"], ["2026-04-23"])
+        self.assertEqual(report["windows"][0]["test_days"], ["2026-04-24"])
+        self.assertTrue(report["summary"]["insufficient_data"])
+        self.assertIn("no_closed_test_trades", report["summary"]["diagnostics"])
+
+    def test_walk_forward_reports_insufficient_days(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "live_20260423_090000.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            recorder.write_book(book(datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)))
+            recorder.close()
+
+            report = walk_forward_micro(path, default_config(), train_size=1, test_size=1, min_trades=1)
+
+        self.assertEqual(report["summary"]["window_count"], 0)
+        self.assertTrue(report["summary"]["insufficient_data"])
+        self.assertIn("insufficient_days_1_lt_required_2", report["summary"]["diagnostics"])
 
 
 if __name__ == "__main__":

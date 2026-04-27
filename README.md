@@ -21,7 +21,7 @@ The code is intentionally safe by default:
 - `src/kabu_futures/api.py`: minimal kabu Station REST client.
 - `src/kabu_futures/marketdata.py`: kabu board/PUSH normalizer, optional WebSocket reader, JSONL recorder.
 - `src/kabu_futures/execution.py`: micro-trade take-profit/stop-loss/time-stop manager.
-- `src/kabu_futures/paper_execution.py`: paper-only controller/executor lifecycle for micro book signals.
+- `src/kabu_futures/paper_execution.py`: paper-only controller/executor lifecycle for micro book and minute-level signals.
 - `src/kabu_futures/simulator.py`: book-path micro replay simulator.
 - `src/kabu_futures/engine.py`: dual-layer orchestration for replay/dry-run use.
 
@@ -42,7 +42,7 @@ python main.py
 
 By default, `main.py` registers `NK225micro` and `TOPIXmini` on production `18080`, day and night sessions `Exchange=23,24`. It reads API settings from `config/local.json`. After registration it connects to kabu WebSocket and keeps running until you press `Ctrl+C`.
 
-Console tick printing is off by default. Startup, heartbeat, signal, paper execution, and error events still print; full market data is still recorded to JSONL unless you change `--book-log-mode`. Microstructure signal decisions are written to JSONL as `signal_eval`, so you can inspect why a book was rejected without flooding the console.
+Console tick printing is off by default. Startup, heartbeat, signal, paper execution, and error events still print; full market data is still recorded to JSONL unless you change `--book-log-mode`. Microstructure signal decisions default to summarized JSONL logging: repeated rejects become `signal_eval_summary`, while `allow` events remain full `signal_eval` records.
 
 Useful safe commands:
 
@@ -53,11 +53,12 @@ python main.py --replay-sample
 python main.py --sandbox --dry-run
 python main.py --register-only
 python main.py --tick-log-mode changes
+python main.py --signal-eval-log-mode full
 ```
 
 ## Paper Execution
 
-Paper execution never sends real orders. It only reacts to tradeable `micro_book` signals.
+Paper execution never sends real orders. It reacts to tradeable `micro_book` signals and minute-level signals (`minute_orb`, `minute_vwap`, `directional_intraday`) for offline/paper research.
 
 ```powershell
 # Safe default: observe only, no paper position and no live order
@@ -73,7 +74,41 @@ python main.py --trade-mode paper --paper-fill-model touch
 python main.py --replay-sample --path logs\live_20260423_222539.jsonl --trade-mode paper --paper-fill-model touch
 ```
 
-Paper events are written to the JSONL log as `paper_pending`, `paper_entry`, `paper_exit`, `paper_cancel`, and `execution_reject`. Heartbeats include `paper_position`, `paper_pending_order`, `paper_trades`, `paper_pnl_ticks`, and `paper_pnl_yen`. Live heartbeats also include `signal_eval_count`, `signal_allow_count`, and `signal_reject_count`.
+Paper events are written to the JSONL log as `paper_pending`, `paper_entry`, `paper_exit`, `paper_cancel`, and `execution_reject`. In observe mode, tradeable signals produce `execution_skip` with reason `observe_mode` so it is clear why no paper position was opened. V1 keeps a single active paper position across micro and minute executors. Heartbeats include the legacy aggregate fields `paper_position`, `paper_pending_order`, `paper_trades`, `paper_pnl_ticks`, and `paper_pnl_yen`, plus split fields such as `paper_micro_position`, `paper_minute_position`, `paper_micro_trades`, and `paper_minute_trades`. Live heartbeats also include `signal_eval_count`, `signal_allow_count`, and `signal_reject_count`.
+
+## Offline Micro Tuning
+
+The evolution MVP starts with offline replay reports. It replays JSONL books through the strategy and paper executor, then summarizes signal attribution, strategy reject reasons, paper execution reject reasons, paper PnL, hourly behavior, and markout.
+
+```powershell
+python scripts\analyze_micro_evolution.py logs\live_20260424_121536.jsonl --config config\local.json --max-books 5000
+python scripts\analyze_micro_evolution.py logs\live_20260423_*.jsonl logs\live_20260424_*.jsonl --output reports\micro_evolution_report.json
+python scripts\analyze_micro_evolution.py logs --output reports\micro_evolution_report.json
+```
+
+Markout is the post-entry mid-price move at fixed horizons. For a long entry it is `future_mid - entry_price`; for a short entry it is `entry_price - future_mid`. The report converts markout to ticks so it can be compared with spread, stop, and take-profit settings.
+
+The tuner replays JSONL books and searches low-risk micro parameters. It prints a recommendation report by default and never rewrites live config.
+
+```powershell
+python scripts\tune_micro_params.py logs\live_20260424_121536.jsonl --config config\local.json --top 10
+python scripts\tune_micro_params.py logs\live_20260423_*.jsonl logs\live_20260424_*.jsonl --config config\local.json --top 10
+python scripts\tune_micro_params.py logs\live_20260424_121536.jsonl --max-books 5000 --min-trades 5
+python scripts\tune_micro_params.py logs\live_20260424_121536.jsonl --write-challenger reports\challenger_micro_engine.json
+```
+
+The report includes baseline metrics, top candidates, trade count, win rate, average PnL, net ticks, max drawdown, reject reason distribution, and a final `recommended` or `no_change` decision. Micro tuning remains isolated to `micro_book` signals, but the report also includes `full_strategy_baseline` and `full_strategy_recommended` so the selected micro candidate can be checked with minute signals sharing the same paper execution lane. `diagnostics` and `insufficient_data` explain cases where the log has too few closed trades to trust. `--write-challenger` writes only a `{"micro_engine": ...}` override JSON, and only when the decision is `recommended`; it does not overwrite `config/local.json`.
+
+## Walk-forward Validation
+
+Walk-forward can read one file, many files, a directory, or glob patterns. Use it only as a smoke test until you have enough full trading days and closed paper trades.
+
+```powershell
+python scripts\walk_forward.py logs --config config\local.json --train-size 1 --test-size 1 --min-trades 1
+python scripts\walk_forward.py logs\live_20260423_*.jsonl logs\live_20260424_*.jsonl --train-size 1 --test-size 1 --output reports\walk_forward.json
+```
+
+The report stores each window as `train_days` plus `test_days` (with legacy `test_day` kept as the first test day). `summary.insufficient_data` is true when there are not enough days or no closed test trades, so the result must not be used for promotion.
 
 ## Replay JSONL Snapshots
 
@@ -93,7 +128,7 @@ Current live logs use the buffered `{"kind":"book","payload":...}` format and ar
 Notes for kabu futures data:
 
 - `TradingVolume` is cumulative, so the bar builder converts it to per-bar incremental volume before computing VWAP and volume ratios.
-- kabu can occasionally emit equal best quotes such as `BidPrice == AskPrice`; the normalizer records `market_data_error` and skips those snapshots instead of reconnecting.
+- kabu can occasionally emit equal best quotes such as `BidPrice == AskPrice`; the normalizer records `market_data_skip` with reason `locked_quote` and skips those snapshots instead of reconnecting or counting them as errors.
 - **kabu Bid/Ask reversal**: kabu PUSH board encodes `BidPrice` as the best *sell* quote and `AskPrice` as the best *buy* quote, the opposite of standard market data conventions. `KabuBoardNormalizer` corrects this mapping so that `OrderBook.best_bid_price` is always the highest buyer price and `best_ask_price` the lowest seller price. This is also documented in `OrderBook` class docstring in `models.py`.
 
 ## Signal Flow

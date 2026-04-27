@@ -14,6 +14,24 @@ class MarketDataError(ValueError):
     pass
 
 
+class MarketDataSkip(ValueError):
+    """Non-fatal market-data snapshot that should be skipped but not counted as an error."""
+
+    def __init__(self, reason: str, message: str, metadata: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.metadata = metadata or {}
+
+    def to_payload(self, raw: str, received_at: datetime) -> dict[str, Any]:
+        return {
+            "reason": self.reason,
+            "message": str(self),
+            "metadata": self.metadata,
+            "raw": raw,
+            "received_at": received_at.isoformat(),
+        }
+
+
 def _parse_time(value: Any, fallback: datetime | None = None) -> datetime:
     if isinstance(value, datetime):
         return value
@@ -80,7 +98,19 @@ class KabuBoardNormalizer:
         if raw_buy_price <= 0 or raw_sell_price <= 0:
             raise MarketDataError("Payload does not include valid bid/ask prices")
 
-        if raw_sell_price <= raw_buy_price:
+        if raw_sell_price == raw_buy_price:
+            raise MarketDataSkip(
+                "locked_quote",
+                f"Skipped kabu locked quote: best sell equals best buy "
+                f"(raw BidPrice={raw_sell_price}, raw AskPrice={raw_buy_price})",
+                {
+                    "symbol": symbol,
+                    "raw_symbol": raw_symbol,
+                    "raw_bid_price": raw_sell_price,
+                    "raw_ask_price": raw_buy_price,
+                },
+            )
+        if raw_sell_price < raw_buy_price:
             raise MarketDataError(
                 f"Invalid kabu quote: best sell must be greater than best buy "
                 f"(raw BidPrice={raw_sell_price}, raw AskPrice={raw_buy_price})"

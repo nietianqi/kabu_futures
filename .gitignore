@@ -8,6 +8,7 @@ __pycache__/
 .venv/
 venv/
 logs/
+tmp/
 *.log
 config/local.json
 config/secrets.json
