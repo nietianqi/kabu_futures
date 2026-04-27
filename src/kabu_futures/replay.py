@@ -61,6 +61,8 @@ def replay_jsonl(
                 "metadata": signal.metadata,
             }
             emitted.append(event)
+            if not signal.is_tradeable:
+                continue
             for execution_event in execution.on_signal(signal, book):
                 emitted.append(execution_event.to_dict())
     if trade_mode == "paper":
@@ -70,20 +72,21 @@ def replay_jsonl(
 
 def read_recorded_books(path: str | Path) -> Iterator[OrderBook]:
     """Yield OrderBook objects from a JSONL file line by line (no full-file load)."""
-    for line in Path(path).open(encoding="utf-8"):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError as exc:
-            _log.warning("Skipping malformed JSONL line: %s", exc)
-            continue
-        kind = row.get("kind")
-        try:
-            if kind == "book":
-                yield parse_book(row["payload"])
-            elif kind is None:
-                yield parse_book(row)
-        except (ValueError, KeyError) as exc:
-            _log.warning("Skipping invalid book record: %s", exc)
+    with Path(path).open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                _log.warning("Skipping malformed JSONL line: %s", exc)
+                continue
+            kind = row.get("kind")
+            try:
+                if kind == "book":
+                    yield parse_book(row["payload"])
+                elif kind is None:
+                    yield parse_book(row)
+            except (ValueError, KeyError) as exc:
+                _log.warning("Skipping invalid book record: %s", exc)

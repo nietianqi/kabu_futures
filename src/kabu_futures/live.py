@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import time
@@ -13,6 +13,7 @@ from .engine import DualStrategyEngine
 from .marketdata import BufferedJsonlMarketRecorder, KabuBoardNormalizer, KabuWebSocketStream, MarketDataError
 from .models import OrderBook, Signal
 from .paper_execution import ExecutionEvent, PaperExecutionController, PaperFillModel, TradeMode
+from .sessions import SessionState, classify_jst_session
 
 
 BookLogMode = Literal["full", "sample", "signals_only", "off"]
@@ -51,6 +52,12 @@ def signal_to_dict(signal: Signal) -> dict[str, Any]:
         "price": signal.price,
         "reason": signal.reason,
         "metadata": signal.metadata,
+        "score": signal.score,
+        "signal_horizon": signal.signal_horizon,
+        "expected_hold_seconds": signal.expected_hold_seconds,
+        "risk_budget_pct": signal.risk_budget_pct,
+        "veto_reason": signal.veto_reason,
+        "position_scale": signal.position_scale,
     }
 
 
@@ -129,8 +136,30 @@ def _write_execution_events(
             print(json.dumps(payload, ensure_ascii=False))
 
 
+def _session_state_to_dict(state: SessionState) -> dict[str, Any]:
+    return {
+        "session_phase": state.phase,
+        "session_window_jst": state.window_jst,
+        "new_entries_allowed": state.new_entries_allowed,
+        "api_window_status": state.api_window_status,
+    }
+
+
 def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | None = None) -> int:
     options = options or LiveRunOptions()
+    startup_session = classify_jst_session(datetime.now(timezone.utc), config.session_schedule)
+    if startup_session.phase == "api_maintenance":
+        print(
+            json.dumps(
+                {
+                    "event": "startup_blocked",
+                    "reason": "api_maintenance",
+                    **_session_state_to_dict(startup_session),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 2
     future_codes = options.future_codes or (config.symbols.primary, config.symbols.filter)
     deriv_month = options.deriv_month if options.deriv_month is not None else config.symbols.deriv_month
     client = KabuStationClient(password, config.api, production=options.production)
@@ -174,6 +203,8 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
             "trade_mode": options.trade_mode,
             "paper_fill_model": options.paper_fill_model,
             "paper_console": options.paper_console,
+            **_session_state_to_dict(startup_session),
+            "no_new_entry_windows_jst": config.micro_engine.no_new_entry_windows_jst,
         },
         force_flush=True,
     )
@@ -184,6 +215,7 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                 "log": str(recorder.path),
                 "resolved": resolved,
                 "trade_mode": options.trade_mode,
+                **_session_state_to_dict(startup_session),
             },
             ensure_ascii=False,
         )
@@ -257,12 +289,15 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                     for signal in signals:
                         recorder.write_signal(signal, force_flush=True)
                         print(json.dumps({"event": "signal", **signal_to_dict(signal)}, ensure_ascii=False))
+                        if not signal.is_tradeable:
+                            continue
                         execution_events = execution.on_signal(signal, book)
                         execution_events_count += len(execution_events)
                         _write_execution_events(recorder, execution_events, options.paper_console)
                     process_time_total_ms += (time.perf_counter() - event_start) * 1000.0
                     if processed % heartbeat_interval == 0:
                         elapsed = max(0.001, time.perf_counter() - started_perf)
+                        session_state = classify_jst_session(book.timestamp, config.session_schedule)
                         heartbeat = {
                             "event": "heartbeat",
                             "books": processed,
@@ -277,6 +312,7 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                             "last_symbol": book.symbol,
                             "raw_symbol": book.raw_symbol,
                             "ts": book.timestamp.isoformat(),
+                            **_session_state_to_dict(session_state),
                         }
                         heartbeat.update(execution.heartbeat_metadata())
                         recorder.write("heartbeat", heartbeat)

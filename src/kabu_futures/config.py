@@ -25,6 +25,7 @@ class MinuteEngineConfig:
     take_profit_r: float = 1.5
     breakeven_after_r: float = 1.0
     max_hold_minutes: int = 45
+    directional_intraday_long_observe_only: bool = True
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,22 @@ class MicroEngineConfig:
     websocket_latency_stop_ms: int = 500
     consecutive_loss_stop: int = 5
     avg_slippage_stop_ticks: float = 2.0
+    no_new_entry_windows_jst: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SessionScheduleConfig:
+    api_maintenance: str = "06:15-06:30"
+    api_prepare: str = "06:30-08:00"
+    day_preopen: str = "08:00-08:45"
+    day_continuous: str = "08:45-15:40"
+    day_closing_call: str = "15:40-15:45"
+    between_sessions: str = "15:45-16:45"
+    night_preopen: str = "16:45-17:00"
+    night_continuous: str = "17:00-05:55"
+    night_closing_call: str = "05:55-06:00"
+    post_close: str = "06:00-06:15"
+    allow_new_entry_phases: tuple[str, ...] = ("day_continuous", "night_continuous")
 
 
 @dataclass(frozen=True)
@@ -136,6 +153,7 @@ class StrategyConfig:
     symbols: SymbolsConfig = field(default_factory=SymbolsConfig)
     minute_engine: MinuteEngineConfig = field(default_factory=MinuteEngineConfig)
     micro_engine: MicroEngineConfig = field(default_factory=MicroEngineConfig)
+    session_schedule: SessionScheduleConfig = field(default_factory=SessionScheduleConfig)
     nt_spread: NTSpreadConfig = field(default_factory=NTSpreadConfig)
     lead_lag: LeadLagConfig = field(default_factory=LeadLagConfig)
     alpha_stack: AlphaStackConfig = field(default_factory=AlphaStackConfig)
@@ -180,6 +198,7 @@ def load_json_config(path: str | Path) -> StrategyConfig:
         symbols=_merge_dataclass(SymbolsConfig, data.get("symbols", {})),
         minute_engine=_merge_dataclass(MinuteEngineConfig, data.get("minute_engine", {})),
         micro_engine=_merge_dataclass(MicroEngineConfig, data.get("micro_engine", {})),
+        session_schedule=_merge_dataclass(SessionScheduleConfig, data.get("session_schedule", {})),
         nt_spread=_merge_dataclass(NTSpreadConfig, data.get("nt_spread", {})),
         lead_lag=_merge_dataclass(LeadLagConfig, data.get("lead_lag", {})),
         alpha_stack=_merge_dataclass(AlphaStackConfig, data.get("alpha_stack", {})),

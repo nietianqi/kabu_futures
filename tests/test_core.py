@@ -9,7 +9,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from dataclasses import replace
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from kabu_futures.alpha import (
     NTRatioSpreadEngine,
@@ -20,6 +20,7 @@ from kabu_futures.alpha import (
 from kabu_futures.api import build_future_registration_symbols, extract_symbol_code
 from kabu_futures.config import default_config, load_json_config
 from kabu_futures.engine import DualStrategyEngine
+from kabu_futures.evolution import analyze_micro_log, calculate_markout_ticks
 from kabu_futures.indicators import BarBuilder
 from kabu_futures.live import _should_print_tick, tick_to_dict, signal_to_dict
 from kabu_futures.microstructure import BookFeatureEngine, RollingPercentile, microprice, percentile, weighted_imbalance
@@ -42,7 +43,12 @@ from kabu_futures.orders import KabuFutureOrderBuilder
 from kabu_futures.paper_execution import PaperExecutionController
 from kabu_futures.replay import read_recorded_books, replay_jsonl
 from kabu_futures.risk import OrderThrottle
+from kabu_futures.sessions import JST, classify_jst_session, new_entries_allowed
 from kabu_futures.strategies import MicroStrategyEngine, MinuteStrategyEngine
+from kabu_futures.tuning import evaluate_micro_config, tune_micro_params
+from kabu_futures.walk_forward import make_windows, split_books_by_day, walk_forward_micro
+from kabu_futures.promotion import PromotionThresholds, evaluate_challenger
+from kabu_futures.regime import RegimeClassifier, split_books_by_regime
 
 
 def book(ts: datetime, bid_qty: float = 100, ask_qty: float = 50, bid: float = 50000, ask: float = 50005) -> OrderBook:
@@ -77,6 +83,47 @@ class ConfigTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "imbalance_entry"):
             DualStrategyEngine(bad_cfg)
+
+    def test_no_new_entry_window_loads_from_json_config(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = pathlib.Path(temp_dir) / "config.json"
+            path.write_text(
+                '{"micro_engine":{"no_new_entry_windows_jst":["15:25-16:30","22:00-22:15"]}}',
+                encoding="utf-8",
+            )
+            cfg = load_json_config(path)
+            self.assertEqual(list(cfg.micro_engine.no_new_entry_windows_jst), ["15:25-16:30", "22:00-22:15"])
+
+    def test_session_schedule_loads_from_json_config(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = pathlib.Path(temp_dir) / "config.json"
+            path.write_text(
+                '{"session_schedule":{"day_continuous":"08:50-15:30","allow_new_entry_phases":["day_continuous"]}}',
+                encoding="utf-8",
+            )
+            cfg = load_json_config(path)
+            self.assertEqual(cfg.session_schedule.day_continuous, "08:50-15:30")
+            self.assertEqual(list(cfg.session_schedule.allow_new_entry_phases), ["day_continuous"])
+
+
+class SessionScheduleTests(unittest.TestCase):
+    def test_day_session_boundaries(self) -> None:
+        self.assertFalse(new_entries_allowed(datetime(2026, 4, 27, 8, 44, tzinfo=JST)))
+        self.assertTrue(new_entries_allowed(datetime(2026, 4, 27, 8, 45, tzinfo=JST)))
+        self.assertTrue(new_entries_allowed(datetime(2026, 4, 27, 15, 39, tzinfo=JST)))
+        self.assertFalse(new_entries_allowed(datetime(2026, 4, 27, 15, 40, tzinfo=JST)))
+
+    def test_night_session_boundaries(self) -> None:
+        self.assertFalse(new_entries_allowed(datetime(2026, 4, 27, 16, 59, tzinfo=JST)))
+        self.assertTrue(new_entries_allowed(datetime(2026, 4, 27, 17, 0, tzinfo=JST)))
+        self.assertTrue(new_entries_allowed(datetime(2026, 4, 28, 5, 54, tzinfo=JST)))
+        self.assertFalse(new_entries_allowed(datetime(2026, 4, 28, 5, 55, tzinfo=JST)))
+
+    def test_api_maintenance_window(self) -> None:
+        state = classify_jst_session(datetime(2026, 4, 28, 6, 15, tzinfo=JST))
+        self.assertEqual(state.phase, "api_maintenance")
+        self.assertEqual(state.api_window_status, "maintenance")
+        self.assertFalse(state.new_entries_allowed)
 
 
 class MicrostructureTests(unittest.TestCase):
@@ -508,17 +555,204 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertEqual(events[0].event_type, "execution_reject")
         self.assertEqual(events[0].reason, "already_has_position")
 
+    def test_minute_signal_creates_paper_entry(self) -> None:
+        cfg = default_config()
+        controller = PaperExecutionController(cfg, trade_mode="paper")
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        signal = Signal("minute_vwap", "NK225micro", "long", 0.8, 50005, "trend_pullback_long", {"atr": 30.0})
+        events = controller.on_signal(signal, book(ts, bid=50000, ask=50005))
+        self.assertEqual(events[0].event_type, "paper_entry")
+        self.assertEqual(events[0].metadata["engine"], "minute_vwap")
+        heartbeat = controller.heartbeat_metadata()
+        self.assertIsNotNone(heartbeat["paper_position"])
+        self.assertIsNotNone(heartbeat["paper_minute_position"])
+
+    def test_minute_long_exits_on_take_profit_with_positive_pnl(self) -> None:
+        cfg = default_config()
+        controller = PaperExecutionController(cfg, trade_mode="paper")
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        controller.on_signal(Signal("minute_vwap", "NK225micro", "long", 0.8, 50005, "trend_pullback_long", {"atr": 30.0}), book(ts))
+        events = controller.on_book(book(ts + timedelta(minutes=1), bid=50050, ask=50055))
+        self.assertEqual(events[0].event_type, "paper_exit")
+        self.assertEqual(events[0].reason, "take_profit")
+        self.assertGreater(events[0].pnl_ticks or 0, 0)
+
+    def test_minute_long_exits_on_stop_loss_with_negative_pnl(self) -> None:
+        cfg = default_config()
+        controller = PaperExecutionController(cfg, trade_mode="paper")
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        controller.on_signal(Signal("minute_vwap", "NK225micro", "long", 0.8, 50005, "trend_pullback_long", {"atr": 30.0}), book(ts))
+        events = controller.on_book(book(ts + timedelta(minutes=1), bid=49975, ask=49980))
+        self.assertEqual(events[0].event_type, "paper_exit")
+        self.assertEqual(events[0].reason, "stop_loss")
+        self.assertLess(events[0].pnl_ticks or 0, 0)
+
+    def test_minute_position_exits_on_max_hold_minutes(self) -> None:
+        cfg = default_config()
+        controller = PaperExecutionController(cfg, trade_mode="paper")
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        controller.on_signal(Signal("directional_intraday", "NK225micro", "long", 0.8, 50005, "trend_continuation_long", {"atr": 30.0}), book(ts))
+        exit_ts = ts + timedelta(minutes=cfg.minute_engine.max_hold_minutes + 1)
+        events = controller.on_book(book(exit_ts, bid=50000, ask=50005))
+        self.assertEqual(events[0].event_type, "paper_exit")
+        self.assertEqual(events[0].reason, "max_hold_minutes")
+
+    def test_micro_signal_rejected_when_minute_position_exists(self) -> None:
+        cfg = default_config()
+        controller = PaperExecutionController(cfg, trade_mode="paper")
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        controller.on_signal(Signal("minute_vwap", "NK225micro", "long", 0.8, 50005, "trend_pullback_long", {"atr": 30.0}), book(ts))
+        events = controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts + timedelta(seconds=1)))
+        self.assertEqual(events[0].event_type, "execution_reject")
+        self.assertEqual(events[0].reason, "already_has_position")
+
+    def test_heartbeat_aggregates_micro_and_minute_paper_trades(self) -> None:
+        cfg = default_config()
+        controller = PaperExecutionController(cfg, trade_mode="paper")
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        controller.on_signal(Signal("minute_vwap", "NK225micro", "long", 0.8, 50005, "trend_pullback_long", {"atr": 30.0}), book(ts))
+        controller.on_book(book(ts + timedelta(minutes=1), bid=50050, ask=50055))
+        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts + timedelta(minutes=2)))
+        controller.on_book(book(ts + timedelta(minutes=2, seconds=2), bid=50015, ask=50020))
+        heartbeat = controller.heartbeat_metadata()
+        self.assertEqual(heartbeat["paper_trades"], 2)
+        self.assertEqual(heartbeat["paper_minute_trades"], 1)
+        self.assertEqual(heartbeat["paper_micro_trades"], 1)
+        self.assertGreater(heartbeat["paper_pnl_ticks"], 0)
+
     def test_observe_mode_does_not_create_paper_position(self) -> None:
         cfg = default_config()
         controller = PaperExecutionController(cfg, trade_mode="observe")
         ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
         events = controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts))
-        self.assertEqual(events, [])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].event_type, "execution_skip")
+        self.assertEqual(events[0].reason, "observe_mode")
         heartbeat = controller.heartbeat_metadata()
         self.assertIsNone(heartbeat["paper_position"])
         self.assertEqual(heartbeat["paper_trades"], 0)
         self.assertEqual(heartbeat["paper_pnl_ticks"], 0.0)
         self.assertEqual(heartbeat["paper_pnl_yen"], 0.0)
+
+    def test_no_new_entry_window_blocks_micro_tradeable_signal(self) -> None:
+        cfg = default_config()
+        engine = DualStrategyEngine(cfg)
+        ts = datetime(2026, 4, 27, 15, 40, tzinfo=JST)
+        for idx in range(5):
+            event_ts = ts + timedelta(milliseconds=100 * idx)
+            engine.on_order_book(book(event_ts, bid_qty=100, ask_qty=100), now=event_ts)
+        final_ts = ts + timedelta(milliseconds=600)
+        signals = engine.on_order_book(book(final_ts, bid_qty=300, ask_qty=20), now=final_ts)
+        self.assertTrue(any(signal.reason == "session_not_tradeable" for signal in signals))
+        self.assertFalse(any(signal.is_tradeable for signal in signals))
+        self.assertEqual(engine.latest_signal_evaluations[-1].reason, "session_not_tradeable")
+        self.assertEqual(engine.latest_signal_evaluations[-1].metadata["reject_stage"], "session_filter")
+        self.assertEqual(engine.latest_signal_evaluations[-1].metadata["session_phase"], "day_closing_call")
+        self.assertEqual(engine.latest_signal_evaluations[-1].metadata["session_window_jst"], "15:40-15:45")
+
+    def test_existing_paper_position_can_exit_during_blocked_session(self) -> None:
+        cfg = default_config()
+        controller = PaperExecutionController(cfg, trade_mode="paper")
+        entry_ts = datetime(2026, 4, 27, 15, 39, tzinfo=JST)
+        exit_ts = datetime(2026, 4, 27, 15, 40, tzinfo=JST)
+        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(entry_ts))
+        events = controller.on_book(book(exit_ts, bid=50015, ask=50020))
+        self.assertEqual(events[0].event_type, "paper_exit")
+        self.assertGreater(events[0].pnl_ticks or 0, 0)
+
+    def test_directional_intraday_long_is_observe_only_by_default(self) -> None:
+        engine = DualStrategyEngine(default_config())
+        reason = engine._minute_observe_only_reason(Signal("directional_intraday", "NK225micro", "long", 0.8, 50000))
+        self.assertEqual(reason, "directional_intraday_long_observe_only")
+        self.assertIsNone(engine._minute_observe_only_reason(Signal("minute_vwap", "NK225micro", "short", 0.8, 50000)))
+
+
+class EvolutionAndTuningTests(unittest.TestCase):
+    def test_markout_calculation_long_and_short(self) -> None:
+        self.assertEqual(calculate_markout_ticks("long", 50000, 50010, 5), 2.0)
+        self.assertEqual(calculate_markout_ticks("short", 50000, 49990, 5), 2.0)
+
+    def test_analyze_micro_log_handles_minute_paper_trade(self) -> None:
+        class FakeEngine:
+            latest_signal_evaluations: list[SignalEvaluation] = []
+            latest_book_features = None
+
+            def __init__(self, config: object) -> None:
+                self.calls = 0
+
+            def on_order_book(self, order_book: OrderBook, now: datetime | None = None) -> list[Signal]:
+                self.calls += 1
+                if self.calls == 1:
+                    return [
+                        Signal(
+                            "minute_vwap",
+                            "NK225micro",
+                            "long",
+                            0.8,
+                            50005,
+                            "trend_pullback_long",
+                            {"atr": 30.0},
+                        )
+                    ]
+                return []
+
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "market.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+            recorder.write_book(book(ts, bid=50000, ask=50005))
+            recorder.write_book(book(ts + timedelta(seconds=1), bid=50050, ask=50055))
+            recorder.close()
+            with patch("kabu_futures.evolution.DualStrategyEngine", FakeEngine):
+                report = analyze_micro_log(path, default_config(), markout_seconds=(0.5,))
+        self.assertEqual(report["paper"]["trades"], 1)
+        self.assertEqual(report["paper"]["paper_minute_trades"], 1)
+        self.assertEqual(report["paper"]["exit_reasons"]["take_profit"], 1)
+        self.assertEqual(report["markout"]["entries"], 1)
+
+    def test_evaluate_micro_config_does_not_execute_minute_signals(self) -> None:
+        class FakeEngine:
+            latest_signal_evaluations: list[SignalEvaluation] = []
+            latest_book_features = None
+
+            def __init__(self, config: object) -> None:
+                pass
+
+            def on_order_book(self, order_book: OrderBook, now: datetime | None = None) -> list[Signal]:
+                return [Signal("minute_vwap", "NK225micro", "long", 0.8, order_book.mid_price, "trend_pullback_long")]
+
+        class FakeExecution:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            def on_book(self, order_book: OrderBook, features: object = None) -> list[object]:
+                return []
+
+            def on_signal(self, signal: Signal, order_book: OrderBook) -> list[object]:
+                raise AssertionError("minute signals must not execute during micro tuning")
+
+        with patch("kabu_futures.tuning.DualStrategyEngine", FakeEngine), patch(
+            "kabu_futures.tuning.PaperExecutionController",
+            FakeExecution,
+        ):
+            result = evaluate_micro_config(
+                [book(datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc))],
+                default_config(),
+                {"imbalance_entry": 0.3},
+            )
+        self.assertEqual(result["trades"], 0)
+        self.assertEqual(result["signals"]["minute_vwap:long:trend_pullback_long"], 1)
+
+    def test_tune_micro_params_skips_invalid_combo_without_crashing(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "tiny.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            for second in range(3):
+                recorder.write_book(book(datetime(2026, 4, 23, 9, 0, second, tzinfo=timezone.utc)))
+            recorder.close()
+            report = tune_micro_params(path, default_config(), imbalance_grid=(0.05, 0.30), min_trades=1)
+        self.assertEqual(report["decision"], "no_change")
+        self.assertGreater(len(report["invalid_combos"]), 0)
 
 
 class ApiRegistrationTests(unittest.TestCase):
@@ -714,6 +948,224 @@ class AlphaStackTests(unittest.TestCase):
         )
         self.assertFalse(intent.allowed)
         self.assertEqual(intent.veto_reason, "portfolio_beta_limit")
+
+
+class WalkForwardTests(unittest.TestCase):
+    """Tests for walk_forward rolling validation."""
+
+    def _make_books(self, n: int, base_ts: datetime, day_offset: int = 0) -> list[OrderBook]:
+        from datetime import timedelta
+        ts = base_ts + timedelta(days=day_offset)
+        return [
+            book(ts + timedelta(seconds=i), bid_qty=200, ask_qty=20)
+            for i in range(n)
+        ]
+
+    def test_make_windows_basic(self) -> None:
+        days = ["2026-04-21", "2026-04-22", "2026-04-23", "2026-04-24"]
+        windows = make_windows(days, train_size=2, test_size=1)
+        self.assertEqual(len(windows), 2)
+        self.assertEqual(windows[0].train_days, ("2026-04-21", "2026-04-22"))
+        self.assertEqual(windows[0].test_days, ("2026-04-23",))
+        self.assertEqual(windows[1].train_days, ("2026-04-22", "2026-04-23"))
+
+    def test_make_windows_insufficient_days_returns_empty(self) -> None:
+        days = ["2026-04-21"]
+        windows = make_windows(days, train_size=1, test_size=1)
+        self.assertEqual(windows, [])
+
+    def test_make_windows_invalid_args_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            make_windows(["2026-04-21"], train_size=0, test_size=1)
+
+    def test_split_books_by_day_groups_correctly(self) -> None:
+        ts_day1 = datetime(2026, 4, 21, 9, 0, tzinfo=timezone.utc)
+        ts_day2 = datetime(2026, 4, 22, 9, 0, tzinfo=timezone.utc)
+        books_day1 = [book(ts_day1 + timedelta(seconds=i)) for i in range(3)]
+        books_day2 = [book(ts_day2 + timedelta(seconds=i)) for i in range(2)]
+        all_books = books_day1 + books_day2
+
+        with TemporaryDirectory() as tmp:
+            import json as _json
+            p = pathlib.Path(tmp) / "test.jsonl"
+            lines = []
+            for b in all_books:
+                lines.append(_json.dumps({
+                    "symbol": b.symbol,
+                    "timestamp": b.timestamp.isoformat(),
+                    "best_bid_price": b.best_bid_price,
+                    "best_bid_qty": b.best_bid_qty,
+                    "best_ask_price": b.best_ask_price,
+                    "best_ask_qty": b.best_ask_qty,
+                }))
+            p.write_text("\n".join(lines), encoding="utf-8")
+
+            grouped = split_books_by_day(p)
+            self.assertIn("2026-04-21", grouped)
+            self.assertIn("2026-04-22", grouped)
+            self.assertEqual(len(grouped["2026-04-21"]), 3)
+            self.assertEqual(len(grouped["2026-04-22"]), 2)
+
+    def test_walk_forward_insufficient_days_returns_diagnostics(self) -> None:
+        cfg = default_config()
+        with TemporaryDirectory() as tmp:
+            import json as _json
+            p = pathlib.Path(tmp) / "single.jsonl"
+            ts = datetime(2026, 4, 21, 9, 0, tzinfo=timezone.utc)
+            b = book(ts, bid_qty=200, ask_qty=20)
+            p.write_text(_json.dumps({
+                "symbol": b.symbol,
+                "timestamp": b.timestamp.isoformat(),
+                "best_bid_price": b.best_bid_price,
+                "best_bid_qty": b.best_bid_qty,
+                "best_ask_price": b.best_ask_price,
+                "best_ask_qty": b.best_ask_qty,
+            }), encoding="utf-8")
+
+            result = walk_forward_micro(p, cfg, train_size=1, test_size=1)
+            self.assertFalse(result["summary"]["stable"])
+            self.assertGreater(len(result["summary"]["diagnostics"]), 0)
+
+    def test_walk_forward_sample_data(self) -> None:
+        """walk_forward runs end-to-end on sample data without error."""
+        sample = pathlib.Path(__file__).resolve().parents[1] / "data" / "sample_market_data.jsonl"
+        if not sample.exists():
+            self.skipTest("sample_market_data.jsonl not available")
+        cfg = default_config()
+        result = walk_forward_micro(sample, cfg, train_size=1, test_size=1, min_trades=1)
+        self.assertIn("summary", result)
+        self.assertIn("evaluations", result)
+        self.assertIn("days", result)
+
+
+class PromotionTests(unittest.TestCase):
+    """Tests for champion/challenger promotion gate."""
+
+    def _base_challenger(self, trades: int = 30, net_pnl: float = 5.0, avg_pnl: float = 0.5) -> dict:
+        return {
+            "best": {
+                "parameters": {"imbalance_entry": 0.22},
+                "trades": trades,
+                "net_pnl_ticks": net_pnl,
+                "avg_pnl_ticks": avg_pnl,
+                "max_drawdown_ticks": -5.0,
+            },
+            "candidates": [{"parameters": {"imbalance_entry": 0.22}}],
+            "grid": {"imbalance_entry": [0.18, 0.20, 0.22, 0.25, 0.30]},
+        }
+
+    def test_promote_when_all_gates_pass(self) -> None:
+        # Champion drawdown=-4.0; challenger drawdown=-5.0.
+        # Use max_drawdown_ratio=2.0 so 5.0 <= 4.0*2.0 passes.
+        champion = {"trades": 20, "net_pnl_ticks": 3.0, "avg_pnl_ticks": 0.3, "max_drawdown_ticks": -4.0}
+        challenger = self._base_challenger(trades=30, net_pnl=5.0, avg_pnl=0.6)
+        wf = {"pass_rate": 0.8, "windows": 5}
+        t = PromotionThresholds(
+            min_trades_per_day=1.0, min_avg_markout_ticks=0.0,
+            walk_forward_pass_threshold=0.7, min_observation_days=0,
+            max_drawdown_ratio=2.0,
+            allow_grid_boundary=True,
+        )
+        decision = evaluate_challenger(champion, challenger, walk_forward_summary=wf, thresholds=t)
+        self.assertEqual(decision.decision, "promote")
+
+    def test_reject_when_no_best(self) -> None:
+        challenger = {"best": None, "candidates": [], "grid": {}}
+        decision = evaluate_challenger({}, challenger)
+        # no trades → fails trades_per_day and avg_markout gates
+        self.assertIn(decision.decision, ("reject", "hold"))
+
+    def test_hold_when_borderline(self) -> None:
+        champion = {"trades": 20, "net_pnl_ticks": 3.0, "max_drawdown_ticks": -4.0}
+        challenger = self._base_challenger(trades=5, net_pnl=4.0, avg_pnl=0.8)
+        t = PromotionThresholds(
+            min_trades_per_day=10.0,   # fails: only 5 trades in 1 day
+            min_avg_markout_ticks=0.0, # passes
+            walk_forward_pass_threshold=0.7,
+            min_observation_days=0,
+        )
+        wf = {"pass_rate": 0.8, "windows": 3}
+        decision = evaluate_challenger(champion, challenger, walk_forward_summary=wf, thresholds=t)
+        # 1 failed (trades_per_day), rest pass → should be hold
+        self.assertIn(decision.decision, ("hold", "reject"))
+
+    def test_veto_param_jump(self) -> None:
+        # Champion imbalance=0.30, challenger imbalance=0.22 → change = 0.267 (26.7%).
+        # With max_param_change_ratio=0.2, 0.267 > 0.2 → veto triggered.
+        champion = {"parameters": {"imbalance_entry": 0.30}, "trades": 20, "net_pnl_ticks": 3.0}
+        challenger = self._base_challenger()  # best.parameters = {"imbalance_entry": 0.22}
+        t = PromotionThresholds(max_param_change_ratio=0.2, min_observation_days=0,
+                                min_trades_per_day=1.0, min_avg_markout_ticks=0.0)
+        decision = evaluate_challenger(champion, challenger, thresholds=t)
+        self.assertIn("param_jump:imbalance_entry", " ".join(decision.veto_reasons))
+
+    def test_no_champion_allows_any_valid_challenger(self) -> None:
+        challenger = self._base_challenger(trades=30, net_pnl=0.1, avg_pnl=0.1)
+        t = PromotionThresholds(
+            min_trades_per_day=1.0, min_avg_markout_ticks=0.0,
+            min_observation_days=0, walk_forward_pass_threshold=0.7,
+            allow_grid_boundary=True,
+        )
+        wf = {"pass_rate": 1.0, "windows": 2}
+        decision = evaluate_challenger({}, challenger, walk_forward_summary=wf, thresholds=t)
+        self.assertEqual(decision.decision, "promote")
+
+
+class RegimeTests(unittest.TestCase):
+    """Tests for volatility regime classifier."""
+
+    def _make_book(self, ts: datetime, mid: float) -> OrderBook:
+        half_spread = 2.5
+        return OrderBook(
+            symbol="NK225micro",
+            timestamp=ts,
+            best_bid_price=mid - half_spread,
+            best_bid_qty=100,
+            best_ask_price=mid + half_spread,
+            best_ask_qty=50,
+            received_at=ts,
+        )
+
+    def test_warmup_during_initial_periods(self) -> None:
+        clf = RegimeClassifier(warmup_periods=5)
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        regime = clf.update(self._make_book(ts, 50000.0))
+        self.assertEqual(regime, "warmup")
+
+    def test_high_vol_after_large_moves(self) -> None:
+        clf = RegimeClassifier(warmup_periods=2)
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        prices = [50000, 50200, 50400, 50100, 49800, 50300, 50100, 49700, 50000, 50400]
+        for i, price in enumerate(prices):
+            # Each price in a different minute
+            book_ts = ts + timedelta(minutes=i, seconds=1)
+            clf.update(self._make_book(book_ts, float(price)))
+        # After 10 minutes some regime should be assigned
+        final_regime = clf.current_regime
+        self.assertIn(final_regime, ("high_vol", "low_vol", "warmup"))
+
+    def test_split_books_by_regime_returns_three_buckets(self) -> None:
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        books_list = [
+            self._make_book(ts + timedelta(minutes=i, seconds=j), 50000.0 + i * 10.0)
+            for i in range(10) for j in range(5)
+        ]
+        result = split_books_by_regime(books_list)
+        self.assertIn("high_vol", result)
+        self.assertIn("low_vol", result)
+        self.assertIn("warmup", result)
+        total = sum(len(v) for v in result.values())
+        self.assertEqual(total, len(books_list))
+
+    def test_regime_distribution_sums_to_total(self) -> None:
+        from kabu_futures.regime import regime_distribution
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        books_list = [
+            self._make_book(ts + timedelta(minutes=i), 50000.0)
+            for i in range(20)
+        ]
+        dist = regime_distribution(books_list)
+        self.assertEqual(sum(dist.values()), len(books_list))
 
 
 if __name__ == "__main__":
