@@ -71,6 +71,8 @@ def live_loop(args: argparse.Namespace) -> int:
     future_codes = tuple(args.symbols or [config.symbols.primary, config.symbols.filter])
     deriv_month = args.deriv_month if args.deriv_month is not None else config.symbols.deriv_month
     exchanges = tuple(args.exchanges or [23, 24])
+    trade_mode = "live" if args.real_trading else args.trade_mode
+    live_orders = bool(args.live_orders or args.real_trading)
     return run_live(
         config,
         password,
@@ -89,10 +91,10 @@ def live_loop(args: argparse.Namespace) -> int:
             tick_log_mode=args.tick_log_mode,
             tick_log_interval_events=args.tick_log_interval,
             clear_registered_symbols=not args.keep_registered_symbols,
-            trade_mode=args.trade_mode,
+            trade_mode=trade_mode,
             paper_fill_model=args.paper_fill_model,
             paper_console=not args.no_paper_console,
-            live_orders=args.live_orders,
+            live_orders=live_orders,
         ),
     )
 
@@ -170,6 +172,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--live-orders",
         action="store_true",
         help="Required safety acknowledgement for --trade-mode live. This sends real kabu futures orders.",
+    )
+    parser.add_argument(
+        "--real-trading",
+        action="store_true",
+        help="Shortcut for --trade-mode live --live-orders. This sends real kabu futures orders.",
     )
     parser.add_argument(
         "--keep-registered-symbols",

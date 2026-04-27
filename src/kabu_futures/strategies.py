@@ -397,6 +397,7 @@ class MicroStrategyEngine:
 
         metadata = {
             "mode": self.config.mode,
+            "invert_direction": self.config.invert_direction,
             "spread_ticks": features.spread_ticks,
             "spread_required_ticks": self.config.spread_ticks_required,
             "spread_ok": spread_ok,
@@ -458,14 +459,14 @@ class MicroStrategyEngine:
 
         if long_ok:
             self.last_signal_time = book.timestamp
-            signal = Signal("micro_book", book.symbol, "long", 0.65, book.best_ask_price, "micro_book_long", metadata)
-            evaluation = SignalEvaluation("micro_book", book.symbol, book.timestamp, "allow", signal.reason, "long", metadata)
+            signal = self._build_signal(book, "long", metadata)
+            evaluation = SignalEvaluation("micro_book", book.symbol, book.timestamp, "allow", signal.reason, signal.direction, metadata)
             self.last_evaluation = evaluation
             return signal, evaluation
         if short_ok:
             self.last_signal_time = book.timestamp
-            signal = Signal("micro_book", book.symbol, "short", 0.65, book.best_bid_price, "micro_book_short", metadata)
-            evaluation = SignalEvaluation("micro_book", book.symbol, book.timestamp, "allow", signal.reason, "short", metadata)
+            signal = self._build_signal(book, "short", metadata)
+            evaluation = SignalEvaluation("micro_book", book.symbol, book.timestamp, "allow", signal.reason, signal.direction, metadata)
             self.last_evaluation = evaluation
             return signal, evaluation
 
@@ -491,6 +492,17 @@ class MicroStrategyEngine:
         )
         self.last_evaluation = evaluation
         return None, evaluation
+
+    def _build_signal(self, book: OrderBook, raw_direction: Direction, metadata: dict[str, object]) -> Signal:
+        direction = _opposite(raw_direction) if self.config.invert_direction else raw_direction
+        signal_metadata = dict(metadata)
+        signal_metadata["raw_signal_direction"] = raw_direction
+        signal_metadata["executed_signal_direction"] = direction
+        if self.config.invert_direction:
+            signal_metadata["direction_inverted"] = True
+        price = book.best_ask_price if direction == "long" else book.best_bid_price
+        reason = f"micro_book_{direction}" if not self.config.invert_direction else f"micro_book_inverted_{direction}"
+        return Signal("micro_book", book.symbol, direction, 0.65, price, reason, signal_metadata)
 
     def _too_soon(self, timestamp: datetime) -> bool:
         if self.last_signal_time is None:
@@ -531,3 +543,11 @@ class MicroStrategyEngine:
         if (not topix_long_ok and imbalance_long_ok) or (not topix_short_ok and imbalance_short_ok):
             return "topix_bias_conflict"
         return "micro_no_directional_edge"
+
+
+def _opposite(direction: Direction) -> Direction:
+    if direction == "long":
+        return "short"
+    if direction == "short":
+        return "long"
+    return "flat"

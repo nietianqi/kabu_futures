@@ -220,6 +220,18 @@ class DualStrategyEngine:
 
     def _minute_observe_only_reason(self, signal: Signal) -> str | None:
         if (
+            self.config.minute_engine.trend_pullback_long_observe_only
+            and signal.engine == "minute_vwap"
+            and signal.reason == "trend_pullback_long"
+        ):
+            return "trend_pullback_long_observe_only"
+        if (
+            self.config.minute_engine.trend_pullback_short_observe_only
+            and signal.engine == "minute_vwap"
+            and signal.reason == "trend_pullback_short"
+        ):
+            return "trend_pullback_short_observe_only"
+        if (
             self.config.minute_engine.directional_intraday_long_observe_only
             and signal.engine == "directional_intraday"
             and signal.direction == "long"

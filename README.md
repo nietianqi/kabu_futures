@@ -7,6 +7,7 @@ The code is intentionally safe by default:
 - Microstructure mode defaults to `observe_only`.
 - `python main.py` runs in `observe` execution mode by default and never sends real orders.
 - `--trade-mode paper` creates simulated paper positions only; live `/sendorder/future` is not enabled.
+- Real orders require the explicit `--real-trading` shortcut, or both `--trade-mode live --live-orders`.
 - Strategy, risk, order payload, and market microstructure logic can be tested without kabu Station.
 
 ## Layout
@@ -84,7 +85,7 @@ The strategy uses a unified JST session gate. Market data, bars, micro features,
 
 Practical rhythm: start kabu Station after `06:30`, prepare symbols before `08:45`, stop aggressive new entries at `15:40`, prepare night session at `16:45`, trade again from `17:00`, stop new entries at `05:55`, then save/exit before `06:15`. The old `micro_engine.no_new_entry_windows_jst` field still exists for extra local blackout windows, but its default is empty because the session gate now owns the official JPX/kabu schedule.
 
-`directional_intraday` long signals are also observe-only by default after the latest log review. They remain visible in logs as diagnostics, but do not create paper entries unless `minute_engine.directional_intraday_long_observe_only` is disabled in config.
+`minute_vwap` trend-pullback signals and `directional_intraday` long signals are observe-only by default after the 2026-04-27 log review. They remain visible in logs as diagnostics, but do not create paper entries unless the corresponding `minute_engine.*_observe_only` flags are disabled in config.
 
 ## Paper Execution
 
@@ -112,6 +113,9 @@ Real kabu futures orders are available only when both switches are present:
 
 ```powershell
 python main.py --trade-mode live --live-orders
+
+# Equivalent explicit shortcut
+python main.py --real-trading
 ```
 
 Live v1 is intentionally narrow:
@@ -125,6 +129,8 @@ Live v1 is intentionally narrow:
 - keeps one active live position/order path at a time.
 
 Live events are written to JSONL as `live_order_submitted`, `live_order_error`, `live_position_detected`, `live_position_flat`, and `live_sync_error`. Heartbeats include `live_position`, `live_pending_entry`, `live_pending_exit`, `live_orders_submitted`, and `live_order_errors`.
+
+The current micro strategy remains conservative and may submit zero live orders if no `micro_book` signal passes all gates. If live order plumbing must be smoke-tested, use a tiny `max_order_qty=1` config and watch `live_orders_submitted`, `live_order_errors`, and the kabu Station order screen.
 
 ## Offline Evolution And Tuning
 
@@ -145,6 +151,12 @@ python scripts\tune_micro_params.py logs\live_20260427_145035.jsonl --config con
 
 The tuner is report-only. It never overwrites `config/local.json`; use the output as a challenger candidate for review.
 
+Latest 2026-04-27 pipeline result: the report-only evolution gate correctly rejected the imbalance-only challenger. Across the aggregated paper replay (`401k+` books), paper PnL was negative, short-horizon markout was negative, and walk-forward pass rate was `0.0`. Treat `imbalance_entry` tuning as insufficient by itself. The next safe experiments are:
+
+- keep `trend_pullback_long/short` observe-only;
+- test `micro_engine.invert_direction=true` only in paper/offline mode;
+- split markout by regime before promoting any new live configuration.
+
 ## Replay JSONL Snapshots
 
 ```powershell
@@ -163,7 +175,7 @@ Current live logs use the buffered `{"kind":"book","payload":...}` format and ar
 Notes for kabu futures data:
 
 - `TradingVolume` is cumulative, so the bar builder converts it to per-bar incremental volume before computing VWAP and volume ratios.
-- kabu can occasionally emit equal best quotes such as `BidPrice == AskPrice`; the normalizer records `market_data_error` and skips those snapshots instead of reconnecting.
+- kabu can occasionally emit equal or crossed best quotes such as `BidPrice == AskPrice`; the normalizer records `market_data_skip` and skips those snapshots instead of treating them as connection errors.
 - **kabu Bid/Ask reversal**: kabu PUSH board encodes `BidPrice` as the best *sell* quote and `AskPrice` as the best *buy* quote, the opposite of standard market data conventions. `KabuBoardNormalizer` corrects this mapping so that `OrderBook.best_bid_price` is always the highest buyer price and `best_ask_price` the lowest seller price. This is also documented in `OrderBook` class docstring in `models.py`.
 
 ## Signal Flow

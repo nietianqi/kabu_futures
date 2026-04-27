@@ -16,12 +16,15 @@
     "take_profit_r": 1.5,
     "breakeven_after_r": 1.0,
     "max_hold_minutes": 45,
+    "trend_pullback_long_observe_only": true,
+    "trend_pullback_short_observe_only": true,
     "directional_intraday_long_observe_only": true
   },
   "micro_engine": {
     "mode": "observe_only",
     "qty": 1,
     "depth_levels": 5,
+    "invert_direction": false,
     "imbalance_entry": 0.3,
     "imbalance_exit": 0.1,
     "microprice_entry_ticks": 0.15,

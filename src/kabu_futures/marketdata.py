@@ -14,6 +14,10 @@ class MarketDataError(ValueError):
     pass
 
 
+class MarketDataSkip(ValueError):
+    """Recoverable market-data condition that should be logged as a skip, not an error."""
+
+
 def _parse_time(value: Any, fallback: datetime | None = None) -> datetime:
     if isinstance(value, datetime):
         return value
@@ -81,7 +85,7 @@ class KabuBoardNormalizer:
             raise MarketDataError("Payload does not include valid bid/ask prices")
 
         if raw_sell_price <= raw_buy_price:
-            raise MarketDataError(
+            raise MarketDataSkip(
                 f"Invalid kabu quote: best sell must be greater than best buy "
                 f"(raw BidPrice={raw_sell_price}, raw AskPrice={raw_buy_price})"
             )

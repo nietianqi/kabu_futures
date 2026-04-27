@@ -25,7 +25,7 @@ from kabu_futures.indicators import BarBuilder
 from kabu_futures.live import _should_print_tick, tick_to_dict, signal_to_dict
 from kabu_futures.live_execution import LiveExecutionController
 from kabu_futures.microstructure import BookFeatureEngine, RollingPercentile, microprice, percentile, weighted_imbalance
-from kabu_futures.marketdata import BufferedJsonlMarketRecorder, KabuBoardNormalizer, MarketDataError, signal_evaluation_to_dict
+from kabu_futures.marketdata import BufferedJsonlMarketRecorder, KabuBoardNormalizer, MarketDataError, MarketDataSkip, signal_evaluation_to_dict
 from kabu_futures.models import (
     AlphaSignal,
     Bar,
@@ -195,6 +195,36 @@ class MicrostructureTests(unittest.TestCase):
         self.assertIsNotNone(signal)
         engine.features.update.assert_not_called()
 
+    def test_micro_strategy_can_invert_direction_for_experiment(self) -> None:
+        base_cfg = default_config()
+        cfg = replace(base_cfg.micro_engine, invert_direction=True)
+        engine = MicroStrategyEngine(cfg)
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        b = book(ts, bid_qty=300, ask_qty=20)
+        features = BookFeatures(
+            timestamp=ts,
+            symbol="NK225micro",
+            spread_ticks=1.0,
+            imbalance=0.6,
+            ofi=80.0,
+            ofi_ewma=80.0,
+            ofi_threshold=10.0,
+            microprice=b.mid_price + 1.0,
+            microprice_edge_ticks=0.2,
+            total_depth=500.0,
+            jump_detected=False,
+            latency_ms=10.0,
+        )
+        signal, evaluation = engine.evaluate_book(b, now=ts, features=features)
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertEqual(signal.direction, "short")
+        self.assertEqual(signal.price, b.best_bid_price)
+        self.assertEqual(signal.reason, "micro_book_inverted_short")
+        self.assertEqual(signal.metadata["raw_signal_direction"], "long")
+        self.assertEqual(signal.metadata["executed_signal_direction"], "short")
+        self.assertEqual(evaluation.candidate_direction, "short")
+
     def test_micro_strategy_evaluation_records_reject_reason(self) -> None:
         cfg = default_config().micro_engine
         engine = MicroStrategyEngine(cfg)
@@ -282,6 +312,13 @@ class MinuteStrategyTests(unittest.TestCase):
         self.assertIsNotNone(signal)
         self.assertEqual(signal.engine, "directional_intraday")
         self.assertEqual(signal.direction, "long")
+
+    def test_trend_pullback_signals_are_observe_only_by_default(self) -> None:
+        engine = DualStrategyEngine(default_config())
+        long_signal = Signal("minute_vwap", "NK225micro", "long", 0.7, 50005, "trend_pullback_long")
+        short_signal = Signal("minute_vwap", "NK225micro", "short", 0.7, 50000, "trend_pullback_short")
+        self.assertEqual(engine._minute_observe_only_reason(long_signal), "trend_pullback_long_observe_only")
+        self.assertEqual(engine._minute_observe_only_reason(short_signal), "trend_pullback_short_observe_only")
 
 
 class OrderTests(unittest.TestCase):
@@ -374,7 +411,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertEqual(normalized.timestamp, received_at)
         self.assertEqual(normalized.received_at, received_at)
 
-    def test_kabu_normalizer_rejects_crossed_kabu_quote(self) -> None:
+    def test_kabu_normalizer_skips_locked_or_crossed_kabu_quote(self) -> None:
         payload = {
             "Symbol": "NK225micro",
             "BidPrice": 50000,
@@ -383,6 +420,11 @@ class MarketDataAndExecutionTests(unittest.TestCase):
             "AskQty": 20,
             "CurrentPriceTime": "2026-04-23T09:00:00+09:00",
         }
+        with self.assertRaises(MarketDataSkip):
+            KabuBoardNormalizer().normalize(payload)
+
+    def test_kabu_normalizer_errors_when_quotes_are_missing(self) -> None:
+        payload = {"Symbol": "NK225micro", "CurrentPriceTime": "2026-04-23T09:00:00+09:00"}
         with self.assertRaises(MarketDataError):
             KabuBoardNormalizer().normalize(payload)
 

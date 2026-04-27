@@ -11,7 +11,7 @@ from .api import KabuStationClient, build_future_registration_symbols
 from .config import StrategyConfig
 from .engine import DualStrategyEngine
 from .live_execution import LiveExecutionController
-from .marketdata import BufferedJsonlMarketRecorder, KabuBoardNormalizer, KabuWebSocketStream, MarketDataError
+from .marketdata import BufferedJsonlMarketRecorder, KabuBoardNormalizer, KabuWebSocketStream, MarketDataError, MarketDataSkip
 from .models import OrderBook, Signal
 from .paper_execution import ExecutionEvent, PaperExecutionController, PaperFillModel, TradeMode
 from .sessions import SessionState, classify_jst_session
@@ -275,6 +275,7 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
     stream = KabuWebSocketStream(client.websocket_base_url(), normalizer)
     processed = 0
     market_data_errors = 0
+    market_data_skips = 0
     signals_count = 0
     signal_eval_count = 0
     signal_allow_count = 0
@@ -293,6 +294,25 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                     event_start = time.perf_counter()
                     try:
                         book = normalizer.normalize_raw(raw, received_at=received_at)
+                    except MarketDataSkip as exc:
+                        market_data_skips += 1
+                        recorder.write(
+                            "market_data_skip",
+                            {"reason": str(exc), "raw": raw, "received_at": received_at.isoformat()},
+                            force_flush=market_data_skips == 1 or market_data_skips % error_sample_rate == 0,
+                        )
+                        if market_data_skips == 1 or market_data_skips % error_sample_rate == 0:
+                            print(
+                                json.dumps(
+                                    {
+                                        "event": "market_data_skip",
+                                        "reason": str(exc),
+                                        "count": market_data_skips,
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            )
+                        continue
                     except (MarketDataError, ValueError, json.JSONDecodeError) as exc:
                         market_data_errors += 1
                         recorder.write(
@@ -354,6 +374,7 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                             "books_per_sec": round(processed / elapsed, 2),
                             "avg_process_ms": round(process_time_total_ms / processed, 4),
                             "market_data_errors": market_data_errors,
+                            "market_data_skips": market_data_skips,
                             "signals_count": signals_count,
                             "signal_eval_count": signal_eval_count,
                             "signal_allow_count": signal_allow_count,

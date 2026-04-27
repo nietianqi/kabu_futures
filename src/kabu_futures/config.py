@@ -25,6 +25,8 @@ class MinuteEngineConfig:
     take_profit_r: float = 1.5
     breakeven_after_r: float = 1.0
     max_hold_minutes: int = 45
+    trend_pullback_long_observe_only: bool = True
+    trend_pullback_short_observe_only: bool = True
     directional_intraday_long_observe_only: bool = True
 
 
@@ -33,6 +35,7 @@ class MicroEngineConfig:
     mode: str = "observe_only"
     qty: int = 1
     depth_levels: int = 5
+    invert_direction: bool = False
     imbalance_entry: float = 0.30
     imbalance_exit: float = 0.10
     microprice_entry_ticks: float = 0.15
