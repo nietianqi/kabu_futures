@@ -88,13 +88,7 @@ class KabuBoardNormalizer:
 
         buy_levels = buy_levels or (Level(raw_buy_price, raw_buy_qty),)
         sell_levels = sell_levels or (Level(raw_sell_price, raw_sell_qty),)
-        timestamp = _parse_time(
-            payload.get("CurrentPriceTime")
-            or payload.get("BidTime")
-            or payload.get("AskTime")
-            or payload.get("timestamp"),
-            fallback=received_at,
-        )
+        timestamp = _book_event_time(payload, received_at)
         book = OrderBook(
             symbol=symbol,
             timestamp=timestamp,
@@ -230,6 +224,18 @@ class BufferedJsonlMarketRecorder(JsonlMarketRecorder):
 
 def _dt(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
+
+
+def _book_event_time(payload: dict[str, Any], received_at: datetime | None) -> datetime:
+    if received_at is not None:
+        return received_at
+    return _parse_time(
+        payload.get("timestamp")
+        or payload.get("BidTime")
+        or payload.get("AskTime")
+        or payload.get("CurrentPriceTime"),
+        fallback=received_at,
+    )
 
 
 def level_to_dict(level: Level) -> dict[str, float]:

@@ -92,11 +92,15 @@ def live_loop(args: argparse.Namespace) -> int:
             trade_mode=args.trade_mode,
             paper_fill_model=args.paper_fill_model,
             paper_console=not args.no_paper_console,
+            live_orders=args.live_orders,
         ),
     )
 
 
 def replay_sample(args: argparse.Namespace) -> int:
+    if args.trade_mode == "live":
+        print("--replay-sample does not support --trade-mode live; use observe or paper.", file=sys.stderr)
+        return 2
     config_path = args.config or ROOT / "config" / "local.json"
     replay_path = args.path or ROOT / "data" / "sample_market_data.jsonl"
     for event in replay_jsonl(replay_path, config_path, trade_mode=args.trade_mode):
@@ -147,9 +151,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tick-log-interval", type=int, default=1, help="Console tick interval when --tick-log-mode sample is used.")
     parser.add_argument(
         "--trade-mode",
-        choices=("observe", "paper"),
+        choices=("observe", "paper", "live"),
         default="observe",
-        help="Execution mode. Default observe never creates paper or live orders.",
+        help="Execution mode. Default observe never creates paper or live orders. live requires --live-orders.",
     )
     parser.add_argument(
         "--paper-fill-model",
@@ -161,6 +165,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-paper-console",
         action="store_true",
         help="Write paper execution events to logs only, without printing them to console.",
+    )
+    parser.add_argument(
+        "--live-orders",
+        action="store_true",
+        help="Required safety acknowledgement for --trade-mode live. This sends real kabu futures orders.",
     )
     parser.add_argument(
         "--keep-registered-symbols",

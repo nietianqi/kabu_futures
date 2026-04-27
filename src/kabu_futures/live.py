@@ -10,6 +10,7 @@ from typing import Any, Literal
 from .api import KabuStationClient, build_future_registration_symbols
 from .config import StrategyConfig
 from .engine import DualStrategyEngine
+from .live_execution import LiveExecutionController
 from .marketdata import BufferedJsonlMarketRecorder, KabuBoardNormalizer, KabuWebSocketStream, MarketDataError
 from .models import OrderBook, Signal
 from .paper_execution import ExecutionEvent, PaperExecutionController, PaperFillModel, TradeMode
@@ -41,6 +42,7 @@ class LiveRunOptions:
     trade_mode: TradeMode = "observe"
     paper_fill_model: PaperFillModel = "immediate"
     paper_console: bool = True
+    live_orders: bool = False
 
 
 def signal_to_dict(signal: Signal) -> dict[str, Any]:
@@ -116,6 +118,28 @@ def _symbol_aliases(resolved: list[dict[str, Any]]) -> dict[str, str]:
     return aliases
 
 
+def _symbol_codes(resolved: list[dict[str, Any]]) -> dict[str, str]:
+    codes: dict[str, str] = {}
+    for item in resolved:
+        future_code = item.get("FutureCode")
+        symbol = item.get("Symbol")
+        if future_code is not None and symbol is not None:
+            codes[str(future_code)] = str(symbol)
+    return codes
+
+
+def _execution_exchange(session_phase: str, exchanges: tuple[int, ...]) -> int:
+    if session_phase.startswith("night") and 24 in exchanges:
+        return 24
+    if session_phase.startswith("day") and 23 in exchanges:
+        return 23
+    if session_phase == "between_sessions" and 24 in exchanges:
+        return 24
+    if session_phase in ("api_prepare", "day_preopen") and 23 in exchanges:
+        return 23
+    return exchanges[0] if exchanges else 23
+
+
 def _should_log_book(mode: BookLogMode, processed: int, sample_interval: int) -> bool:
     if mode == "full":
         return True
@@ -154,6 +178,19 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                 {
                     "event": "startup_blocked",
                     "reason": "api_maintenance",
+                    **_session_state_to_dict(startup_session),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 2
+    if options.trade_mode == "live" and not options.live_orders:
+        print(
+            json.dumps(
+                {
+                    "event": "startup_blocked",
+                    "reason": "live_orders_flag_required",
+                    "message": "Pass --live-orders together with --trade-mode live to send real kabu orders.",
                     **_session_state_to_dict(startup_session),
                 },
                 ensure_ascii=False,
@@ -203,6 +240,8 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
             "trade_mode": options.trade_mode,
             "paper_fill_model": options.paper_fill_model,
             "paper_console": options.paper_console,
+            "live_orders": options.live_orders,
+            "live_supported_engines": config.live_execution.supported_engines,
             **_session_state_to_dict(startup_session),
             "no_new_entry_windows_jst": config.micro_engine.no_new_entry_windows_jst,
         },
@@ -215,6 +254,7 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                 "log": str(recorder.path),
                 "resolved": resolved,
                 "trade_mode": options.trade_mode,
+                "live_orders": options.live_orders,
                 **_session_state_to_dict(startup_session),
             },
             ensure_ascii=False,
@@ -227,7 +267,10 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
         return 0
 
     engine = DualStrategyEngine(config)
-    execution = PaperExecutionController(config, options.trade_mode, options.paper_fill_model)
+    if options.trade_mode == "live":
+        execution = LiveExecutionController(client, config, _symbol_codes(resolved))
+    else:
+        execution = PaperExecutionController(config, options.trade_mode, options.paper_fill_model)
     normalizer = KabuBoardNormalizer(symbol_aliases=_symbol_aliases(resolved))
     stream = KabuWebSocketStream(client.websocket_base_url(), normalizer)
     processed = 0
@@ -275,6 +318,8 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                     if _should_print_tick(options.tick_log_mode, processed, tick_interval, book, last_tick_state):
                         print(json.dumps(tick_to_dict(book, processed), ensure_ascii=False))
                     last_tick_state[book.symbol] = _tick_state(book)
+                    session_state = classify_jst_session(book.timestamp, config.session_schedule)
+                    exchange = _execution_exchange(session_state.phase, options.exchanges)
                     signals = engine.on_order_book(book)
                     signal_evaluations = engine.latest_signal_evaluations
                     signal_eval_count += len(signal_evaluations)
@@ -282,7 +327,10 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                     signal_reject_count += sum(1 for evaluation in signal_evaluations if evaluation.decision == "reject")
                     for evaluation in signal_evaluations:
                         recorder.write("signal_eval", evaluation)
-                    execution_events = execution.on_book(book, engine.latest_book_features)
+                    if options.trade_mode == "live":
+                        execution_events = execution.on_book(book, engine.latest_book_features, exchange)
+                    else:
+                        execution_events = execution.on_book(book, engine.latest_book_features)
                     execution_events_count += len(execution_events)
                     _write_execution_events(recorder, execution_events, options.paper_console)
                     signals_count += len(signals)
@@ -291,13 +339,15 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                         print(json.dumps({"event": "signal", **signal_to_dict(signal)}, ensure_ascii=False))
                         if not signal.is_tradeable:
                             continue
-                        execution_events = execution.on_signal(signal, book)
+                        if options.trade_mode == "live":
+                            execution_events = execution.on_signal(signal, book, exchange)
+                        else:
+                            execution_events = execution.on_signal(signal, book)
                         execution_events_count += len(execution_events)
                         _write_execution_events(recorder, execution_events, options.paper_console)
                     process_time_total_ms += (time.perf_counter() - event_start) * 1000.0
                     if processed % heartbeat_interval == 0:
                         elapsed = max(0.001, time.perf_counter() - started_perf)
-                        session_state = classify_jst_session(book.timestamp, config.session_schedule)
                         heartbeat = {
                             "event": "heartbeat",
                             "books": processed,

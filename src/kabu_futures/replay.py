@@ -41,6 +41,8 @@ def replay_jsonl(
     config_path: str | Path | None = None,
     trade_mode: TradeMode = "observe",
 ) -> list[dict[str, Any]]:
+    if trade_mode == "live":
+        raise ValueError("replay_jsonl does not support live execution")
     config = load_json_config(config_path) if config_path else default_config()
     engine = DualStrategyEngine(config)
     execution = PaperExecutionController(config, trade_mode=trade_mode)

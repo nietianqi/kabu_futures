@@ -15,7 +15,8 @@
     "stop_atr_mult": 0.8,
     "take_profit_r": 1.5,
     "breakeven_after_r": 1.0,
-    "max_hold_minutes": 45
+    "max_hold_minutes": 45,
+    "directional_intraday_long_observe_only": true
   },
   "micro_engine": {
     "mode": "observe_only",
@@ -33,7 +34,29 @@
     "max_new_entries_per_minute": 6,
     "websocket_latency_stop_ms": 500,
     "consecutive_loss_stop": 5,
-    "avg_slippage_stop_ticks": 2
+    "avg_slippage_stop_ticks": 2,
+    "no_new_entry_windows_jst": []
+  },
+  "session_schedule": {
+    "api_maintenance": "06:15-06:30",
+    "api_prepare": "06:30-08:00",
+    "day_preopen": "08:00-08:45",
+    "day_continuous": "08:45-15:40",
+    "day_closing_call": "15:40-15:45",
+    "between_sessions": "15:45-16:45",
+    "night_preopen": "16:45-17:00",
+    "night_continuous": "17:00-05:55",
+    "night_closing_call": "05:55-06:00",
+    "post_close": "06:00-06:15",
+    "allow_new_entry_phases": ["day_continuous", "night_continuous"]
+  },
+  "live_execution": {
+    "max_order_qty": 1,
+    "supported_engines": ["micro_book"],
+    "entry_time_in_force": 2,
+    "exit_time_in_force": 2,
+    "position_poll_interval_seconds": 1.0,
+    "max_pending_entry_seconds": 8
   },
   "nt_spread": {
     "enabled": true,

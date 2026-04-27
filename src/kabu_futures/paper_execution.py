@@ -9,9 +9,21 @@ from .execution import MicroTradeManager
 from .models import BookFeatures, Direction, OrderBook, Signal
 
 
-TradeMode = Literal["observe", "paper"]
+TradeMode = Literal["observe", "paper", "live"]
 PaperFillModel = Literal["immediate", "touch"]
-ExecutionEventType = Literal["paper_entry", "paper_exit", "paper_pending", "paper_cancel", "execution_reject", "execution_skip"]
+ExecutionEventType = Literal[
+    "paper_entry",
+    "paper_exit",
+    "paper_pending",
+    "paper_cancel",
+    "execution_reject",
+    "execution_skip",
+    "live_order_submitted",
+    "live_order_error",
+    "live_position_detected",
+    "live_position_flat",
+    "live_sync_error",
+]
 
 
 @dataclass(frozen=True)

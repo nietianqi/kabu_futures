@@ -22,6 +22,7 @@ The code is intentionally safe by default:
 - `src/kabu_futures/marketdata.py`: kabu board/PUSH normalizer, optional WebSocket reader, JSONL recorder.
 - `src/kabu_futures/execution.py`: micro-trade take-profit/stop-loss/time-stop manager.
 - `src/kabu_futures/paper_execution.py`: paper-only controller/executor lifecycle for micro and minute-level signals.
+- `src/kabu_futures/live_execution.py`: explicitly gated kabu `/sendorder/future` executor for real futures orders.
 - `src/kabu_futures/sessions.py`: JST futures session classification and new-entry gate.
 - `src/kabu_futures/evolution.py`: offline replay report with signal attribution, paper PnL, and markout.
 - `src/kabu_futures/tuning.py`: report-only micro parameter grid evaluation.
@@ -104,6 +105,26 @@ python main.py --replay-sample --path logs\live_20260423_222539.jsonl --trade-mo
 ```
 
 Paper events are written to the JSONL log as `paper_pending`, `paper_entry`, `paper_exit`, `paper_cancel`, `execution_reject`, and `execution_skip`. In observe mode, tradeable signals produce `execution_skip` with reason `observe_mode`. V1 keeps a single active paper position across micro and minute executors. Heartbeats keep the legacy aggregate fields `paper_position`, `paper_pending_order`, `paper_trades`, `paper_pnl_ticks`, and `paper_pnl_yen`, and add split fields such as `paper_micro_position`, `paper_minute_position`, `paper_micro_trades`, and `paper_minute_trades`.
+
+## Live Execution
+
+Real kabu futures orders are available only when both switches are present:
+
+```powershell
+python main.py --trade-mode live --live-orders
+```
+
+Live v1 is intentionally narrow:
+
+- supports only `micro_book` signals;
+- rejects `minute_orb`, `minute_vwap`, and `directional_intraday` with `live_unsupported_signal_engine`;
+- submits FAK limit entry orders through `/sendorder/future`;
+- polls `/positions?product=3&symbol=...` to confirm the real position;
+- uses the same micro exit logic for take-profit, stop-loss, time-stop, and feature exits;
+- submits close orders through `/sendorder/future`, using `ClosePositions` when a hold ID is available;
+- keeps one active live position/order path at a time.
+
+Live events are written to JSONL as `live_order_submitted`, `live_order_error`, `live_position_detected`, `live_position_flat`, and `live_sync_error`. Heartbeats include `live_position`, `live_pending_entry`, `live_pending_exit`, `live_orders_submitted`, and `live_order_errors`.
 
 ## Offline Evolution And Tuning
 

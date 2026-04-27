@@ -23,6 +23,7 @@ from kabu_futures.engine import DualStrategyEngine
 from kabu_futures.evolution import analyze_micro_log, calculate_markout_ticks
 from kabu_futures.indicators import BarBuilder
 from kabu_futures.live import _should_print_tick, tick_to_dict, signal_to_dict
+from kabu_futures.live_execution import LiveExecutionController
 from kabu_futures.microstructure import BookFeatureEngine, RollingPercentile, microprice, percentile, weighted_imbalance
 from kabu_futures.marketdata import BufferedJsonlMarketRecorder, KabuBoardNormalizer, MarketDataError, signal_evaluation_to_dict
 from kabu_futures.models import (
@@ -359,6 +360,20 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertEqual(normalized.best_bid_price, 50000)
         self.assertEqual(normalized.best_ask_price, 50005)
 
+    def test_kabu_normalizer_uses_received_at_as_live_book_clock(self) -> None:
+        payload = {
+            "Symbol": "TOPIXmini",
+            "BidPrice": 3731.5,
+            "BidQty": 1,
+            "AskPrice": 3731.25,
+            "AskQty": 1,
+            "CurrentPriceTime": "2026-04-27T15:45:01+09:00",
+        }
+        received_at = datetime(2026, 4, 27, 12, 31, 38, tzinfo=timezone.utc)
+        normalized = KabuBoardNormalizer().normalize(payload, received_at=received_at)
+        self.assertEqual(normalized.timestamp, received_at)
+        self.assertEqual(normalized.received_at, received_at)
+
     def test_kabu_normalizer_rejects_crossed_kabu_quote(self) -> None:
         payload = {
             "Symbol": "NK225micro",
@@ -659,6 +674,91 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         events = controller.on_book(book(exit_ts, bid=50015, ask=50020))
         self.assertEqual(events[0].event_type, "paper_exit")
         self.assertGreater(events[0].pnl_ticks or 0, 0)
+
+    def test_live_micro_signal_submits_kabu_future_order(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                return {"Result": 0, "OrderId": f"O{len(self.sent)}"}
+
+            def positions(self, **query: object) -> dict[str, object]:
+                return {"data": []}
+
+        client = FakeClient()
+        controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+        events = controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+        self.assertEqual(events[0].event_type, "live_order_submitted")
+        self.assertEqual(client.sent[0]["Symbol"], "161060023")
+        self.assertEqual(client.sent[0]["Exchange"], 24)
+        self.assertEqual(client.sent[0]["TradeType"], 1)
+        self.assertEqual(client.sent[0]["Side"], "2")
+        self.assertEqual(client.sent[0]["Qty"], 1)
+
+    def test_live_rejects_minute_signal_without_order(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                return {"Result": 0, "OrderId": "O1"}
+
+        client = FakeClient()
+        controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+        events = controller.on_signal(
+            Signal("minute_vwap", "NK225micro", "long", 0.8, 50005, "trend_pullback_long"),
+            book(ts),
+            exchange=24,
+        )
+        self.assertEqual(events[0].event_type, "execution_reject")
+        self.assertEqual(events[0].reason, "live_unsupported_signal_engine")
+        self.assertEqual(client.sent, [])
+
+    def test_live_syncs_position_and_submits_exit_order_on_stop(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+                self.position_open = False
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                if payload["TradeType"] == 1:
+                    self.position_open = True
+                return {"Result": 0, "OrderId": f"O{len(self.sent)}"}
+
+            def positions(self, **query: object) -> dict[str, object]:
+                if not self.position_open:
+                    return {"data": []}
+                return {
+                    "data": [
+                        {
+                            "ExecutionID": "E1",
+                            "Symbol": "161060023",
+                            "Exchange": 24,
+                            "Price": 50005,
+                            "LeavesQty": 1,
+                            "Side": "2",
+                        }
+                    ]
+                }
+
+        client = FakeClient()
+        controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+        sync_events = controller.on_book(book(ts + timedelta(seconds=2), bid=50000, ask=50005), None, exchange=24)
+        self.assertEqual(sync_events[0].event_type, "live_position_detected")
+        exit_events = controller.on_book(book(ts + timedelta(seconds=4), bid=49990, ask=49995), None, exchange=24)
+        self.assertEqual(exit_events[0].event_type, "live_order_submitted")
+        self.assertEqual(exit_events[0].metadata["exit_reason"], "stop_loss")
+        self.assertEqual(client.sent[-1]["TradeType"], 2)
+        self.assertEqual(client.sent[-1]["Side"], "1")
+        self.assertEqual(client.sent[-1]["ClosePositions"], [{"HoldID": "E1", "Qty": 1}])
 
     def test_directional_intraday_long_is_observe_only_by_default(self) -> None:
         engine = DualStrategyEngine(default_config())

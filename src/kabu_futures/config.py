@@ -65,6 +65,16 @@ class SessionScheduleConfig:
 
 
 @dataclass(frozen=True)
+class LiveExecutionConfig:
+    max_order_qty: int = 1
+    supported_engines: tuple[str, ...] = ("micro_book",)
+    entry_time_in_force: int = 2
+    exit_time_in_force: int = 2
+    position_poll_interval_seconds: float = 1.0
+    max_pending_entry_seconds: int = 8
+
+
+@dataclass(frozen=True)
 class NTSpreadConfig:
     enabled: bool = True
     mode: str = "shadow"
@@ -154,6 +164,7 @@ class StrategyConfig:
     minute_engine: MinuteEngineConfig = field(default_factory=MinuteEngineConfig)
     micro_engine: MicroEngineConfig = field(default_factory=MicroEngineConfig)
     session_schedule: SessionScheduleConfig = field(default_factory=SessionScheduleConfig)
+    live_execution: LiveExecutionConfig = field(default_factory=LiveExecutionConfig)
     nt_spread: NTSpreadConfig = field(default_factory=NTSpreadConfig)
     lead_lag: LeadLagConfig = field(default_factory=LeadLagConfig)
     alpha_stack: AlphaStackConfig = field(default_factory=AlphaStackConfig)
@@ -199,6 +210,7 @@ def load_json_config(path: str | Path) -> StrategyConfig:
         minute_engine=_merge_dataclass(MinuteEngineConfig, data.get("minute_engine", {})),
         micro_engine=_merge_dataclass(MicroEngineConfig, data.get("micro_engine", {})),
         session_schedule=_merge_dataclass(SessionScheduleConfig, data.get("session_schedule", {})),
+        live_execution=_merge_dataclass(LiveExecutionConfig, data.get("live_execution", {})),
         nt_spread=_merge_dataclass(NTSpreadConfig, data.get("nt_spread", {})),
         lead_lag=_merge_dataclass(LeadLagConfig, data.get("lead_lag", {})),
         alpha_stack=_merge_dataclass(AlphaStackConfig, data.get("alpha_stack", {})),
