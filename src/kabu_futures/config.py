@@ -76,6 +76,10 @@ class LiveExecutionConfig:
     exit_time_in_force: int = 1
     position_poll_interval_seconds: float = 1.0
     max_pending_entry_seconds: int = 8
+    pending_entry_grace_seconds: int = 20
+    max_consecutive_exit_failures: int = 3
+    max_consecutive_entry_failures: int = 3
+    entry_failure_cooldown_seconds: int = 30
 
 
 @dataclass(frozen=True)
@@ -193,6 +197,35 @@ class StrategyConfig:
         if self.live_execution.entry_slippage_ticks < 0:
             raise ValueError(
                 f"live_execution.entry_slippage_ticks must be non-negative, got {self.live_execution.entry_slippage_ticks}"
+            )
+        if self.live_execution.position_poll_interval_seconds <= 0:
+            raise ValueError(
+                "live_execution.position_poll_interval_seconds must be positive, "
+                f"got {self.live_execution.position_poll_interval_seconds}"
+            )
+        if self.live_execution.max_pending_entry_seconds <= 0:
+            raise ValueError(
+                f"live_execution.max_pending_entry_seconds must be positive, got {self.live_execution.max_pending_entry_seconds}"
+            )
+        if self.live_execution.pending_entry_grace_seconds < self.live_execution.max_pending_entry_seconds:
+            raise ValueError(
+                "live_execution.pending_entry_grace_seconds must be greater than or equal to "
+                f"max_pending_entry_seconds ({self.live_execution.max_pending_entry_seconds}), "
+                f"got {self.live_execution.pending_entry_grace_seconds}"
+            )
+        if self.live_execution.max_consecutive_exit_failures <= 0:
+            raise ValueError(
+                f"live_execution.max_consecutive_exit_failures must be positive, got {self.live_execution.max_consecutive_exit_failures}"
+            )
+        if self.live_execution.max_consecutive_entry_failures <= 0:
+            raise ValueError(
+                "live_execution.max_consecutive_entry_failures must be positive, "
+                f"got {self.live_execution.max_consecutive_entry_failures}"
+            )
+        if self.live_execution.entry_failure_cooldown_seconds < 0:
+            raise ValueError(
+                "live_execution.entry_failure_cooldown_seconds must be non-negative, "
+                f"got {self.live_execution.entry_failure_cooldown_seconds}"
             )
         if self.risk.max_positions_per_symbol <= 0:
             raise ValueError(f"max_positions_per_symbol must be positive, got {self.risk.max_positions_per_symbol}")

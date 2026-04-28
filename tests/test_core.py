@@ -17,7 +17,7 @@ from kabu_futures.alpha import (
     USJapanLeadLagScorer,
     compute_micro225_per_topix_mini,
 )
-from kabu_futures.api import build_future_registration_symbols, extract_symbol_code
+from kabu_futures.api import KabuApiError, build_future_registration_symbols, extract_symbol_code
 from kabu_futures.analysis_utils import iter_books, max_drawdown
 from kabu_futures.config import default_config, load_json_config
 from kabu_futures.engine import DualStrategyEngine
@@ -1313,7 +1313,11 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertEqual(len(tp_events), 1)
         self.assertEqual(client.sent[-1]["TradeType"], 2)
         self.assertEqual(client.sent[-1]["ClosePositions"], [{"HoldID": "E1", "Qty": 1}])
-        self.assertEqual(controller.heartbeat_metadata()["live_position_count"], 1)
+        heartbeat = controller.heartbeat_metadata()
+        self.assertEqual(heartbeat["live_position_count"], 1)
+        self.assertEqual(heartbeat["live_entry_orders_submitted"], 0)
+        self.assertEqual(heartbeat["live_own_entry_fills_detected"], 0)
+        self.assertEqual(heartbeat["live_entry_fill_rate"], 0.0)
 
     def test_live_cold_start_capacity_blocks_sixth_entry(self) -> None:
         class FakeClient:
@@ -1640,12 +1644,324 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         partial_events = [event for event in events if event.reason == "exit_order_partially_filled"]
         self.assertEqual(len(partial_events), 1)
         close_orders = [payload for payload in client.sent if payload["TradeType"] == 2]
+        self.assertEqual(len(close_orders), 1)
+        heartbeat = controller.heartbeat_metadata()
+        self.assertEqual(heartbeat["live_positions"][0]["qty"], 1)
+        self.assertEqual(heartbeat["live_pending_exits"], [])
+        self.assertEqual(heartbeat["live_exit_failure_counts"]["hold:E1"], 1)
+
+        controller.on_book(book(ts + timedelta(seconds=4), bid=50000, ask=50005), None, exchange=24)
+        close_orders = [payload for payload in client.sent if payload["TradeType"] == 2]
         self.assertEqual(len(close_orders), 2)
         self.assertEqual(close_orders[-1]["Qty"], 1)
         self.assertEqual(close_orders[-1]["ClosePositions"], [{"HoldID": "E1", "Qty": 1}])
         heartbeat = controller.heartbeat_metadata()
-        self.assertEqual(heartbeat["live_positions"][0]["qty"], 1)
         self.assertEqual(heartbeat["live_pending_exits"][0]["qty"], 1)
+
+    def test_live_exit_api_errors_block_after_retries_and_reject_new_entries(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                if payload["TradeType"] == 2:
+                    raise KabuApiError("close failed")
+                return {"Result": 0, "OrderId": f"O{len(self.sent)}"}
+
+            def positions(self, **query: object) -> dict[str, object]:
+                return {
+                    "data": [
+                        {
+                            "ExecutionID": "E1",
+                            "Symbol": "161060023",
+                            "Exchange": 24,
+                            "Price": 50005,
+                            "LeavesQty": 1,
+                            "Side": "2",
+                        }
+                    ]
+                }
+
+            def orders(self, **query: object) -> dict[str, object]:
+                return {"data": []}
+
+        client = FakeClient()
+        controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+
+        controller.on_book(book(ts, bid=50000, ask=50005), None, exchange=24)
+        controller.on_book(book(ts + timedelta(seconds=2), bid=50000, ask=50005), None, exchange=24)
+        events = controller.on_book(book(ts + timedelta(seconds=4), bid=50000, ask=50005), None, exchange=24)
+
+        close_orders = [payload for payload in client.sent if payload["TradeType"] == 2]
+        self.assertEqual(len(close_orders), 3)
+        self.assertTrue(all(payload["FrontOrderType"] != 120 for payload in close_orders))
+        self.assertTrue(any(event.reason == "exit_order_blocked_after_retries" for event in events))
+        heartbeat = controller.heartbeat_metadata()
+        self.assertEqual(heartbeat["live_exit_blocked"], ["hold:E1"])
+        self.assertEqual(heartbeat["live_exit_failure_counts"]["hold:E1"], 3)
+
+        reject_events = controller.on_signal(
+            Signal("micro_book", "NK225micro", "short", 0.8, 50000),
+            book(ts + timedelta(seconds=5)),
+            exchange=24,
+        )
+        self.assertEqual(reject_events[-1].event_type, "execution_reject")
+        self.assertEqual(reject_events[-1].reason, "exit_order_blocked_after_retries")
+
+    def test_live_exit_terminal_unfilled_uses_backoff_then_blocks(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                return {"Result": 0, "OrderId": f"O{len(self.sent)}"}
+
+            def positions(self, **query: object) -> dict[str, object]:
+                return {
+                    "data": [
+                        {
+                            "ExecutionID": "E1",
+                            "Symbol": "161060023",
+                            "Exchange": 24,
+                            "Price": 50005,
+                            "LeavesQty": 1,
+                            "Side": "2",
+                        }
+                    ]
+                }
+
+            def orders(self, **query: object) -> dict[str, object]:
+                order_id = query.get("id", "O1")
+                return {
+                    "data": [
+                        {
+                            "ID": order_id,
+                            "State": 5,
+                            "OrderState": 5,
+                            "OrderQty": 1,
+                            "CumQty": 0,
+                            "Details": [{"RecType": 7, "State": 0, "Qty": 1}],
+                        }
+                    ]
+                }
+
+        cfg = default_config()
+        cfg = replace(cfg, live_execution=replace(cfg.live_execution, max_consecutive_exit_failures=2))
+        client = FakeClient()
+        controller = LiveExecutionController(client, cfg, {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+
+        controller.on_book(book(ts, bid=50000, ask=50005), None, exchange=24)
+        controller.on_book(book(ts + timedelta(seconds=2), bid=50000, ask=50005), None, exchange=24)
+        close_orders = [payload for payload in client.sent if payload["TradeType"] == 2]
+        self.assertEqual(len(close_orders), 1)
+        heartbeat = controller.heartbeat_metadata()
+        self.assertEqual(heartbeat["live_exit_failure_counts"]["hold:E1"], 1)
+        self.assertIn("hold:E1", heartbeat["live_exit_retry_after"])
+
+        controller.on_book(book(ts + timedelta(seconds=4), bid=50000, ask=50005), None, exchange=24)
+        close_orders = [payload for payload in client.sent if payload["TradeType"] == 2]
+        self.assertEqual(len(close_orders), 2)
+        events = controller.on_book(book(ts + timedelta(seconds=6), bid=50000, ask=50005), None, exchange=24)
+
+        close_orders = [payload for payload in client.sent if payload["TradeType"] == 2]
+        self.assertEqual(len(close_orders), 2)
+        self.assertTrue(any(event.reason == "exit_order_blocked_after_retries" for event in events))
+        heartbeat = controller.heartbeat_metadata()
+        self.assertEqual(heartbeat["live_exit_blocked"], ["hold:E1"])
+        self.assertEqual(heartbeat["live_exit_failure_counts"]["hold:E1"], 2)
+
+    def test_live_pending_entry_uses_grace_before_timeout(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                return {"Result": 0, "OrderId": "O1"}
+
+            def positions(self, **query: object) -> dict[str, object]:
+                return {"data": []}
+
+            def orders(self, **query: object) -> dict[str, object]:
+                return {
+                    "data": [
+                        {
+                            "ID": "O1",
+                            "State": 2,
+                            "OrderState": 2,
+                            "OrderQty": 1,
+                            "CumQty": 0,
+                            "Details": [],
+                        }
+                    ]
+                }
+
+        client = FakeClient()
+        controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+
+        grace_events = controller.on_book(book(ts + timedelta(seconds=9), bid=50000, ask=50005), None, exchange=24)
+        self.assertTrue(any(event.reason == "pending_entry_grace_active" for event in grace_events))
+        heartbeat = controller.heartbeat_metadata()
+        self.assertIsNotNone(heartbeat["live_pending_entry"])
+        self.assertEqual(heartbeat["live_entry_failure_count"], 0)
+
+        timeout_events = controller.on_book(book(ts + timedelta(seconds=21), bid=50000, ask=50005), None, exchange=24)
+        self.assertTrue(any(event.reason == "pending_entry_timeout_after_grace" for event in timeout_events))
+        heartbeat = controller.heartbeat_metadata()
+        self.assertIsNone(heartbeat["live_pending_entry"])
+        self.assertEqual(heartbeat["live_entry_failure_count"], 1)
+
+    def test_live_entry_failures_enter_cooldown(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                return {"Result": 1, "Message": "rejected"}
+
+            def positions(self, **query: object) -> dict[str, object]:
+                return {"data": []}
+
+        cfg = default_config()
+        cfg = replace(
+            cfg,
+            live_execution=replace(
+                cfg.live_execution,
+                max_consecutive_entry_failures=3,
+                entry_failure_cooldown_seconds=30,
+            ),
+        )
+        client = FakeClient()
+        controller = LiveExecutionController(client, cfg, {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+
+        for offset in range(3):
+            events = controller.on_signal(
+                Signal("micro_book", "NK225micro", "long", 0.8, 50005),
+                book(ts + timedelta(seconds=offset)),
+                exchange=24,
+            )
+            self.assertEqual(events[-1].event_type, "live_order_error")
+
+        heartbeat = controller.heartbeat_metadata()
+        self.assertEqual(heartbeat["live_entry_failure_count"], 3)
+        self.assertIsNotNone(heartbeat["live_entry_cooldown_until"])
+        cooldown_events = controller.on_signal(
+            Signal("micro_book", "NK225micro", "long", 0.8, 50005),
+            book(ts + timedelta(seconds=3)),
+            exchange=24,
+        )
+        self.assertEqual(cooldown_events[-1].event_type, "execution_reject")
+        self.assertEqual(cooldown_events[-1].reason, "entry_failure_cooldown")
+        self.assertEqual(len(client.sent), 3)
+
+    def test_live_late_fill_uses_orphan_entry_signal_metadata(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+                self.position_open = False
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                return {"Result": 0, "OrderId": f"O{len(self.sent)}"}
+
+            def positions(self, **query: object) -> dict[str, object]:
+                if not self.position_open:
+                    return {"data": []}
+                return {
+                    "data": [
+                        {
+                            "ExecutionID": "E1",
+                            "Symbol": "161060023",
+                            "Exchange": 24,
+                            "Price": 50010,
+                            "LeavesQty": 1,
+                            "Side": "2",
+                        }
+                    ]
+                }
+
+            def orders(self, **query: object) -> dict[str, object]:
+                return {
+                    "data": [
+                        {
+                            "ID": "O1",
+                            "State": 2,
+                            "OrderState": 2,
+                            "OrderQty": 1,
+                            "CumQty": 0,
+                            "Details": [],
+                        }
+                    ]
+                }
+
+        client = FakeClient()
+        controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+        signal = Signal("micro_book", "NK225micro", "long", 0.8, 50005, "rich_reason", {"imbalance": 0.7})
+        controller.on_signal(signal, book(ts), exchange=24)
+        controller.on_book(book(ts + timedelta(seconds=21), bid=50000, ask=50005), None, exchange=24)
+
+        client.position_open = True
+        events = controller.on_book(book(ts + timedelta(seconds=22), bid=50005, ask=50010), None, exchange=24)
+
+        detected = [event for event in events if event.event_type == "live_position_detected"]
+        self.assertEqual(detected[0].metadata["signal_reason"], "rich_reason")
+        self.assertTrue(detected[0].metadata["own_entry_detected"])
+        tp_events = [
+            event
+            for event in events
+            if event.event_type == "live_order_submitted" and event.metadata.get("exit_reason") == "take_profit"
+        ]
+        self.assertEqual(tp_events[0].metadata["take_profit_ticks"], 2)
+        heartbeat = controller.heartbeat_metadata()
+        self.assertEqual(heartbeat["live_own_entry_fills_detected"], 1)
+        self.assertEqual(heartbeat["live_entry_failure_count"], 0)
+
+    def test_live_order_status_requires_exact_order_id_match(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                return {"Result": 0, "OrderId": "O1"}
+
+            def positions(self, **query: object) -> dict[str, object]:
+                return {"data": []}
+
+            def orders(self, **query: object) -> dict[str, object]:
+                return {
+                    "data": [
+                        {
+                            "ID": "DIFFERENT",
+                            "State": 5,
+                            "OrderState": 5,
+                            "OrderQty": 1,
+                            "CumQty": 0,
+                            "Details": [{"RecType": 7, "State": 0, "Qty": 1}],
+                        }
+                    ]
+                }
+
+        client = FakeClient()
+        controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+        events = controller.on_book(book(ts + timedelta(seconds=2), bid=50000, ask=50005), None, exchange=24)
+
+        self.assertTrue(any(event.reason == "order_status_missing" for event in events))
+        self.assertFalse(any(event.event_type == "live_order_expired" for event in events))
+        heartbeat = controller.heartbeat_metadata()
+        self.assertIsNotNone(heartbeat["live_pending_entry"])
+        self.assertEqual(heartbeat["live_entry_orders_expired"], 0)
 
     def test_directional_intraday_long_observe_only_flag_is_opt_in(self) -> None:
         cfg = default_config()

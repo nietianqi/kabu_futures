@@ -22,7 +22,7 @@ python scripts\analyze_micro_evolution.py logs\live_20260428_124855.jsonl --conf
 - `signals.by_key`: confirms which engines produced signals. Minute signals can appear in research logs while live execution remains gated to `micro_book`.
 - `paper.trades`, `paper.net_pnl_ticks`, and `markout.summary`: frequency alone is not enough. Only consider candidates that improve trades without damaging PnL, average PnL, drawdown, or markout.
 - `paper.execution_reject_reasons` and recorded `execution_reject`: live-only rejects such as `live_unsupported_signal_engine` are safety gates, not strategy conflicts.
-- Heartbeat fields `live_order_errors`, `live_position_count`, `live_pending_entry`, `live_pending_exits`, and `live_exit_retry_after`: these show whether live order management is healthy.
+- Heartbeat fields `live_order_errors`, `live_position_count`, `live_pending_entry`, `live_pending_exits`, `live_exit_retry_after`, `live_exit_blocked`, `live_exit_failure_counts`, `live_entry_failure_count`, and `live_entry_cooldown_until`: these show whether live order management is healthy.
 - `market_data_skip`: occasional equal/crossed kabu quotes are normal. A sudden spike can distort feature counts and should be reviewed before trusting a tuning run.
 
 ## 2026-04-28 Findings
@@ -42,4 +42,5 @@ The 2026-04-28 logs show sparse trading is mainly a micro-entry gate issue, not 
 - Do not loosen live thresholds directly from one log. Run the multi-grid tuner, then require `recommendation.decision == "recommended"`, then validate in paper or tiny live size.
 - If kabu `HTTP 429` appears again, stop evaluating strategy quality from that run first. The order path was rate-limited, so execution health must be fixed before PnL conclusions are useful.
 - If `live_position_count > 0` and `live_pending_exits` is empty for more than one heartbeat, investigate immediately because a synced live position may not have a resting TP order.
+- If `live_exit_blocked` is non-empty or an event reason is `exit_order_blocked_after_retries`, the bot has stopped automatic TP resubmission for that hold ID. Check kabu Station manually before restarting or re-enabling new entries.
 

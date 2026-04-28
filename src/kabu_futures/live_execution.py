@@ -79,6 +79,14 @@ class LiveExecutionController:
         self.entry_signal: Signal | None = None
         self.position_sync_blocked = False
         self.exit_retry_after: dict[str, datetime] = {}
+        self.exit_failure_counts: dict[str, int] = {}
+        self.exit_blocked: set[str] = set()
+        self.consecutive_entry_failures = 0
+        self.entry_cooldown_until: datetime | None = None
+        self.orphan_entry_signal: Signal | None = None
+        self.orphan_entry_order_id: str | None = None
+        self.orphan_entry_expires_at: datetime | None = None
+        self.pending_entry_grace_reported: set[str] = set()
         self.last_position_poll_at: datetime | None = None
         self.reported_order_statuses: set[tuple[str, str]] = set()
         self.last_order_snapshot_by_id: dict[str, dict[str, Any]] = {}
@@ -89,6 +97,7 @@ class LiveExecutionController:
         self.entry_orders_expired = 0
         self.exit_orders_expired = 0
         self.positions_detected = 0
+        self.own_entry_fills_detected = 0
         self.positions_flat = 0
 
     def on_signal(self, signal: Signal, book: OrderBook, exchange: int) -> list[ExecutionEvent]:
@@ -105,6 +114,42 @@ class LiveExecutionController:
             events.extend(self._submit_take_profit_orders(book, exchange, event_time))
         if self.position_sync_blocked:
             return events + [_event("execution_reject", signal, book, "position_sync_blocked", _live_reject_metadata("position_sync_blocked", "position_state"))]
+        if self.exit_blocked:
+            return events + [
+                _event(
+                    "execution_reject",
+                    signal,
+                    book,
+                    "exit_order_blocked_after_retries",
+                    _live_reject_metadata(
+                        "exit_order_blocked_after_retries",
+                        "exit_order_state",
+                        {
+                            "live_exit_blocked": sorted(self.exit_blocked),
+                            "live_exit_failure_counts": dict(self.exit_failure_counts),
+                        },
+                    ),
+                )
+            ]
+        if self._entry_cooldown_active(event_time):
+            return events + [
+                _event(
+                    "execution_reject",
+                    signal,
+                    book,
+                    "entry_failure_cooldown",
+                    _live_reject_metadata(
+                        "entry_failure_cooldown",
+                        "entry_order_state",
+                        {
+                            "live_entry_failure_count": self.consecutive_entry_failures,
+                            "live_entry_cooldown_until": self.entry_cooldown_until.isoformat()
+                            if self.entry_cooldown_until is not None
+                            else None,
+                        },
+                    ),
+                )
+            ]
         if self._position_capacity_used() >= self.config.risk.max_positions_per_symbol:
             return events + [
                 _event(
@@ -149,6 +194,7 @@ class LiveExecutionController:
             response = self.client.sendorder_future(payload)
         except KabuApiError as exc:
             self.order_errors += 1
+            failure_metadata = self._record_entry_failure(event_time, "entry_order_api_error")
             return [
                 _event(
                     "live_order_error",
@@ -159,12 +205,14 @@ class LiveExecutionController:
                         **_live_reject_metadata("entry_order_api_error", "kabu_api"),
                         "error": str(exc),
                         "order_payload": payload,
+                        **failure_metadata,
                     },
                 )
             ]
         order_id = _order_id(response)
         if _order_result(response) != 0 or order_id is None:
             self.order_errors += 1
+            failure_metadata = self._record_entry_failure(event_time, "entry_order_rejected")
             return [
                 _event(
                     "live_order_error",
@@ -175,6 +223,7 @@ class LiveExecutionController:
                         **_live_reject_metadata("entry_order_rejected", "kabu_order_response"),
                         "response": response,
                         "order_payload": payload,
+                        **failure_metadata,
                     },
                 )
             ]
@@ -211,28 +260,7 @@ class LiveExecutionController:
         if self._should_poll_positions(event_time):
             events.extend(self._sync_order_status(book))
             events.extend(self._sync_position(book, exchange))
-        if self.pending_entry is not None and event_time - self.pending_entry.submitted_at > timedelta(
-            seconds=self.config.live_execution.max_pending_entry_seconds
-        ):
-            pending = self.pending_entry
-            self.pending_entry = None
-            self.entry_signal = None
-            events.append(
-                ExecutionEvent(
-                    "live_sync_error",
-                    pending.symbol,
-                    pending.direction,
-                    qty=pending.qty,
-                    reason="pending_entry_not_confirmed",
-                    timestamp=event_time,
-                    metadata={
-                        **event_trace_metadata("position_lifecycle", "reject", "pending_entry_not_confirmed", "position_sync"),
-                        "order_id": pending.order_id,
-                        "symbol_code": pending.symbol_code,
-                        "last_order_status": self.last_order_snapshot_by_id.get(pending.order_id),
-                    },
-                )
-            )
+        events.extend(self._handle_pending_entry_timeout(book, event_time))
 
         events.extend(self._submit_take_profit_orders(book, exchange, event_time))
         self._refresh_legacy_state()
@@ -272,7 +300,15 @@ class LiveExecutionController:
             "live_exit_orders_expired": self.exit_orders_expired,
             "live_positions_detected": self.positions_detected,
             "live_positions_flat": self.positions_flat,
-            "live_entry_fill_rate": _ratio(self.positions_detected, self.entry_orders_submitted),
+            "live_entry_fill_rate": _ratio(self.own_entry_fills_detected, self.entry_orders_submitted),
+            "live_own_entry_fills_detected": self.own_entry_fills_detected,
+            "live_exit_blocked": sorted(self.exit_blocked),
+            "live_exit_blocked_count": len(self.exit_blocked),
+            "live_exit_failure_counts": dict(self.exit_failure_counts),
+            "live_entry_failure_count": self.consecutive_entry_failures,
+            "live_entry_cooldown_until": self.entry_cooldown_until.isoformat()
+            if self.entry_cooldown_until is not None
+            else None,
             "live_position_sync_blocked": self.position_sync_blocked,
             "live_exit_retry_after": {key: value.isoformat() for key, value in self.exit_retry_after.items()},
         }
@@ -306,6 +342,26 @@ class LiveExecutionController:
                 continue
             order = _find_order(orders, pending.order_id)
             if order is None:
+                missing_key = (pending.order_id, "missing")
+                if missing_key not in self.reported_order_statuses:
+                    self.reported_order_statuses.add(missing_key)
+                    events.append(
+                        ExecutionEvent(
+                            "live_sync_error",
+                            pending.symbol,
+                            pending.direction,
+                            qty=pending.qty,
+                            reason="order_status_missing",
+                            timestamp=book_event_time(book),
+                            metadata={
+                                **_live_reject_metadata("order_status_missing", "order_status_lookup"),
+                                "order_id": pending.order_id,
+                                "symbol_code": pending.symbol_code,
+                                "position_key": pending.position_key,
+                                "orders_count": len(orders),
+                            },
+                        )
+                    )
                 continue
             snapshot = _order_status_snapshot(order)
             self.last_order_snapshot_by_id[pending.order_id] = snapshot
@@ -334,17 +390,18 @@ class LiveExecutionController:
             filled_qty = _float_value(order.get("CumQty"))
             if terminal_unfilled:
                 if self.pending_entry is not None and pending.order_id == self.pending_entry.order_id:
-                    self.pending_entry = None
-                    self.entry_signal = None
+                    self._clear_pending_entry()
                     self.entry_orders_expired += 1
                     reason = "entry_order_expired_or_unfilled"
                     blocked_by = "order_terminal_unfilled"
+                    failure_metadata = self._record_entry_failure(book_event_time(book), reason)
                 elif pending.position_key is not None and pending.position_key in self.pending_exits:
                     self.pending_exits.pop(pending.position_key, None)
                     self._refresh_legacy_state()
                     self.exit_orders_expired += 1
                     reason = "exit_order_expired_or_unfilled"
                     blocked_by = "order_terminal_unfilled"
+                    failure_metadata = self._record_exit_failure(pending.position_key, book_event_time(book), reason)
                 else:
                     continue
             elif terminal_partial_exit and pending.position_key is not None and pending.position_key in self.pending_exits:
@@ -353,6 +410,7 @@ class LiveExecutionController:
                 self.exit_orders_expired += 1
                 reason = "exit_order_partially_filled"
                 blocked_by = "order_terminal_partial_fill"
+                failure_metadata = self._record_exit_failure(pending.position_key, book_event_time(book), reason)
             else:
                 continue
             events.append(
@@ -371,9 +429,20 @@ class LiveExecutionController:
                         "order_status": snapshot,
                         "filled_qty": filled_qty,
                         "remaining_qty": max(0.0, float(pending.qty) - filled_qty),
+                        **failure_metadata,
                     },
                 )
             )
+            if pending.position_key is not None and failure_metadata.get("exit_blocked"):
+                events.append(
+                    self._exit_blocked_event(
+                        pending,
+                        book_event_time(book),
+                        snapshot,
+                        str(failure_metadata.get("exit_failure_reason") or reason),
+                        filled_qty,
+                    )
+                )
         return events
 
     def _sync_position(self, book: OrderBook, exchange: int) -> list[ExecutionEvent]:
@@ -431,6 +500,8 @@ class LiveExecutionController:
             self.live_positions.pop(position_key, None)
             self.pending_exits.pop(position_key, None)
             self.exit_retry_after.pop(position_key, None)
+            self.exit_failure_counts.pop(position_key, None)
+            self.exit_blocked.discard(position_key)
             events.append(
                 ExecutionEvent(
                     "live_position_flat",
@@ -448,15 +519,27 @@ class LiveExecutionController:
             )
 
         pending_entry_consumed = False
+        orphan_entry_consumed = False
         for position_key, position in current_positions.items():
             if position_key in self.live_positions:
                 continue
-            source_signal = self.entry_signal if not pending_entry_consumed else None
+            source_signal = None
+            own_entry_detected = False
+            if self.entry_signal is not None and not pending_entry_consumed:
+                source_signal = self.entry_signal
+                pending_entry_consumed = True
+                own_entry_detected = True
+            elif self._orphan_entry_signal_active(event_time) and not orphan_entry_consumed:
+                source_signal = self.orphan_entry_signal
+                orphan_entry_consumed = True
+                own_entry_detected = True
             entry_signal = _position_entry_signal(source_signal, position, self.config.symbols.primary)
             trade = self._trade_from_position(entry_signal, event_time, position.qty)
             self.live_positions[position_key] = LivePositionSlot(position, trade, entry_signal)
-            pending_entry_consumed = pending_entry_consumed or source_signal is not None
             self.positions_detected += 1
+            if own_entry_detected:
+                self.own_entry_fills_detected += 1
+                self._reset_entry_failures()
             events.append(
                 ExecutionEvent(
                     "live_position_detected",
@@ -473,12 +556,15 @@ class LiveExecutionController:
                         "hold_id": position.hold_id,
                         "position_key": position_key,
                         "engine": entry_signal.engine,
+                        "own_entry_detected": own_entry_detected,
+                        "signal_reason": entry_signal.reason,
                     },
                 )
             )
         if pending_entry_consumed:
-            self.pending_entry = None
-            self.entry_signal = None
+            self._clear_pending_entry()
+        if orphan_entry_consumed:
+            self._clear_orphan_entry_signal()
         self._refresh_legacy_state()
         return events
 
@@ -502,45 +588,51 @@ class LiveExecutionController:
             response = self.client.sendorder_future(payload)
         except KabuApiError as exc:
             self.order_errors += 1
-            retry_after = self._mark_exit_retry(position_key, event_time)
+            failure_metadata = self._record_exit_failure(position_key, event_time, "exit_order_api_error")
             return ExecutionEvent(
                 "live_order_error",
                 trade.symbol,
                 trade.direction,
                 qty=position.qty,
                 entry_price=trade.entry_price,
-                reason="exit_order_api_error",
+                reason="exit_order_blocked_after_retries" if failure_metadata["exit_blocked"] else "exit_order_api_error",
                 timestamp=event_time,
                 metadata={
-                    **_live_reject_metadata("exit_order_api_error", "kabu_api"),
+                    **_live_reject_metadata(
+                        "exit_order_blocked_after_retries" if failure_metadata["exit_blocked"] else "exit_order_api_error",
+                        "exit_order_state" if failure_metadata["exit_blocked"] else "kabu_api",
+                    ),
                     "error": str(exc),
                     "exit_reason": decision.reason,
                     "position_key": position_key,
                     "hold_id": position.hold_id,
-                    "retry_after": retry_after.isoformat(),
                     "order_payload": payload,
+                    **failure_metadata,
                 },
             )
         order_id = _order_id(response)
         if _order_result(response) != 0 or order_id is None:
             self.order_errors += 1
-            retry_after = self._mark_exit_retry(position_key, event_time)
+            failure_metadata = self._record_exit_failure(position_key, event_time, "exit_order_rejected")
             return ExecutionEvent(
                 "live_order_error",
                 trade.symbol,
                 trade.direction,
                 qty=position.qty,
                 entry_price=trade.entry_price,
-                reason="exit_order_rejected",
+                reason="exit_order_blocked_after_retries" if failure_metadata["exit_blocked"] else "exit_order_rejected",
                 timestamp=event_time,
                 metadata={
-                    **_live_reject_metadata("exit_order_rejected", "kabu_order_response"),
+                    **_live_reject_metadata(
+                        "exit_order_blocked_after_retries" if failure_metadata["exit_blocked"] else "exit_order_rejected",
+                        "exit_order_state" if failure_metadata["exit_blocked"] else "kabu_order_response",
+                    ),
                     "response": response,
                     "exit_reason": decision.reason,
                     "position_key": position_key,
                     "hold_id": position.hold_id,
-                    "retry_after": retry_after.isoformat(),
                     "order_payload": payload,
+                    **failure_metadata,
                 },
             )
         self.orders_submitted += 1
@@ -618,6 +710,8 @@ class LiveExecutionController:
     ) -> list[ExecutionEvent]:
         events: list[ExecutionEvent] = []
         for position_key, slot in tuple(self.live_positions.items()):
+            if position_key in self.exit_blocked:
+                continue
             if position_key in self.pending_exits:
                 continue
             retry_after = self.exit_retry_after.get(position_key)
@@ -647,10 +741,173 @@ class LiveExecutionController:
     def _position_capacity_used(self) -> int:
         return len(self.live_positions) + (1 if self.pending_entry is not None else 0)
 
+    def _handle_pending_entry_timeout(self, book: OrderBook, event_time: datetime) -> list[ExecutionEvent]:
+        if self.pending_entry is None:
+            return []
+        pending = self.pending_entry
+        elapsed = (event_time - pending.submitted_at).total_seconds()
+        max_seconds = float(self.config.live_execution.max_pending_entry_seconds)
+        grace_seconds = float(self.config.live_execution.pending_entry_grace_seconds)
+        if elapsed <= max_seconds:
+            return []
+        last_status = self.last_order_snapshot_by_id.get(pending.order_id)
+        if elapsed <= grace_seconds:
+            if pending.order_id in self.pending_entry_grace_reported:
+                return []
+            self.pending_entry_grace_reported.add(pending.order_id)
+            return [
+                ExecutionEvent(
+                    "live_sync_error",
+                    pending.symbol,
+                    pending.direction,
+                    qty=pending.qty,
+                    reason="pending_entry_grace_active",
+                    timestamp=event_time,
+                    metadata={
+                        **event_trace_metadata("position_lifecycle", "status", "pending_entry_grace_active", "position_sync"),
+                        "order_id": pending.order_id,
+                        "symbol_code": pending.symbol_code,
+                        "elapsed_seconds": elapsed,
+                        "max_pending_entry_seconds": self.config.live_execution.max_pending_entry_seconds,
+                        "pending_entry_grace_seconds": self.config.live_execution.pending_entry_grace_seconds,
+                        "last_order_status": last_status,
+                    },
+                )
+            ]
+        self._clear_pending_entry(preserve_orphan=True, event_time=event_time)
+        self.entry_orders_expired += 1
+        failure_metadata = self._record_entry_failure(event_time, "pending_entry_timeout_after_grace")
+        return [
+            ExecutionEvent(
+                "live_sync_error",
+                pending.symbol,
+                pending.direction,
+                qty=pending.qty,
+                reason="pending_entry_timeout_after_grace",
+                timestamp=event_time,
+                metadata={
+                    **event_trace_metadata(
+                        "position_lifecycle",
+                        "reject",
+                        "pending_entry_timeout_after_grace",
+                        "position_sync",
+                    ),
+                    "order_id": pending.order_id,
+                    "symbol_code": pending.symbol_code,
+                    "elapsed_seconds": elapsed,
+                    "max_pending_entry_seconds": self.config.live_execution.max_pending_entry_seconds,
+                    "pending_entry_grace_seconds": self.config.live_execution.pending_entry_grace_seconds,
+                    "last_order_status": last_status,
+                    **failure_metadata,
+                },
+            )
+        ]
+
     def _mark_exit_retry(self, position_key: str, event_time: datetime) -> datetime:
         retry_after = event_time + timedelta(seconds=max(1.0, self.config.live_execution.position_poll_interval_seconds))
         self.exit_retry_after[position_key] = retry_after
         return retry_after
+
+    def _record_exit_failure(self, position_key: str, event_time: datetime, reason: str) -> dict[str, object]:
+        count = self.exit_failure_counts.get(position_key, 0) + 1
+        self.exit_failure_counts[position_key] = count
+        blocked = count >= self.config.live_execution.max_consecutive_exit_failures
+        retry_after: datetime | None = None
+        if blocked:
+            self.exit_blocked.add(position_key)
+            self.exit_retry_after.pop(position_key, None)
+        else:
+            retry_after = self._mark_exit_retry(position_key, event_time)
+        return {
+            "exit_failure_reason": reason,
+            "exit_failure_count": count,
+            "max_consecutive_exit_failures": self.config.live_execution.max_consecutive_exit_failures,
+            "exit_blocked": blocked,
+            "retry_after": retry_after.isoformat() if retry_after is not None else None,
+        }
+
+    def _record_entry_failure(self, event_time: datetime, reason: str) -> dict[str, object]:
+        self.consecutive_entry_failures += 1
+        cooldown_until: datetime | None = None
+        cooldown_active = self.consecutive_entry_failures >= self.config.live_execution.max_consecutive_entry_failures
+        if cooldown_active:
+            cooldown_until = event_time + timedelta(seconds=self.config.live_execution.entry_failure_cooldown_seconds)
+            self.entry_cooldown_until = cooldown_until
+        return {
+            "entry_failure_reason": reason,
+            "entry_failure_count": self.consecutive_entry_failures,
+            "max_consecutive_entry_failures": self.config.live_execution.max_consecutive_entry_failures,
+            "entry_cooldown_active": cooldown_active,
+            "entry_cooldown_until": cooldown_until.isoformat() if cooldown_until is not None else None,
+        }
+
+    def _reset_entry_failures(self) -> None:
+        self.consecutive_entry_failures = 0
+        self.entry_cooldown_until = None
+
+    def _entry_cooldown_active(self, event_time: datetime) -> bool:
+        if self.entry_cooldown_until is None:
+            return False
+        if event_time >= self.entry_cooldown_until:
+            self.entry_cooldown_until = None
+            return False
+        return True
+
+    def _clear_pending_entry(self, preserve_orphan: bool = False, event_time: datetime | None = None) -> PendingLiveOrder | None:
+        pending = self.pending_entry
+        if pending is not None:
+            self.pending_entry_grace_reported.discard(pending.order_id)
+            if preserve_orphan and pending.signal is not None and event_time is not None:
+                self.orphan_entry_signal = pending.signal
+                self.orphan_entry_order_id = pending.order_id
+                ttl_seconds = max(60.0, float(self.config.live_execution.pending_entry_grace_seconds))
+                self.orphan_entry_expires_at = event_time + timedelta(seconds=ttl_seconds)
+        self.pending_entry = None
+        self.entry_signal = None
+        return pending
+
+    def _clear_orphan_entry_signal(self) -> None:
+        self.orphan_entry_signal = None
+        self.orphan_entry_order_id = None
+        self.orphan_entry_expires_at = None
+
+    def _orphan_entry_signal_active(self, event_time: datetime) -> bool:
+        if self.orphan_entry_signal is None:
+            return False
+        if self.orphan_entry_expires_at is not None and event_time > self.orphan_entry_expires_at:
+            self._clear_orphan_entry_signal()
+            return False
+        return True
+
+    def _exit_blocked_event(
+        self,
+        pending: PendingLiveOrder,
+        event_time: datetime,
+        snapshot: dict[str, Any],
+        failure_reason: str,
+        filled_qty: float,
+    ) -> ExecutionEvent:
+        return ExecutionEvent(
+            "live_order_error",
+            pending.symbol,
+            pending.direction,
+            qty=pending.qty,
+            reason="exit_order_blocked_after_retries",
+            timestamp=event_time,
+            metadata={
+                **_live_reject_metadata("exit_order_blocked_after_retries", "exit_order_state"),
+                "order_id": pending.order_id,
+                "symbol_code": pending.symbol_code,
+                "position_key": pending.position_key,
+                "order_status": snapshot,
+                "filled_qty": filled_qty,
+                "remaining_qty": max(0.0, float(pending.qty) - filled_qty),
+                "exit_failure_reason": failure_reason,
+                "exit_failure_count": self.exit_failure_counts.get(pending.position_key or "", 0),
+                "max_consecutive_exit_failures": self.config.live_execution.max_consecutive_exit_failures,
+                "exit_blocked": True,
+            },
+        )
 
     def _refresh_legacy_state(self) -> None:
         first_slot = next(iter(self.live_positions.values()), None)
@@ -771,7 +1028,7 @@ def _find_order(orders: list[dict[str, Any]], order_id: str) -> dict[str, Any] |
         candidate = item.get("ID") or item.get("OrderId") or item.get("OrderID")
         if str(candidate) == order_id:
             return item
-    return orders[0] if len(orders) == 1 else None
+    return None
 
 
 def _order_status_snapshot(order: dict[str, Any]) -> dict[str, Any]:

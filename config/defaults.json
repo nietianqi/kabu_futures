@@ -59,7 +59,11 @@
     "entry_time_in_force": 2,
     "exit_time_in_force": 1,
     "position_poll_interval_seconds": 1.0,
-    "max_pending_entry_seconds": 8
+    "max_pending_entry_seconds": 8,
+    "pending_entry_grace_seconds": 20,
+    "max_consecutive_exit_failures": 3,
+    "max_consecutive_entry_failures": 3,
+    "entry_failure_cooldown_seconds": 30
   },
   "nt_spread": {
     "enabled": true,
