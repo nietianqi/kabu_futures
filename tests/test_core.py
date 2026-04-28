@@ -734,6 +734,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
         events = controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
         self.assertEqual(events[0].event_type, "live_order_submitted")
+        self.assertEqual(events[0].qty, 1)
         self.assertEqual(client.sent[0]["Symbol"], "161060023")
         self.assertEqual(client.sent[0]["Exchange"], 24)
         self.assertEqual(client.sent[0]["TradeType"], 1)
@@ -789,18 +790,69 @@ class MarketDataAndExecutionTests(unittest.TestCase):
                     ]
                 }
 
+            def orders(self, **query: object) -> dict[str, object]:
+                return {
+                    "data": [
+                        {
+                            "ID": query.get("id", "O1"),
+                            "State": 5,
+                            "OrderState": 5,
+                            "OrderQty": 1,
+                            "CumQty": 1,
+                            "Details": [{"RecType": 8, "State": 0, "Qty": 1, "ExecutionID": "E1"}],
+                        }
+                    ]
+                }
+
         client = FakeClient()
         controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
         controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
         sync_events = controller.on_book(book(ts + timedelta(seconds=2), bid=50000, ask=50005), None, exchange=24)
-        self.assertEqual(sync_events[0].event_type, "live_position_detected")
+        self.assertTrue(any(event.event_type == "live_position_detected" for event in sync_events))
         exit_events = controller.on_book(book(ts + timedelta(seconds=4), bid=49990, ask=49995), None, exchange=24)
         self.assertEqual(exit_events[0].event_type, "live_order_submitted")
         self.assertEqual(exit_events[0].metadata["exit_reason"], "stop_loss")
         self.assertEqual(client.sent[-1]["TradeType"], 2)
         self.assertEqual(client.sent[-1]["Side"], "1")
         self.assertEqual(client.sent[-1]["ClosePositions"], [{"HoldID": "E1", "Qty": 1}])
+
+    def test_live_order_status_marks_unfilled_fak_as_expired(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                return {"Result": 0, "OrderId": "O1"}
+
+            def positions(self, **query: object) -> dict[str, object]:
+                return {"data": []}
+
+            def orders(self, **query: object) -> dict[str, object]:
+                return {
+                    "data": [
+                        {
+                            "ID": "O1",
+                            "State": 5,
+                            "OrderState": 5,
+                            "OrderQty": 1,
+                            "CumQty": 0,
+                            "Details": [{"RecType": 7, "State": 0, "Qty": 1}],
+                        }
+                    ]
+                }
+
+        client = FakeClient()
+        controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+        events = controller.on_book(book(ts + timedelta(seconds=2), bid=50000, ask=50005), None, exchange=24)
+        self.assertTrue(any(event.event_type == "live_order_status" for event in events))
+        expired = [event for event in events if event.event_type == "live_order_expired"]
+        self.assertEqual(len(expired), 1)
+        self.assertEqual(expired[0].reason, "entry_order_expired_or_unfilled")
+        self.assertIsNone(controller.heartbeat_metadata()["live_pending_entry"])
 
     def test_directional_intraday_long_is_observe_only_by_default(self) -> None:
         engine = DualStrategyEngine(default_config())

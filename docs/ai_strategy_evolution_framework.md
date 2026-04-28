@@ -43,6 +43,13 @@ python main.py --trade-mode live --live-orders
 
 Live v1 只支持 `micro_book` 信号，并且只允许一个活跃 live 仓位或挂单路径。`minute_orb`、`minute_vwap`、`directional_intraday` 不会直接实盘下单。
 
+真实下单确认链路分两层：
+
+- `/orders?product=3&id=...&details=true`：判断订单是否被接收、约定、失效或期限切れ。
+- `/positions?product=3&symbol=...`：只有持仓确认后，系统才认为真实仓位存在并开始管理退出。
+
+如果 FAK 入场单被接收但 `CumQty=0` 且订单进入终态，日志会记录 `live_order_expired`，这代表订单未形成持仓，而不是策略已经成交。
+
 ## 3. 2026-04-27 日志结论
 
 最新长日志 `live_20260427_232822.jsonl` 是 observe 模式：

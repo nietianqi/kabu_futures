@@ -61,6 +61,8 @@ class LiveExecutionController:
         self.live_position: LivePositionState | None = None
         self.entry_signal: Signal | None = None
         self.last_position_poll_at: datetime | None = None
+        self.reported_order_statuses: set[tuple[str, str]] = set()
+        self.last_order_snapshot_by_id: dict[str, dict[str, Any]] = {}
         self.orders_submitted = 0
         self.order_errors = 0
 
@@ -116,6 +118,7 @@ class LiveExecutionController:
                 book,
                 "entry_limit_fak_submitted",
                 {"order_id": order_id, "order_payload": payload, "response": response},
+                qty=qty,
             )
         ]
 
@@ -125,12 +128,14 @@ class LiveExecutionController:
             return events
         event_time = _event_time(book)
         if self._should_poll_positions(event_time):
+            events.extend(self._sync_order_status(book))
             events.extend(self._sync_position(book, exchange))
         if self.pending_entry is not None and event_time - self.pending_entry.submitted_at > timedelta(
             seconds=self.config.live_execution.max_pending_entry_seconds
         ):
             pending = self.pending_entry
             self.pending_entry = None
+            self.entry_signal = None
             events.append(
                 ExecutionEvent(
                     "live_sync_error",
@@ -139,7 +144,11 @@ class LiveExecutionController:
                     qty=pending.qty,
                     reason="pending_entry_not_confirmed",
                     timestamp=event_time,
-                    metadata={"order_id": pending.order_id, "symbol_code": pending.symbol_code},
+                    metadata={
+                        "order_id": pending.order_id,
+                        "symbol_code": pending.symbol_code,
+                        "last_order_status": self.last_order_snapshot_by_id.get(pending.order_id),
+                    },
                 )
             )
 
@@ -231,9 +240,72 @@ class LiveExecutionController:
             "live_position": _position_summary(self.live_position),
             "live_pending_entry": _pending_summary(self.pending_entry),
             "live_pending_exit": _pending_summary(self.pending_exit),
+            "live_last_order_statuses": dict(self.last_order_snapshot_by_id),
             "live_orders_submitted": self.orders_submitted,
             "live_order_errors": self.order_errors,
         }
+
+    def _sync_order_status(self, book: OrderBook) -> list[ExecutionEvent]:
+        events: list[ExecutionEvent] = []
+        for pending in tuple(order for order in (self.pending_entry, self.pending_exit) if order is not None):
+            try:
+                orders = _orders_list(self.client.orders(product=3, id=pending.order_id, details="true"))
+            except KabuApiError as exc:
+                self.order_errors += 1
+                events.append(
+                    ExecutionEvent(
+                        "live_sync_error",
+                        pending.symbol,
+                        pending.direction,
+                        qty=pending.qty,
+                        reason="orders_api_error",
+                        timestamp=_event_time(book),
+                        metadata={"error": str(exc), "order_id": pending.order_id, "symbol_code": pending.symbol_code},
+                    )
+                )
+                continue
+            order = _find_order(orders, pending.order_id)
+            if order is None:
+                continue
+            snapshot = _order_status_snapshot(order)
+            self.last_order_snapshot_by_id[pending.order_id] = snapshot
+            status_key = (pending.order_id, _status_signature(snapshot))
+            if status_key not in self.reported_order_statuses:
+                self.reported_order_statuses.add(status_key)
+                events.append(
+                    ExecutionEvent(
+                        "live_order_status",
+                        pending.symbol,
+                        pending.direction,
+                        qty=pending.qty,
+                        reason="order_status_update",
+                        timestamp=_event_time(book),
+                        metadata={"order_id": pending.order_id, "symbol_code": pending.symbol_code, "order_status": snapshot},
+                    )
+                )
+            if not _order_is_unfilled_terminal(order):
+                continue
+            if self.pending_entry is not None and pending.order_id == self.pending_entry.order_id:
+                self.pending_entry = None
+                self.entry_signal = None
+                reason = "entry_order_expired_or_unfilled"
+            elif self.pending_exit is not None and pending.order_id == self.pending_exit.order_id:
+                self.pending_exit = None
+                reason = "exit_order_expired_or_unfilled"
+            else:
+                continue
+            events.append(
+                ExecutionEvent(
+                    "live_order_expired",
+                    pending.symbol,
+                    pending.direction,
+                    qty=pending.qty,
+                    reason=reason,
+                    timestamp=_event_time(book),
+                    metadata={"order_id": pending.order_id, "symbol_code": pending.symbol_code, "order_status": snapshot},
+                )
+            )
+        return events
 
     def _sync_position(self, book: OrderBook, exchange: int) -> list[ExecutionEvent]:
         events: list[ExecutionEvent] = []
@@ -329,6 +401,7 @@ def _event(
     book: OrderBook,
     reason: str,
     metadata: dict[str, object] | None = None,
+    qty: int = 0,
 ) -> ExecutionEvent:
     details = {"signal": _signal_snapshot(signal)}
     if metadata:
@@ -337,7 +410,7 @@ def _event(
         event_type,  # type: ignore[arg-type]
         signal.symbol,
         signal.direction,
-        qty=0,
+        qty=qty,
         entry_price=signal.price,
         reason=reason,
         timestamp=_event_time(book),
@@ -363,6 +436,66 @@ def _positions_list(response: Any) -> list[dict[str, Any]]:
         if isinstance(data, list):
             return [item for item in data if isinstance(item, dict)]
     return []
+
+
+def _orders_list(response: Any) -> list[dict[str, Any]]:
+    if isinstance(response, list):
+        return [item for item in response if isinstance(item, dict)]
+    if isinstance(response, dict):
+        data = response.get("data")
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+    return []
+
+
+def _find_order(orders: list[dict[str, Any]], order_id: str) -> dict[str, Any] | None:
+    for item in orders:
+        candidate = item.get("ID") or item.get("OrderId") or item.get("OrderID")
+        if str(candidate) == order_id:
+            return item
+    return orders[0] if len(orders) == 1 else None
+
+
+def _order_status_snapshot(order: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": order.get("ID") or order.get("OrderId") or order.get("OrderID"),
+        "state": order.get("State"),
+        "order_state": order.get("OrderState"),
+        "order_qty": order.get("OrderQty"),
+        "cum_qty": order.get("CumQty"),
+        "side": order.get("Side"),
+        "price": order.get("Price"),
+        "details": [
+            {
+                "rec_type": detail.get("RecType"),
+                "state": detail.get("State"),
+                "qty": detail.get("Qty"),
+                "price": detail.get("Price"),
+                "execution_id": detail.get("ExecutionID"),
+                "execution_day": detail.get("ExecutionDay"),
+            }
+            for detail in (order.get("Details") or [])
+            if isinstance(detail, dict)
+        ],
+    }
+
+
+def _status_signature(snapshot: dict[str, Any]) -> str:
+    details = snapshot.get("details")
+    return f"{snapshot.get('state')}:{snapshot.get('order_state')}:{snapshot.get('cum_qty')}:{details}"
+
+
+def _order_is_unfilled_terminal(order: dict[str, Any]) -> bool:
+    state = _optional_int(order.get("State"))
+    order_state = _optional_int(order.get("OrderState"))
+    cum_qty = _float_value(order.get("CumQty"))
+    details = [item for item in (order.get("Details") or []) if isinstance(item, dict)]
+    rec_types = {_optional_int(item.get("RecType")) for item in details}
+    if cum_qty > 0:
+        return False
+    if rec_types.intersection({3, 7}):
+        return True
+    return state == 5 or order_state == 5
 
 
 def _position_qty(item: dict[str, Any]) -> int:
@@ -396,6 +529,20 @@ def _normalize_position(item: dict[str, Any]) -> LivePositionState | None:
         entry_time=datetime.now(timezone.utc),
         hold_id=str(hold_id) if hold_id else None,
     )
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_value(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _with_tif(intent: Any, tif: int) -> Any:

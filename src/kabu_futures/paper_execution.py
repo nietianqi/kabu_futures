@@ -19,6 +19,8 @@ ExecutionEventType = Literal[
     "execution_reject",
     "execution_skip",
     "live_order_submitted",
+    "live_order_status",
+    "live_order_expired",
     "live_order_error",
     "live_position_detected",
     "live_position_flat",

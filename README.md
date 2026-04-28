@@ -123,12 +123,13 @@ Live v1 is intentionally narrow:
 - supports only `micro_book` signals;
 - rejects `minute_orb`, `minute_vwap`, and `directional_intraday` with `live_unsupported_signal_engine`;
 - submits FAK limit entry orders through `/sendorder/future`;
-- polls `/positions?product=3&symbol=...` to confirm the real position;
+- polls `/orders?product=3&id=...&details=true` to distinguish filled, expired, and unfilled FAK orders;
+- polls `/positions?product=3&symbol=...` to confirm the real position before managing exits;
 - uses the same micro exit logic for take-profit, stop-loss, time-stop, and feature exits;
 - submits close orders through `/sendorder/future`, using `ClosePositions` when a hold ID is available;
 - keeps one active live position/order path at a time.
 
-Live events are written to JSONL as `live_order_submitted`, `live_order_error`, `live_position_detected`, `live_position_flat`, and `live_sync_error`. Heartbeats include `live_position`, `live_pending_entry`, `live_pending_exit`, `live_orders_submitted`, and `live_order_errors`.
+Live events are written to JSONL as `live_order_submitted`, `live_order_status`, `live_order_expired`, `live_order_error`, `live_position_detected`, `live_position_flat`, and `live_sync_error`. Heartbeats include `live_position`, `live_pending_entry`, `live_pending_exit`, `live_last_order_statuses`, `live_orders_submitted`, and `live_order_errors`.
 
 The current micro strategy remains conservative and may submit zero live orders if no `micro_book` signal passes all gates. If live order plumbing must be smoke-tested, use a tiny `max_order_qty=1` config and watch `live_orders_submitted`, `live_order_errors`, and the kabu Station order screen.
 
