@@ -73,6 +73,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=",".join(str(value) for value in DEFAULT_ENTRY_FILL_LATENCY_MS),
         help="Comma-separated latency assumptions in milliseconds for FAK fill simulation.",
     )
+    parser.add_argument(
+        "--diagnostics-max-rows",
+        type=int,
+        default=None,
+        help=(
+            "Limit logged live-diagnostic JSONL rows. Defaults to --max-books for smoke tests; "
+            "use 0 for full-log diagnostics."
+        ),
+    )
     parser.add_argument("--output", help="Optional JSON report path.")
     return parser
 
@@ -92,6 +101,9 @@ def main() -> int:
         },
         entry_fill_slippage_ticks=_int_tuple(args.entry_fill_slippage_grid),
         entry_fill_latency_ms=_int_tuple(args.entry_fill_latency_ms),
+        logged_diagnostics_max_rows=args.diagnostics_max_rows
+        if args.diagnostics_max_rows is not None
+        else args.max_books,
     )
     text = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:

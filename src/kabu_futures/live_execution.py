@@ -7,7 +7,7 @@ from typing import Any
 
 from .api import KabuApiError, KabuStationClient
 from .config import StrategyConfig, default_config
-from .execution import ExitDecision, MicroTradeManager, MinuteTradeManager
+from .execution import ExitDecision, MicroTradeManager, MinuteTradeManager, pnl_ticks as calculate_pnl_ticks
 from .models import BookFeatures, Direction, OrderBook, Signal
 from .orders import KabuConstants, KabuFutureOrderBuilder
 from .paper_execution import ExecutionEvent
@@ -46,6 +46,11 @@ class LivePositionSlot:
     position: LivePositionState
     trade: Any
     entry_signal: Signal
+    entry_order_id: str | None = None
+    entry_execution_price: float | None = None
+    entry_execution_id: str | None = None
+    entry_execution_day: str | None = None
+    entry_price_mismatch: bool = False
 
 
 class LiveExecutionController:
@@ -94,6 +99,9 @@ class LiveExecutionController:
         self.last_position_poll_at: datetime | None = None
         self.reported_order_statuses: set[tuple[str, str]] = set()
         self.last_order_snapshot_by_id: dict[str, dict[str, Any]] = {}
+        self.entry_execution_by_order_id: dict[str, dict[str, Any]] = {}
+        self.closed_exit_order_ids: set[str] = set()
+        self.closed_trade_by_position_key: dict[str, dict[str, object]] = {}
         self.orders_submitted = 0
         self.order_errors = 0
         self.entry_orders_submitted = 0
@@ -103,6 +111,11 @@ class LiveExecutionController:
         self.positions_detected = 0
         self.own_entry_fills_detected = 0
         self.positions_flat = 0
+        self.live_trades_count = 0
+        self.live_wins = 0
+        self.live_losses = 0
+        self.live_pnl_ticks = 0.0
+        self.live_pnl_yen = 0.0
 
     def on_signal(self, signal: Signal, book: OrderBook, exchange: int) -> list[ExecutionEvent]:
         event_time = book_event_time(book)
@@ -309,6 +322,15 @@ class LiveExecutionController:
             "live_positions_flat": self.positions_flat,
             "live_entry_fill_rate": _ratio(self.own_entry_fills_detected, self.entry_orders_submitted),
             "live_own_entry_fills_detected": self.own_entry_fills_detected,
+            "live_trades_count": self.live_trades_count,
+            "live_wins": self.live_wins,
+            "live_losses": self.live_losses,
+            "live_win_rate": _ratio(self.live_wins, self.live_trades_count),
+            "live_pnl_ticks": round(self.live_pnl_ticks, 4),
+            "live_pnl_yen": round(self.live_pnl_yen, 2),
+            "live_avg_pnl_ticks": round(self.live_pnl_ticks / self.live_trades_count, 4)
+            if self.live_trades_count
+            else 0.0,
             "live_exit_blocked": sorted(self.exit_blocked),
             "live_exit_blocked_count": len(self.exit_blocked),
             "live_exit_failure_counts": dict(self.exit_failure_counts),
@@ -394,8 +416,22 @@ class LiveExecutionController:
                 )
             terminal_unfilled = _order_is_unfilled_terminal(order)
             terminal_partial_exit = _order_is_partially_filled_terminal(order, pending.qty)
+            terminal_filled = _order_is_filled_terminal(order, pending.qty)
             filled_qty = _float_value(order.get("CumQty"))
-            if terminal_unfilled:
+            if terminal_filled:
+                if self.pending_entry is not None and pending.order_id == self.pending_entry.order_id:
+                    self.entry_execution_by_order_id[pending.order_id] = _order_execution_snapshot(order)
+                elif (
+                    pending.position_key is not None
+                    and pending.position_key in self.pending_exits
+                    and pending.order_id not in self.closed_exit_order_ids
+                ):
+                    closed_event = self._record_live_trade_closed(pending, snapshot, book_event_time(book))
+                    if closed_event is not None:
+                        events.append(closed_event)
+                    self.closed_exit_order_ids.add(pending.order_id)
+                continue
+            elif terminal_unfilled:
                 if self.pending_entry is not None and pending.order_id == self.pending_entry.order_id:
                     self._clear_pending_entry()
                     self.entry_orders_expired += 1
@@ -531,6 +567,7 @@ class LiveExecutionController:
             self.exit_retry_after.pop(position_key, None)
             self.exit_failure_counts.pop(position_key, None)
             self.exit_blocked.discard(position_key)
+            closed_trade = self.closed_trade_by_position_key.pop(position_key, None)
             events.append(
                 ExecutionEvent(
                     "live_position_flat",
@@ -543,6 +580,7 @@ class LiveExecutionController:
                         **event_trace_metadata("position_lifecycle", "exit", "position_flat_confirmed"),
                         "position_key": position_key,
                         "hold_id": slot.position.hold_id,
+                        "live_trade": closed_trade,
                     },
                 )
             )
@@ -554,8 +592,10 @@ class LiveExecutionController:
                 continue
             source_signal = None
             own_entry_detected = False
+            entry_order_id = None
             if self.entry_signal is not None and self.entry_signal.symbol == position.symbol and not pending_entry_consumed:
                 source_signal = self.entry_signal
+                entry_order_id = self.pending_entry.order_id if self.pending_entry is not None else None
                 pending_entry_consumed = True
                 own_entry_detected = True
             elif (
@@ -565,11 +605,26 @@ class LiveExecutionController:
                 and not orphan_entry_consumed
             ):
                 source_signal = self.orphan_entry_signal
+                entry_order_id = self.orphan_entry_order_id
                 orphan_entry_consumed = True
                 own_entry_detected = True
             entry_signal = _position_entry_signal(source_signal, position, position.symbol)
             trade = self._trade_from_position(entry_signal, event_time, position.qty)
-            self.live_positions[position_key] = LivePositionSlot(position, trade, entry_signal)
+            entry_execution = self.entry_execution_by_order_id.get(entry_order_id or "", {})
+            entry_execution_price = _optional_float(entry_execution.get("execution_price"))
+            entry_price_mismatch = (
+                entry_execution_price is not None and abs(entry_execution_price - position.entry_price) > 1e-9
+            )
+            self.live_positions[position_key] = LivePositionSlot(
+                position,
+                trade,
+                entry_signal,
+                entry_order_id=entry_order_id,
+                entry_execution_price=entry_execution_price,
+                entry_execution_id=_optional_str(entry_execution.get("execution_id")),
+                entry_execution_day=_optional_str(entry_execution.get("execution_day")),
+                entry_price_mismatch=entry_price_mismatch,
+            )
             self.positions_detected += 1
             if own_entry_detected:
                 self.own_entry_fills_detected += 1
@@ -592,15 +647,104 @@ class LiveExecutionController:
                         "engine": entry_signal.engine,
                         "own_entry_detected": own_entry_detected,
                         "signal_reason": entry_signal.reason,
+                        "entry_order_id": entry_order_id,
+                        "position_entry_price": position.entry_price,
+                        "entry_execution_price": entry_execution_price,
+                        "entry_execution_id": entry_execution.get("execution_id"),
+                        "entry_execution_day": entry_execution.get("execution_day"),
+                        "entry_execution_qty": entry_execution.get("execution_qty"),
+                        "entry_price_mismatch": entry_price_mismatch,
                     },
                 )
             )
         if pending_entry_consumed:
-            self._clear_pending_entry()
+            consumed = self._clear_pending_entry()
+            if consumed is not None:
+                self.entry_execution_by_order_id.pop(consumed.order_id, None)
         if orphan_entry_consumed:
+            if self.orphan_entry_order_id is not None:
+                self.entry_execution_by_order_id.pop(self.orphan_entry_order_id, None)
             self._clear_orphan_entry_signal()
         self._refresh_legacy_state()
         return events
+
+    def _record_live_trade_closed(
+        self,
+        pending: PendingLiveOrder,
+        order_status: dict[str, Any],
+        event_time: datetime,
+    ) -> ExecutionEvent | None:
+        position_key = pending.position_key
+        if position_key is None:
+            return None
+        slot = self.live_positions.get(position_key)
+        if slot is None:
+            return None
+        exit_price = _optional_float(order_status.get("execution_price"))
+        if exit_price is None:
+            exit_price = _optional_float(order_status.get("price"))
+        if exit_price is None:
+            return None
+
+        symbol = slot.position.symbol
+        tick_size = self.config.tick_size_for(symbol)
+        tick_value = self.config.tick_value_yen_for(symbol)
+        execution_qty = _optional_float(order_status.get("execution_qty"))
+        qty = int(execution_qty) if execution_qty is not None and execution_qty > 0 else pending.qty
+        pnl_ticks = calculate_pnl_ticks(slot.position.direction, slot.position.entry_price, exit_price, tick_size)
+        pnl_yen = pnl_ticks * qty * tick_value
+
+        self.live_trades_count += 1
+        if pnl_ticks > 0:
+            self.live_wins += 1
+        elif pnl_ticks < 0:
+            self.live_losses += 1
+        self.live_pnl_ticks += pnl_ticks
+        self.live_pnl_yen += pnl_yen
+
+        trade_record: dict[str, object] = {
+            "symbol": symbol,
+            "direction": slot.position.direction,
+            "qty": qty,
+            "entry_price": slot.position.entry_price,
+            "exit_price": exit_price,
+            "pnl_ticks": round(pnl_ticks, 4),
+            "pnl_yen": round(pnl_yen, 2),
+            "exit_reason": pending.reason,
+            "position_key": position_key,
+            "hold_id": slot.position.hold_id,
+            "entry_order_id": slot.entry_order_id,
+            "entry_execution_price": slot.entry_execution_price,
+            "entry_execution_id": slot.entry_execution_id,
+            "entry_execution_day": slot.entry_execution_day,
+            "entry_price_mismatch": slot.entry_price_mismatch,
+            "exit_order_id": pending.order_id,
+            "exit_execution_price": exit_price,
+            "exit_execution_id": order_status.get("execution_id"),
+            "exit_execution_ids": order_status.get("execution_ids"),
+            "exit_execution_day": order_status.get("execution_day"),
+            "exit_execution_qty": order_status.get("execution_qty"),
+            "tick_size": tick_size,
+            "tick_value_yen": tick_value,
+        }
+        self.closed_trade_by_position_key[position_key] = trade_record
+        return ExecutionEvent(
+            "live_trade_closed",
+            symbol,
+            slot.position.direction,
+            qty=qty,
+            entry_price=slot.position.entry_price,
+            exit_price=exit_price,
+            reason=pending.reason,
+            pnl_ticks=round(pnl_ticks, 4),
+            pnl_yen=round(pnl_yen, 2),
+            timestamp=event_time,
+            metadata={
+                **event_trace_metadata("position_lifecycle", "exit", pending.reason, checks={"engine": _trade_engine(slot.trade)}),
+                **trade_record,
+                "order_status": order_status,
+            },
+        )
 
     def _submit_exit_order(
         self,
@@ -1081,6 +1225,7 @@ def _find_order(orders: list[dict[str, Any]], order_id: str) -> dict[str, Any] |
 
 
 def _order_status_snapshot(order: dict[str, Any]) -> dict[str, Any]:
+    execution = _order_execution_snapshot(order)
     return {
         "id": order.get("ID") or order.get("OrderId") or order.get("OrderID"),
         "state": order.get("State"),
@@ -1089,6 +1234,7 @@ def _order_status_snapshot(order: dict[str, Any]) -> dict[str, Any]:
         "cum_qty": order.get("CumQty"),
         "side": order.get("Side"),
         "price": order.get("Price"),
+        **execution,
         "details": [
             {
                 "rec_type": detail.get("RecType"),
@@ -1101,6 +1247,54 @@ def _order_status_snapshot(order: dict[str, Any]) -> dict[str, Any]:
             for detail in (order.get("Details") or [])
             if isinstance(detail, dict)
         ],
+    }
+
+
+def _order_execution_snapshot(order: dict[str, Any]) -> dict[str, Any]:
+    details = [detail for detail in (order.get("Details") or []) if isinstance(detail, dict)]
+    executions: list[tuple[float, float, str | None, str | None]] = []
+    for detail in details:
+        rec_type = _optional_int(detail.get("RecType"))
+        execution_id = _optional_str(detail.get("ExecutionID"))
+        price = _optional_float(detail.get("Price"))
+        if price is None or (execution_id is None and rec_type != 8):
+            continue
+        qty = _optional_float(detail.get("Qty")) or 1.0
+        executions.append((price, qty, execution_id, _optional_str(detail.get("ExecutionDay"))))
+    if executions:
+        total_qty = sum(qty for _, qty, _, _ in executions)
+        avg_price = sum(price * qty for price, qty, _, _ in executions) / total_qty if total_qty > 0 else executions[-1][0]
+        execution_ids = [execution_id for _, _, execution_id, _ in executions if execution_id]
+        execution_days = [execution_day for _, _, _, execution_day in executions if execution_day]
+        return {
+            "execution_price": avg_price,
+            "execution_qty": total_qty,
+            "execution_id": execution_ids[-1] if execution_ids else None,
+            "execution_ids": execution_ids,
+            "execution_day": execution_days[-1] if execution_days else None,
+            "execution_days": execution_days,
+            "execution_source": "details",
+        }
+    if _float_value(order.get("CumQty")) > 0:
+        price = _optional_float(order.get("Price"))
+        if price is not None:
+            return {
+                "execution_price": price,
+                "execution_qty": _float_value(order.get("CumQty")),
+                "execution_id": None,
+                "execution_ids": [],
+                "execution_day": None,
+                "execution_days": [],
+                "execution_source": "order_price",
+            }
+    return {
+        "execution_price": None,
+        "execution_qty": 0.0,
+        "execution_id": None,
+        "execution_ids": [],
+        "execution_day": None,
+        "execution_days": [],
+        "execution_source": None,
     }
 
 
@@ -1125,6 +1319,10 @@ def _order_is_unfilled_terminal(order: dict[str, Any]) -> bool:
 def _order_is_partially_filled_terminal(order: dict[str, Any], order_qty: int) -> bool:
     cum_qty = _float_value(order.get("CumQty"))
     return 0 < cum_qty < float(order_qty) and _order_is_terminal(order)
+
+
+def _order_is_filled_terminal(order: dict[str, Any], order_qty: int) -> bool:
+    return _float_value(order.get("CumQty")) >= float(order_qty) and _order_is_terminal(order)
 
 
 def _order_is_terminal(order: dict[str, Any]) -> bool:
@@ -1174,6 +1372,20 @@ def _optional_int(value: Any) -> int | None:
         return int(float(value))
     except (TypeError, ValueError):
         return None
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
 
 
 def _float_value(value: Any) -> float:

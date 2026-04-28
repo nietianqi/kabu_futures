@@ -26,6 +26,7 @@ ExecutionEventType = Literal[
     "live_order_error",
     "live_position_detected",
     "live_position_flat",
+    "live_trade_closed",
     "live_sync_error",
 ]
 

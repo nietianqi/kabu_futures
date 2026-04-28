@@ -15,6 +15,7 @@ from .models import Direction, OrderBook, SignalEvaluation
 from .paper_execution import ExecutionEvent, PaperExecutionController, PaperFillModel
 from .regime import RegimeClassifier
 from .serialization import event_time as book_event_time
+from .sessions import classify_jst_session
 
 
 DEFAULT_MARKOUT_SECONDS = (0.5, 1.0, 3.0, 5.0, 30.0, 60.0)
@@ -98,6 +99,65 @@ class _EntryFillDiagnostics:
     by_slippage_ticks: defaultdict[str, Counter[str]] = field(default_factory=lambda: defaultdict(Counter))
 
 
+@dataclass
+class _LiveTradeDiagnostics:
+    direct_events: int = 0
+    reconstructed_trades: int = 0
+    pnl_ticks: list[float] = field(default_factory=list)
+    pnl_yen: list[float] = field(default_factory=list)
+    by_symbol_ticks: defaultdict[str, list[float]] = field(default_factory=lambda: defaultdict(list))
+    by_symbol_yen: defaultdict[str, list[float]] = field(default_factory=lambda: defaultdict(list))
+    by_exit_reason: Counter[str] = field(default_factory=Counter)
+    entry_price_mismatches: int = 0
+    mismatch_samples: list[dict[str, object]] = field(default_factory=list)
+
+
+@dataclass
+class _LoggedPosition:
+    symbol: str
+    direction: Direction
+    qty: int
+    entry_price: float
+    position_key: str
+    hold_id: str | None = None
+
+
+@dataclass
+class _LoggedExitOrder:
+    order_id: str
+    position_key: str
+    symbol: str
+    direction: Direction
+    qty: int
+    exit_reason: str
+
+
+@dataclass
+class _JumpDiagnostics:
+    total: int = 0
+    by_symbol: Counter[str] = field(default_factory=Counter)
+    by_session_phase: Counter[str] = field(default_factory=Counter)
+    by_spread_ticks: Counter[str] = field(default_factory=Counter)
+
+
+@dataclass
+class _LoggedDiagnostics:
+    entry_fill: _EntryFillDiagnostics = field(default_factory=_EntryFillDiagnostics)
+    live_trade: _LiveTradeDiagnostics = field(default_factory=_LiveTradeDiagnostics)
+    jump: _JumpDiagnostics = field(default_factory=_JumpDiagnostics)
+    recorded_execution_rejects: Counter[str] = field(default_factory=Counter)
+    recorded_live_unsupported_engines: Counter[str] = field(default_factory=Counter)
+    pending_entry_bucket_by_order_id: dict[str, str] = field(default_factory=dict)
+    pending_entry_ids_by_symbol_direction: defaultdict[tuple[str, str], deque[str]] = field(default_factory=lambda: defaultdict(deque))
+    live_positions_by_key: dict[str, _LoggedPosition] = field(default_factory=dict)
+    live_exit_orders_by_id: dict[str, _LoggedExitOrder] = field(default_factory=dict)
+    live_filled_exit_status_by_order_id: dict[str, float] = field(default_factory=dict)
+    live_direct_exit_order_ids: set[str] = field(default_factory=set)
+    live_entry_order_ids: defaultdict[tuple[str, str], deque[str]] = field(default_factory=lambda: defaultdict(deque))
+    live_entry_order_key_by_id: dict[str, tuple[str, str]] = field(default_factory=dict)
+    live_entry_executions_by_order_id: dict[str, float] = field(default_factory=dict)
+
+
 def calculate_markout_ticks(direction: Direction, entry_price: float, future_mid_price: float, tick_size: float) -> float:
     if tick_size <= 0:
         raise ValueError(f"tick_size must be positive, got {tick_size}")
@@ -118,6 +178,7 @@ def analyze_micro_log(
     regime_kwargs: dict[str, object] | None = None,
     entry_fill_slippage_ticks: Iterable[int] = DEFAULT_ENTRY_FILL_SLIPPAGE_TICKS,
     entry_fill_latency_ms: Iterable[int] = DEFAULT_ENTRY_FILL_LATENCY_MS,
+    logged_diagnostics_max_rows: int | None = None,
 ) -> dict[str, object]:
     horizons = tuple(float(value) for value in markout_seconds)
     fill_slippage_ticks = _non_negative_int_tuple(entry_fill_slippage_ticks, "entry_fill_slippage_ticks")
@@ -224,8 +285,9 @@ def analyze_micro_log(
             break
 
     pnl_values = [float(event.pnl_ticks or 0.0) for event in exits]
-    _record_logged_execution_rejects(path, entry_diagnostics)
-    entry_fill_observed = _record_logged_entry_fill_diagnostics(path, config)
+    logged_diagnostics = _record_logged_diagnostics(path, config, logged_diagnostics_max_rows)
+    entry_diagnostics.recorded_execution_rejects.update(logged_diagnostics.recorded_execution_rejects)
+    entry_diagnostics.recorded_live_unsupported_engines.update(logged_diagnostics.recorded_live_unsupported_engines)
     entry_fill_simulation = _simulate_fak_entry_fills(
         entry_signal_samples,
         book_quotes,
@@ -250,7 +312,9 @@ def analyze_micro_log(
             "by_direction": dict(signal_directions),
         },
         "entry_diagnostics": _entry_diagnostics_summary(entry_diagnostics),
-        "entry_fill_diagnostics": _entry_fill_diagnostics_summary(entry_fill_observed, entry_fill_simulation),
+        "entry_fill_diagnostics": _entry_fill_diagnostics_summary(logged_diagnostics.entry_fill, entry_fill_simulation),
+        "live_trade_diagnostics": _live_trade_diagnostics_summary(logged_diagnostics.live_trade),
+        "jump_diagnostics": _jump_diagnostics_summary(logged_diagnostics.jump),
         "paper": {
             **_paper_summary(pnl_values, execution.heartbeat_metadata()),
             "events": dict(paper_events),
@@ -403,84 +467,243 @@ def _non_negative_int_tuple(values: Iterable[int], name: str) -> tuple[int, ...]
     return result
 
 
-def _record_logged_execution_rejects(path: str | Path, diagnostics: _EntryDiagnostics) -> None:
-    for jsonl_file in _jsonl_files(path):
-        try:
-            handle = jsonl_file.open(encoding="utf-8")
-        except OSError:
-            continue
-        with handle:
-            for line in handle:
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if row.get("kind") != "execution_reject":
-                    continue
-                payload = row.get("payload")
-                if not isinstance(payload, dict):
-                    continue
-                reason = payload.get("reason") or payload.get("event_type")
-                if reason:
-                    diagnostics.recorded_execution_rejects[str(reason)] += 1
-                if reason == "live_unsupported_signal_engine":
-                    signal = _payload_signal(payload)
-                    engine = signal.get("engine") if isinstance(signal, dict) else None
-                    diagnostics.recorded_live_unsupported_engines[str(engine or "unknown")] += 1
-
-
-def _record_logged_entry_fill_diagnostics(path: str | Path, config: StrategyConfig) -> _EntryFillDiagnostics:
-    diagnostics = _EntryFillDiagnostics()
-    pending_by_order_id: dict[str, str] = {}
-    pending_by_symbol_direction: defaultdict[tuple[str, str], deque[str]] = defaultdict(deque)
-
-    for row in _iter_jsonl_rows(path):
+def _record_logged_diagnostics(
+    path: str | Path,
+    config: StrategyConfig,
+    max_rows: int | None = None,
+) -> _LoggedDiagnostics:
+    diagnostics = _LoggedDiagnostics()
+    for row in _iter_jsonl_rows(path, max_rows=max_rows):
         payload = row.get("payload")
         if not isinstance(payload, dict):
             continue
         event_type = _payload_event_type(row, payload)
         reason = str(payload.get("reason") or "")
-        if event_type == "live_order_submitted" and _is_entry_submission(payload):
-            bucket = _entry_slippage_bucket(payload, config.tick_size_for(_payload_symbol(payload)))
-            diagnostics.entry_submitted += 1
-            diagnostics.by_slippage_ticks[bucket]["entry_submitted"] += 1
-            order_id = _payload_order_id(payload)
-            if order_id:
-                pending_by_order_id[order_id] = bucket
-                pending_by_symbol_direction[_payload_symbol_direction(payload)].append(order_id)
-        elif event_type == "live_position_detected":
-            diagnostics.positions_detected += 1
-            metadata = _payload_metadata(payload)
-            if metadata.get("own_entry_detected") is True:
-                bucket = _consume_pending_entry_bucket(payload, pending_by_order_id, pending_by_symbol_direction)
-                diagnostics.own_fills_detected += 1
-                diagnostics.by_slippage_ticks[bucket]["own_fills_detected"] += 1
-            else:
-                diagnostics.external_or_unknown_positions_detected += 1
-        elif event_type == "live_order_expired" and reason == "entry_order_expired_or_unfilled":
-            bucket = _pending_bucket_for_payload(payload, pending_by_order_id, config.tick_size_for(_payload_symbol(payload)))
-            diagnostics.expired_unfilled += 1
-            diagnostics.by_slippage_ticks[bucket]["expired_unfilled"] += 1
-        elif event_type == "live_sync_error" and reason == "pending_entry_timeout_after_grace":
-            bucket = _pending_bucket_for_payload(payload, pending_by_order_id, config.tick_size_for(_payload_symbol(payload)))
-            diagnostics.timeout_after_grace += 1
-            diagnostics.by_slippage_ticks[bucket]["timeout_after_grace"] += 1
-        elif event_type == "live_order_error" and reason == "entry_order_api_error":
-            bucket = _entry_slippage_bucket(payload, config.tick_size_for(_payload_symbol(payload)))
-            diagnostics.api_errors += 1
-            diagnostics.by_slippage_ticks[bucket]["api_errors"] += 1
-        elif event_type == "live_order_error" and reason == "entry_order_rejected":
-            bucket = _entry_slippage_bucket(payload, config.tick_size_for(_payload_symbol(payload)))
-            diagnostics.rejected += 1
-            diagnostics.by_slippage_ticks[bucket]["rejected"] += 1
-        elif event_type == "execution_reject" and reason == "entry_failure_cooldown":
-            diagnostics.cooldown_rejects += 1
-            diagnostics.by_slippage_ticks["unknown"]["cooldown_rejects"] += 1
+        _record_logged_execution_reject(diagnostics, event_type, payload)
+        _record_logged_entry_fill(diagnostics, event_type, reason, payload, config)
+        _record_logged_live_trade(diagnostics, event_type, reason, payload, config)
+        _record_logged_jump(diagnostics, row, payload, config)
 
+    for order_id, execution_price in diagnostics.live_filled_exit_status_by_order_id.items():
+        if order_id in diagnostics.live_direct_exit_order_ids:
+            continue
+        exit_order = diagnostics.live_exit_orders_by_id.get(order_id)
+        if exit_order is not None:
+            _record_reconstructed_live_trade(
+                diagnostics.live_trade,
+                diagnostics.live_positions_by_key,
+                exit_order,
+                execution_price,
+                config,
+            )
     return diagnostics
 
 
-def _iter_jsonl_rows(path: str | Path) -> Iterable[dict[str, object]]:
+def _record_logged_execution_reject(
+    diagnostics: _LoggedDiagnostics,
+    event_type: str,
+    payload: dict[str, object],
+) -> None:
+    if event_type != "execution_reject":
+        return
+    reason = payload.get("reason") or payload.get("event_type")
+    if reason:
+        diagnostics.recorded_execution_rejects[str(reason)] += 1
+    if reason == "live_unsupported_signal_engine":
+        signal = _payload_signal(payload)
+        engine = signal.get("engine") if isinstance(signal, dict) else None
+        diagnostics.recorded_live_unsupported_engines[str(engine or "unknown")] += 1
+
+
+def _record_logged_entry_fill(
+    diagnostics: _LoggedDiagnostics,
+    event_type: str,
+    reason: str,
+    payload: dict[str, object],
+    config: StrategyConfig,
+) -> None:
+    observed = diagnostics.entry_fill
+    if event_type == "live_order_submitted" and _is_entry_submission(payload):
+        bucket = _entry_slippage_bucket(payload, config.tick_size_for(_payload_symbol(payload)))
+        observed.entry_submitted += 1
+        observed.by_slippage_ticks[bucket]["entry_submitted"] += 1
+        order_id = _payload_order_id(payload)
+        if order_id:
+            diagnostics.pending_entry_bucket_by_order_id[order_id] = bucket
+            diagnostics.pending_entry_ids_by_symbol_direction[_payload_symbol_direction(payload)].append(order_id)
+    elif event_type == "live_position_detected":
+        observed.positions_detected += 1
+        metadata = _payload_metadata(payload)
+        if metadata.get("own_entry_detected") is True:
+            bucket = _consume_pending_entry_bucket(
+                payload,
+                diagnostics.pending_entry_bucket_by_order_id,
+                diagnostics.pending_entry_ids_by_symbol_direction,
+            )
+            observed.own_fills_detected += 1
+            observed.by_slippage_ticks[bucket]["own_fills_detected"] += 1
+        else:
+            observed.external_or_unknown_positions_detected += 1
+    elif event_type == "live_order_expired" and reason == "entry_order_expired_or_unfilled":
+        bucket = _pending_bucket_for_payload(
+            payload,
+            diagnostics.pending_entry_bucket_by_order_id,
+            config.tick_size_for(_payload_symbol(payload)),
+        )
+        observed.expired_unfilled += 1
+        observed.by_slippage_ticks[bucket]["expired_unfilled"] += 1
+    elif event_type == "live_sync_error" and reason == "pending_entry_timeout_after_grace":
+        bucket = _pending_bucket_for_payload(
+            payload,
+            diagnostics.pending_entry_bucket_by_order_id,
+            config.tick_size_for(_payload_symbol(payload)),
+        )
+        observed.timeout_after_grace += 1
+        observed.by_slippage_ticks[bucket]["timeout_after_grace"] += 1
+    elif event_type == "live_order_error" and reason == "entry_order_api_error":
+        bucket = _entry_slippage_bucket(payload, config.tick_size_for(_payload_symbol(payload)))
+        observed.api_errors += 1
+        observed.by_slippage_ticks[bucket]["api_errors"] += 1
+    elif event_type == "live_order_error" and reason == "entry_order_rejected":
+        bucket = _entry_slippage_bucket(payload, config.tick_size_for(_payload_symbol(payload)))
+        observed.rejected += 1
+        observed.by_slippage_ticks[bucket]["rejected"] += 1
+    elif event_type == "execution_reject" and reason == "entry_failure_cooldown":
+        observed.cooldown_rejects += 1
+        observed.by_slippage_ticks["unknown"]["cooldown_rejects"] += 1
+
+
+def _record_logged_live_trade(
+    diagnostics: _LoggedDiagnostics,
+    event_type: str,
+    reason: str,
+    payload: dict[str, object],
+    config: StrategyConfig,
+) -> None:
+    metadata = _payload_metadata(payload)
+    if event_type == "live_order_submitted" and _is_entry_submission(payload):
+        order_id = _payload_order_id(payload)
+        if order_id:
+            key = _payload_symbol_direction(payload)
+            diagnostics.live_entry_order_ids[key].append(order_id)
+            diagnostics.live_entry_order_key_by_id[order_id] = key
+    elif event_type == "live_order_submitted" and _is_exit_submission(payload):
+        order_id = _payload_order_id(payload)
+        position_key = _metadata_text(metadata, "position_key")
+        if order_id and position_key:
+            diagnostics.live_exit_orders_by_id[order_id] = _LoggedExitOrder(
+                order_id,
+                position_key,
+                _payload_symbol(payload),
+                _payload_direction(payload),
+                int(payload.get("qty") or 1),
+                str(metadata.get("exit_reason") or reason or "unknown"),
+            )
+    elif event_type == "live_order_status":
+        _record_logged_order_status(diagnostics, payload, metadata)
+    elif event_type == "live_order_expired" and reason == "entry_order_expired_or_unfilled":
+        _discard_logged_entry_order(diagnostics, _payload_order_id(payload))
+    elif event_type == "live_sync_error" and reason == "pending_entry_timeout_after_grace":
+        _discard_logged_entry_order(diagnostics, _payload_order_id(payload))
+    elif event_type == "live_position_detected":
+        _record_logged_position_detected(diagnostics, payload, metadata)
+    elif event_type == "live_trade_closed":
+        diagnostics.live_trade.direct_events += 1
+        exit_order_id = _metadata_text(metadata, "exit_order_id")
+        if exit_order_id:
+            diagnostics.live_direct_exit_order_ids.add(exit_order_id)
+        _record_direct_live_trade(diagnostics.live_trade, payload, metadata, config)
+
+
+def _record_logged_order_status(
+    diagnostics: _LoggedDiagnostics,
+    payload: dict[str, object],
+    metadata: dict[str, object],
+) -> None:
+    order_id = _payload_order_id(payload)
+    status = metadata.get("order_status")
+    if not order_id or not isinstance(status, dict):
+        return
+    execution_price = _status_execution_price(status)
+    if execution_price is None:
+        return
+    if order_id in diagnostics.live_exit_orders_by_id and order_id not in diagnostics.live_direct_exit_order_ids:
+        exit_order = diagnostics.live_exit_orders_by_id[order_id]
+        if _status_is_filled(status, exit_order.qty):
+            diagnostics.live_filled_exit_status_by_order_id[order_id] = execution_price
+    elif _status_is_filled(status, 1):
+        diagnostics.live_entry_executions_by_order_id[order_id] = execution_price
+
+
+def _discard_logged_entry_order(diagnostics: _LoggedDiagnostics, order_id: str | None) -> None:
+    if order_id is None:
+        return
+    _remove_entry_order_id(order_id, diagnostics.live_entry_order_ids, diagnostics.live_entry_order_key_by_id)
+    diagnostics.live_entry_executions_by_order_id.pop(order_id, None)
+
+
+def _record_logged_position_detected(
+    diagnostics: _LoggedDiagnostics,
+    payload: dict[str, object],
+    metadata: dict[str, object],
+) -> None:
+    position = _logged_position_from_payload(payload)
+    if position is not None:
+        diagnostics.live_positions_by_key[position.position_key] = position
+    if metadata.get("entry_price_mismatch") is True:
+        _record_entry_price_mismatch(diagnostics.live_trade, payload, metadata)
+    elif metadata.get("own_entry_detected") is True:
+        order_id = _metadata_text(metadata, "entry_order_id") or _consume_entry_order_id(
+            payload,
+            diagnostics.live_entry_order_ids,
+        )
+        if order_id is not None:
+            diagnostics.live_entry_order_key_by_id.pop(order_id, None)
+        execution_price = _optional_payload_float(metadata.get("entry_execution_price"))
+        if execution_price is None and order_id is not None:
+            execution_price = diagnostics.live_entry_executions_by_order_id.get(order_id)
+        position_entry_price = _optional_payload_float(metadata.get("position_entry_price") or payload.get("entry_price"))
+        if execution_price is not None and position_entry_price is not None and abs(execution_price - position_entry_price) > 1e-9:
+            _record_entry_price_mismatch(
+                diagnostics.live_trade,
+                payload,
+                {
+                    **metadata,
+                    "entry_order_id": order_id,
+                    "entry_execution_price": execution_price,
+                    "position_entry_price": position_entry_price,
+                },
+            )
+
+
+def _record_logged_jump(
+    diagnostics: _LoggedDiagnostics,
+    row: dict[str, object],
+    payload: dict[str, object],
+    config: StrategyConfig,
+) -> None:
+    kind = str(row.get("kind") or "")
+    if kind not in {"signal_eval", "signal_eval_summary"}:
+        return
+    reason = str(payload.get("reason") or "")
+    metadata = _jump_metadata(payload)
+    if reason != "jump_detected" and metadata.get("jump_detected") is not True:
+        return
+    count = int(payload.get("count") or 1)
+    symbol = str(payload.get("symbol") or "unknown")
+    timestamp = _payload_timestamp(payload, "start_timestamp") or _payload_timestamp(payload, "timestamp")
+    session_phase = classify_jst_session(timestamp, config.session_schedule).phase if timestamp is not None else "unknown"
+    spread_ticks = _optional_payload_float(metadata.get("spread_ticks"))
+    spread_bucket = _spread_bucket(spread_ticks)
+    diagnostics.jump.total += count
+    diagnostics.jump.by_symbol[symbol] += count
+    diagnostics.jump.by_session_phase[session_phase] += count
+    diagnostics.jump.by_spread_ticks[spread_bucket] += count
+
+
+def _iter_jsonl_rows(path: str | Path, max_rows: int | None = None) -> Iterable[dict[str, object]]:
+    yielded = 0
+    limit = None if max_rows is None or max_rows <= 0 else int(max_rows)
     for jsonl_file in _jsonl_files(path):
         try:
             handle = jsonl_file.open(encoding="utf-8")
@@ -493,6 +716,9 @@ def _iter_jsonl_rows(path: str | Path) -> Iterable[dict[str, object]]:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(row, dict):
+                    if limit is not None and yielded >= limit:
+                        return
+                    yielded += 1
                     yield row
 
 
@@ -508,6 +734,14 @@ def _is_entry_submission(payload: dict[str, object]) -> bool:
         return False
     order_payload = metadata.get("order_payload")
     return isinstance(order_payload, dict) and str(order_payload.get("TradeType")) == "1"
+
+
+def _is_exit_submission(payload: dict[str, object]) -> bool:
+    metadata = _payload_metadata(payload)
+    if metadata.get("exit_reason"):
+        return True
+    order_payload = metadata.get("order_payload")
+    return isinstance(order_payload, dict) and str(order_payload.get("TradeType")) == "2"
 
 
 def _payload_metadata(payload: dict[str, object]) -> dict[str, object]:
@@ -531,6 +765,11 @@ def _payload_order_id(payload: dict[str, object]) -> str | None:
 
 def _payload_symbol_direction(payload: dict[str, object]) -> tuple[str, str]:
     return (_payload_symbol(payload), str(payload.get("direction") or ""))
+
+
+def _payload_direction(payload: dict[str, object]) -> Direction:
+    direction = str(payload.get("direction") or "")
+    return direction if direction in ("long", "short") else "flat"
 
 
 def _payload_symbol(payload: dict[str, object]) -> str:
@@ -568,6 +807,33 @@ def _consume_pending_entry_bucket(
     return "unknown"
 
 
+def _consume_entry_order_id(
+    payload: dict[str, object],
+    entry_order_ids: defaultdict[tuple[str, str], deque[str]],
+) -> str | None:
+    queue = entry_order_ids[_payload_symbol_direction(payload)]
+    while queue:
+        return queue.popleft()
+    return None
+
+
+def _remove_entry_order_id(
+    order_id: str,
+    entry_order_ids: defaultdict[tuple[str, str], deque[str]],
+    entry_order_key_by_id: dict[str, tuple[str, str]],
+) -> None:
+    key = entry_order_key_by_id.pop(order_id, None)
+    if key is None:
+        return
+    queue = entry_order_ids.get(key)
+    if queue is None:
+        return
+    try:
+        queue.remove(order_id)
+    except ValueError:
+        return
+
+
 def _entry_slippage_bucket(payload: dict[str, object], tick_size: float) -> str:
     metadata = _payload_metadata(payload)
     raw_slippage = metadata.get("entry_slippage_ticks")
@@ -600,6 +866,183 @@ def _float_from_any(value: object) -> float | None:
         except ValueError:
             return None
     return None
+
+
+def _optional_payload_float(value: object) -> float | None:
+    return _float_from_any(value)
+
+
+def _metadata_text(metadata: dict[str, object], key: str) -> str | None:
+    value = metadata.get(key)
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
+
+
+def _logged_position_from_payload(payload: dict[str, object]) -> _LoggedPosition | None:
+    metadata = _payload_metadata(payload)
+    entry_price = _optional_payload_float(payload.get("entry_price") or metadata.get("position_entry_price"))
+    if entry_price is None:
+        return None
+    position_key = _metadata_text(metadata, "position_key")
+    if position_key is None:
+        hold_id = _metadata_text(metadata, "hold_id")
+        symbol_code = _metadata_text(metadata, "symbol_code") or _payload_symbol(payload)
+        position_key = f"hold:{hold_id}" if hold_id else f"single_position_without_hold_id:{symbol_code}"
+    qty = int(payload.get("qty") or 1)
+    return _LoggedPosition(
+        _payload_symbol(payload),
+        _payload_direction(payload),
+        qty,
+        entry_price,
+        position_key,
+        _metadata_text(metadata, "hold_id"),
+    )
+
+
+def _record_direct_live_trade(
+    diagnostics: _LiveTradeDiagnostics,
+    payload: dict[str, object],
+    metadata: dict[str, object],
+    config: StrategyConfig,
+) -> None:
+    symbol = _payload_symbol(payload)
+    pnl_ticks = _optional_payload_float(payload.get("pnl_ticks") or metadata.get("pnl_ticks"))
+    pnl_yen = _optional_payload_float(payload.get("pnl_yen") or metadata.get("pnl_yen"))
+    if pnl_ticks is None:
+        entry_price = _optional_payload_float(payload.get("entry_price") or metadata.get("entry_price"))
+        exit_price = _optional_payload_float(payload.get("exit_price") or metadata.get("exit_price"))
+        if entry_price is not None and exit_price is not None:
+            pnl_ticks = calculate_markout_ticks(_payload_direction(payload), entry_price, exit_price, config.tick_size_for(symbol))
+    if pnl_ticks is None:
+        return
+    qty = int(payload.get("qty") or metadata.get("qty") or 1)
+    if pnl_yen is None:
+        pnl_yen = pnl_ticks * qty * config.tick_value_yen_for(symbol)
+    _append_live_trade(
+        diagnostics,
+        symbol,
+        str(payload.get("reason") or metadata.get("exit_reason") or "unknown"),
+        pnl_ticks,
+        pnl_yen,
+    )
+
+
+def _record_reconstructed_live_trade(
+    diagnostics: _LiveTradeDiagnostics,
+    positions_by_key: dict[str, _LoggedPosition],
+    exit_order: _LoggedExitOrder,
+    exit_price: float,
+    config: StrategyConfig,
+) -> None:
+    position = positions_by_key.get(exit_order.position_key)
+    if position is None:
+        return
+    pnl_ticks = calculate_markout_ticks(position.direction, position.entry_price, exit_price, config.tick_size_for(position.symbol))
+    pnl_yen = pnl_ticks * exit_order.qty * config.tick_value_yen_for(position.symbol)
+    diagnostics.reconstructed_trades += 1
+    _append_live_trade(diagnostics, position.symbol, exit_order.exit_reason, pnl_ticks, pnl_yen)
+
+
+def _append_live_trade(
+    diagnostics: _LiveTradeDiagnostics,
+    symbol: str,
+    exit_reason: str,
+    pnl_ticks: float,
+    pnl_yen: float,
+) -> None:
+    diagnostics.pnl_ticks.append(float(pnl_ticks))
+    diagnostics.pnl_yen.append(float(pnl_yen))
+    diagnostics.by_symbol_ticks[symbol].append(float(pnl_ticks))
+    diagnostics.by_symbol_yen[symbol].append(float(pnl_yen))
+    diagnostics.by_exit_reason[exit_reason] += 1
+
+
+def _record_entry_price_mismatch(
+    diagnostics: _LiveTradeDiagnostics,
+    payload: dict[str, object],
+    metadata: dict[str, object],
+) -> None:
+    diagnostics.entry_price_mismatches += 1
+    if len(diagnostics.mismatch_samples) >= 10:
+        return
+    diagnostics.mismatch_samples.append(
+        {
+            "timestamp": payload.get("timestamp"),
+            "symbol": _payload_symbol(payload),
+            "direction": payload.get("direction"),
+            "position_key": metadata.get("position_key"),
+            "entry_order_id": metadata.get("entry_order_id"),
+            "position_entry_price": metadata.get("position_entry_price") or payload.get("entry_price"),
+            "entry_execution_price": metadata.get("entry_execution_price"),
+            "entry_execution_id": metadata.get("entry_execution_id"),
+        }
+    )
+
+
+def _status_execution_price(status: dict[str, object]) -> float | None:
+    direct = _optional_payload_float(status.get("execution_price"))
+    if direct is not None:
+        return direct
+    details = status.get("details")
+    if not isinstance(details, list):
+        return _optional_payload_float(status.get("price")) if _optional_payload_float(status.get("cum_qty")) else None
+    executions: list[tuple[float, float]] = []
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        price = _optional_payload_float(detail.get("price"))
+        if price is None:
+            continue
+        if detail.get("execution_id") or str(detail.get("rec_type")) == "8":
+            executions.append((price, _optional_payload_float(detail.get("qty")) or 1.0))
+    if executions:
+        total_qty = sum(qty for _, qty in executions)
+        return sum(price * qty for price, qty in executions) / total_qty if total_qty > 0 else executions[-1][0]
+    if _optional_payload_float(status.get("cum_qty")):
+        return _optional_payload_float(status.get("price"))
+    return None
+
+
+def _status_is_filled(status: dict[str, object], qty: int) -> bool:
+    cum_qty = _optional_payload_float(status.get("cum_qty")) or 0.0
+    state = str(status.get("state") or "")
+    order_state = str(status.get("order_state") or "")
+    return cum_qty >= float(qty) and (state in {"5", "5.0"} or order_state in {"5", "5.0"})
+
+
+def _jump_metadata(payload: dict[str, object]) -> dict[str, object]:
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        return metadata
+    first = payload.get("first_metadata")
+    if isinstance(first, dict):
+        return first
+    last = payload.get("last_metadata")
+    if isinstance(last, dict):
+        return last
+    return {}
+
+
+def _payload_timestamp(payload: dict[str, object], key: str) -> datetime | None:
+    value = payload.get(key)
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _spread_bucket(spread_ticks: float | None) -> str:
+    if spread_ticks is None:
+        return "unknown"
+    if spread_ticks < 1:
+        return "<1"
+    if spread_ticks >= 10:
+        return ">=10"
+    return str(int(spread_ticks))
 
 
 def _jsonl_files(path: str | Path) -> list[Path]:
@@ -656,6 +1099,37 @@ def _entry_fill_diagnostics_summary(
             },
         },
         "fak_fill_simulation": simulation,
+    }
+
+
+def _live_trade_diagnostics_summary(diagnostics: _LiveTradeDiagnostics) -> dict[str, object]:
+    trades = len(diagnostics.pnl_ticks)
+    net_yen = sum(diagnostics.pnl_yen)
+    return {
+        **pnl_summary(diagnostics.pnl_ticks),
+        "net_pnl_yen": round(net_yen, 2),
+        "avg_pnl_yen": round(net_yen / trades, 2) if trades else 0.0,
+        "direct_events": diagnostics.direct_events,
+        "reconstructed_trades": diagnostics.reconstructed_trades,
+        "by_symbol": {
+            symbol: {
+                **pnl_summary(diagnostics.by_symbol_ticks[symbol]),
+                "net_pnl_yen": round(sum(diagnostics.by_symbol_yen[symbol]), 2),
+            }
+            for symbol in sorted(diagnostics.by_symbol_ticks)
+        },
+        "by_exit_reason": dict(diagnostics.by_exit_reason),
+        "entry_price_mismatches": diagnostics.entry_price_mismatches,
+        "entry_price_mismatch_samples": diagnostics.mismatch_samples,
+    }
+
+
+def _jump_diagnostics_summary(diagnostics: _JumpDiagnostics) -> dict[str, object]:
+    return {
+        "total": diagnostics.total,
+        "by_symbol": dict(diagnostics.by_symbol),
+        "by_session_phase": dict(diagnostics.by_session_phase),
+        "by_spread_ticks": dict(diagnostics.by_spread_ticks),
     }
 
 
