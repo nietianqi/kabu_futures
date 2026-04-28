@@ -1768,6 +1768,70 @@ class EvolutionAndTuningTests(unittest.TestCase):
 
         self.assertNotIn("regime", report)
 
+    def test_analyze_micro_log_entry_diagnostics_counts_failed_micro_checks(self) -> None:
+        class FakeEngine:
+            latest_book_features = None
+
+            def __init__(self, config: object) -> None:
+                self.latest_signal_evaluations: list[SignalEvaluation] = []
+
+            def on_order_book(self, order_book: OrderBook, now: datetime | None = None) -> list[Signal]:
+                self.latest_signal_evaluations = [
+                    SignalEvaluation(
+                        "micro_book",
+                        order_book.symbol,
+                        now or order_book.timestamp,
+                        "reject",
+                        "spread_not_required_width",
+                        "flat",
+                        {
+                            "spread_ok": False,
+                            "imbalance_long_ok": False,
+                            "imbalance_short_ok": False,
+                            "ofi_long_ok": False,
+                            "ofi_short_ok": False,
+                            "microprice_long_ok": True,
+                            "microprice_short_ok": False,
+                            "blocked_by": "multi_timeframe",
+                            "reject_stage": "multi_timeframe",
+                            "policy_reason": "execution_score_below_threshold",
+                        },
+                    )
+                ]
+                return []
+
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "market.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            recorder.write_book(book(datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)))
+            recorder.close()
+            with path.open("a", encoding="utf-8") as handle:
+                import json as _json
+
+                handle.write(
+                    _json.dumps(
+                        {
+                            "kind": "execution_reject",
+                            "payload": {
+                                "reason": "live_unsupported_signal_engine",
+                                "metadata": {"signal": {"engine": "minute_vwap"}},
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            with patch("kabu_futures.evolution.DualStrategyEngine", FakeEngine):
+                report = analyze_micro_log(path, default_config(), include_regime=False)
+
+        diagnostics = report["entry_diagnostics"]
+        self.assertEqual(diagnostics["micro_rejects"], 1)
+        self.assertEqual(diagnostics["failed_checks"]["spread_not_required_width"], 1)
+        self.assertEqual(diagnostics["failed_checks"]["imbalance_not_met"], 1)
+        self.assertEqual(diagnostics["failed_checks"]["ofi_not_met"], 1)
+        self.assertEqual(diagnostics["blocked_by"]["multi_timeframe"], 1)
+        self.assertEqual(diagnostics["policy_reasons"]["execution_score_below_threshold"], 1)
+        self.assertEqual(diagnostics["recorded_live_unsupported_engines"]["minute_vwap"], 1)
+
     def test_evaluate_micro_config_does_not_execute_minute_signals(self) -> None:
         class FakeEngine:
             latest_signal_evaluations: list[SignalEvaluation] = []
@@ -1811,6 +1875,133 @@ class EvolutionAndTuningTests(unittest.TestCase):
             report = tune_micro_params(path, default_config(), imbalance_grid=(0.05, 0.30), min_trades=1)
         self.assertEqual(report["decision"], "no_change")
         self.assertGreater(len(report["invalid_combos"]), 0)
+
+    def test_tune_micro_params_generates_multi_dimensional_grid(self) -> None:
+        def fake_evaluate(
+            books: object,
+            config: object,
+            parameters: dict[str, object],
+            paper_fill_model: object = "immediate",
+        ) -> dict[str, object]:
+            trades = int(float(parameters["imbalance_entry"]) * 10) + int(parameters["spread_ticks_required"])
+            net = float(trades)
+            return {
+                "parameters": dict(parameters),
+                "books": 1,
+                "evaluations": {"reject": 1},
+                "reject_reasons_top": [("imbalance_not_met", max(0, 10 - trades))],
+                "signals": {},
+                "paper_events": {},
+                "exit_reasons": {},
+                "trades": trades,
+                "win_rate": 1.0,
+                "net_pnl_ticks": net,
+                "avg_pnl_ticks": round(net / trades, 4) if trades else 0.0,
+                "max_drawdown_ticks": 0.0,
+            }
+
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "tiny.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            recorder.write_book(book(datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)))
+            recorder.close()
+            with patch("kabu_futures.tuning.evaluate_micro_config", side_effect=fake_evaluate) as mocked:
+                report = tune_micro_params(
+                    path,
+                    default_config(),
+                    imbalance_grid=(0.20, 0.30),
+                    microprice_grid=(0.10, 0.15),
+                    spread_grid=(1, 2),
+                    min_trades=1,
+                )
+
+        self.assertEqual(mocked.call_count, 9)
+        self.assertEqual(len(report["candidates"]), 8)
+        self.assertEqual(report["baseline"]["parameters"]["imbalance_entry"], default_config().micro_engine.imbalance_entry)
+        self.assertEqual(report["baseline"]["parameters"]["microprice_entry_ticks"], default_config().micro_engine.microprice_entry_ticks)
+        self.assertEqual(report["baseline"]["parameters"]["spread_ticks_required"], default_config().micro_engine.spread_ticks_required)
+        self.assertEqual(report["grid"]["microprice_entry_ticks"], [0.1, 0.15])
+        self.assertEqual(report["grid"]["spread_ticks_required"], [1, 2])
+
+    def test_tune_micro_params_marks_weaker_trade_increase_as_diagnostic_only(self) -> None:
+        def fake_evaluate(
+            books: object,
+            config: object,
+            parameters: dict[str, object],
+            paper_fill_model: object = "immediate",
+        ) -> dict[str, object]:
+            is_baseline = parameters["imbalance_entry"] == default_config().micro_engine.imbalance_entry
+            trades = 5 if is_baseline else 8
+            net = 10.0 if is_baseline else 6.0
+            avg = 2.0 if is_baseline else 0.75
+            drawdown = -4.0 if is_baseline else -10.0
+            return {
+                "parameters": dict(parameters),
+                "books": 1,
+                "evaluations": {},
+                "reject_reasons_top": [("imbalance_not_met", 10 if is_baseline else 5)],
+                "signals": {},
+                "paper_events": {},
+                "exit_reasons": {},
+                "trades": trades,
+                "win_rate": 0.5,
+                "net_pnl_ticks": net,
+                "avg_pnl_ticks": avg,
+                "max_drawdown_ticks": drawdown,
+            }
+
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "tiny.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            recorder.write_book(book(datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)))
+            recorder.close()
+            with patch("kabu_futures.tuning.evaluate_micro_config", side_effect=fake_evaluate):
+                report = tune_micro_params(path, default_config(), imbalance_grid=(0.20,), min_trades=1)
+
+        self.assertEqual(report["decision"], "no_change")
+        self.assertEqual(report["recommendation"]["decision"], "diagnostic_only")
+        self.assertFalse(report["recommendation"]["checks"]["net_pnl_improved"])
+        self.assertFalse(report["recommendation"]["checks"]["avg_pnl_not_worse"])
+
+    def test_tune_micro_params_recommends_candidate_only_when_safety_gates_pass(self) -> None:
+        def fake_evaluate(
+            books: object,
+            config: object,
+            parameters: dict[str, object],
+            paper_fill_model: object = "immediate",
+        ) -> dict[str, object]:
+            is_baseline = parameters["imbalance_entry"] == default_config().micro_engine.imbalance_entry
+            trades = 5 if is_baseline else 10
+            net = 5.0 if is_baseline else 12.0
+            avg = 1.0 if is_baseline else 1.2
+            drawdown = -4.0 if is_baseline else -4.5
+            return {
+                "parameters": dict(parameters),
+                "books": 1,
+                "evaluations": {},
+                "reject_reasons_top": [("imbalance_not_met", 10 if is_baseline else 3)],
+                "signals": {},
+                "paper_events": {},
+                "exit_reasons": {},
+                "trades": trades,
+                "win_rate": 0.6,
+                "net_pnl_ticks": net,
+                "avg_pnl_ticks": avg,
+                "max_drawdown_ticks": drawdown,
+            }
+
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "tiny.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            recorder.write_book(book(datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)))
+            recorder.close()
+            with patch("kabu_futures.tuning.evaluate_micro_config", side_effect=fake_evaluate):
+                report = tune_micro_params(path, default_config(), imbalance_grid=(0.20,), min_trades=1)
+
+        self.assertEqual(report["decision"], "recommended")
+        self.assertEqual(report["recommendation"]["decision"], "recommended")
+        self.assertEqual(report["recommendation"]["trade_delta"], 5)
+        self.assertEqual(report["best_safe_candidate"]["parameters"]["imbalance_entry"], 0.20)
 
 
 class ApiRegistrationTests(unittest.TestCase):
