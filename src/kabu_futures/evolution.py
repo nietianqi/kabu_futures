@@ -3,13 +3,14 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+import json
 from pathlib import Path
 from typing import Iterable
 
 from .analysis_utils import REGIME_BUCKETS, iter_books, markout_summary, pnl_summary, regime_counter
 from .config import StrategyConfig
 from .engine import DualStrategyEngine
-from .models import Direction, OrderBook
+from .models import Direction, OrderBook, SignalEvaluation
 from .paper_execution import ExecutionEvent, PaperExecutionController, PaperFillModel
 from .regime import RegimeClassifier
 from .serialization import event_time as book_event_time
@@ -48,6 +49,19 @@ class _RegimeAttribution:
     markout_by_reason: defaultdict[str, defaultdict[str, defaultdict[str, list[float]]]] = field(
         default_factory=lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     )
+
+
+@dataclass
+class _EntryDiagnostics:
+    micro_rejects: int = 0
+    failed_checks: Counter[str] = field(default_factory=Counter)
+    reject_reasons: Counter[str] = field(default_factory=Counter)
+    candidate_directions: Counter[str] = field(default_factory=Counter)
+    blocked_by: Counter[str] = field(default_factory=Counter)
+    reject_stages: Counter[str] = field(default_factory=Counter)
+    policy_reasons: Counter[str] = field(default_factory=Counter)
+    recorded_execution_rejects: Counter[str] = field(default_factory=Counter)
+    recorded_live_unsupported_engines: Counter[str] = field(default_factory=Counter)
 
 
 def calculate_markout_ticks(direction: Direction, entry_price: float, future_mid_price: float, tick_size: float) -> float:
@@ -92,6 +106,7 @@ def analyze_micro_log(
     markout_by_reason: defaultdict[str, defaultdict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     exits: list[ExecutionEvent] = []
     entries = 0
+    entry_diagnostics = _EntryDiagnostics()
 
     for book in iter_books(path):
         books += 1
@@ -110,6 +125,7 @@ def analyze_micro_log(
                 regime_stats.evaluation_decisions[current_regime][evaluation.decision] += 1
             if evaluation.decision == "reject":
                 reject_reasons[evaluation.reason] += 1
+                _record_entry_diagnostics(evaluation, entry_diagnostics)
                 if regime_stats is not None and current_regime is not None:
                     regime_stats.reject_reasons[current_regime][evaluation.reason] += 1
                 hourly[_hour_key(event_time)]["rejects"] += 1
@@ -163,6 +179,7 @@ def analyze_micro_log(
             break
 
     pnl_values = [float(event.pnl_ticks or 0.0) for event in exits]
+    _record_logged_execution_rejects(path, entry_diagnostics)
     report: dict[str, object] = {
         "source": str(path),
         "books": books,
@@ -179,6 +196,7 @@ def analyze_micro_log(
             "by_reason": dict(signal_reasons),
             "by_direction": dict(signal_directions),
         },
+        "entry_diagnostics": _entry_diagnostics_summary(entry_diagnostics),
         "paper": {
             **_paper_summary(pnl_values, execution.heartbeat_metadata()),
             "events": dict(paper_events),
@@ -256,6 +274,129 @@ def _record_execution_events(
         elif event.event_type == "paper_pending":
             hourly[hour]["pending"] += 1
     return entries
+
+
+def _record_entry_diagnostics(evaluation: SignalEvaluation, diagnostics: _EntryDiagnostics) -> None:
+    if evaluation.engine != "micro_book" or evaluation.decision != "reject":
+        return
+    diagnostics.micro_rejects += 1
+    diagnostics.reject_reasons[evaluation.reason] += 1
+    diagnostics.candidate_directions[evaluation.candidate_direction] += 1
+    metadata = evaluation.metadata if isinstance(evaluation.metadata, dict) else {}
+    for reason in _failed_entry_checks(metadata):
+        diagnostics.failed_checks[reason] += 1
+    blocked_by = metadata.get("blocked_by")
+    if blocked_by:
+        diagnostics.blocked_by[str(blocked_by)] += 1
+    reject_stage = metadata.get("reject_stage")
+    if reject_stage:
+        diagnostics.reject_stages[str(reject_stage)] += 1
+    policy_reason = metadata.get("policy_reason")
+    if policy_reason and policy_reason != "ok":
+        diagnostics.policy_reasons[str(policy_reason)] += 1
+
+
+def _failed_entry_checks(metadata: dict[str, object]) -> list[str]:
+    checks: list[str] = []
+    if metadata.get("jump_detected") is True:
+        checks.append("jump_detected")
+    if metadata.get("spread_ok") is False:
+        checks.append("spread_not_required_width")
+    if metadata.get("too_soon") is True:
+        checks.append("min_order_interval")
+    if _both_false(metadata, "imbalance_long_ok", "imbalance_short_ok"):
+        checks.append("imbalance_not_met")
+    if _both_false(metadata, "ofi_long_ok", "ofi_short_ok"):
+        checks.append("ofi_not_met")
+    if _both_false(metadata, "microprice_long_ok", "microprice_short_ok"):
+        checks.append("microprice_not_met")
+
+    candidate_direction = metadata.get("candidate_direction")
+    if candidate_direction == "long":
+        if metadata.get("minute_long_ok") is False:
+            checks.append("minute_bias_conflict_long")
+        if metadata.get("topix_long_ok") is False:
+            checks.append("topix_bias_conflict_long")
+    elif candidate_direction == "short":
+        if metadata.get("minute_short_ok") is False:
+            checks.append("minute_bias_conflict_short")
+        if metadata.get("topix_short_ok") is False:
+            checks.append("topix_bias_conflict_short")
+    else:
+        if _both_false(metadata, "minute_long_ok", "minute_short_ok"):
+            checks.append("minute_bias_conflict")
+        if _both_false(metadata, "topix_long_ok", "topix_short_ok"):
+            checks.append("topix_bias_conflict")
+
+    blocked_by = metadata.get("blocked_by")
+    if blocked_by:
+        checks.append(f"blocked_by:{blocked_by}")
+    reject_stage = metadata.get("reject_stage")
+    if reject_stage:
+        checks.append(f"reject_stage:{reject_stage}")
+    return checks
+
+
+def _both_false(metadata: dict[str, object], left_key: str, right_key: str) -> bool:
+    return metadata.get(left_key) is False and metadata.get(right_key) is False
+
+
+def _record_logged_execution_rejects(path: str | Path, diagnostics: _EntryDiagnostics) -> None:
+    for jsonl_file in _jsonl_files(path):
+        try:
+            handle = jsonl_file.open(encoding="utf-8")
+        except OSError:
+            continue
+        with handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("kind") != "execution_reject":
+                    continue
+                payload = row.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                reason = payload.get("reason") or payload.get("event_type")
+                if reason:
+                    diagnostics.recorded_execution_rejects[str(reason)] += 1
+                if reason == "live_unsupported_signal_engine":
+                    signal = _payload_signal(payload)
+                    engine = signal.get("engine") if isinstance(signal, dict) else None
+                    diagnostics.recorded_live_unsupported_engines[str(engine or "unknown")] += 1
+
+
+def _jsonl_files(path: str | Path) -> list[Path]:
+    source = Path(path)
+    if source.is_dir():
+        return sorted(source.glob("*.jsonl"))
+    return [source]
+
+
+def _payload_signal(payload: dict[str, object]) -> dict[str, object]:
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        signal = metadata.get("signal")
+        if isinstance(signal, dict):
+            return signal
+    return {}
+
+
+def _entry_diagnostics_summary(diagnostics: _EntryDiagnostics) -> dict[str, object]:
+    return {
+        "micro_rejects": diagnostics.micro_rejects,
+        "failed_checks": dict(diagnostics.failed_checks),
+        "failed_checks_top": diagnostics.failed_checks.most_common(10),
+        "reject_reasons": dict(diagnostics.reject_reasons),
+        "reject_reasons_top": diagnostics.reject_reasons.most_common(10),
+        "candidate_directions": dict(diagnostics.candidate_directions),
+        "blocked_by": dict(diagnostics.blocked_by),
+        "reject_stages": dict(diagnostics.reject_stages),
+        "policy_reasons": dict(diagnostics.policy_reasons),
+        "recorded_execution_rejects": dict(diagnostics.recorded_execution_rejects),
+        "recorded_live_unsupported_engines": dict(diagnostics.recorded_live_unsupported_engines),
+    }
 
 
 def _update_pending_markouts(

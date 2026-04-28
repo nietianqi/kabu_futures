@@ -30,6 +30,7 @@ The code is intentionally safe by default:
 - `src/kabu_futures/tuning.py`: report-only micro parameter grid evaluation.
 - `src/kabu_futures/simulator.py`: book-path micro replay simulator.
 - `src/kabu_futures/engine.py`: dual-layer orchestration for replay/dry-run use.
+- `docs/log_review.md`: JSONL log review checklist and latest known live-log findings.
 
 ## Run Tests
 
@@ -150,6 +151,8 @@ python scripts\analyze_micro_evolution.py logs\live_20260427_145035.jsonl --outp
 
 Markout is the post-entry mid-price move at fixed horizons. For a long entry it is `future_mid - entry_price`; for a short entry it is `entry_price - future_mid`. The report converts markout to ticks so it can be compared with spread, stop, and take-profit settings.
 
+The analyzer also adds `entry_diagnostics`, a micro-entry bottleneck view built from reject metadata. Use `failed_checks` and `failed_checks_top` to see whether trade frequency is mainly gated by imbalance, spread width, OFI, microprice edge, minute/TOPIX bias, MTF/policy gates, or recorded live execution rejects such as `live_unsupported_signal_engine`.
+
 By default, the analyzer now adds a `regime` section that attributes books, allow/reject decisions, signals, paper PnL, exit reasons, and markout to `warmup`, `high_vol`, and `low_vol` volatility regimes. Use this after a rejected challenger to see whether losses cluster in a specific volatility state:
 
 ```powershell
@@ -157,13 +160,15 @@ python scripts\analyze_micro_evolution.py logs\live_20260428_104649.jsonl --conf
 python scripts\analyze_micro_evolution.py logs\live_20260428_104649.jsonl --no-regime
 ```
 
-Run the conservative imbalance experiment from the latest log analysis:
+Run the conservative multi-grid experiment from the latest log analysis:
 
 ```powershell
-python scripts\tune_micro_params.py logs\live_20260427_145035.jsonl --config config\local.json --imbalance-grid 0.18,0.20,0.22,0.25,0.30
+python scripts\tune_micro_params.py logs\live_20260428_124855.jsonl --config config\local.json --imbalance-grid 0.18,0.20,0.22,0.25,0.30 --microprice-grid 0.10,0.12,0.15 --spread-grid 1,2
 ```
 
-The tuner is report-only. It never overwrites `config/local.json`; use the output as a challenger candidate for review.
+Recommended workflow when trades are too sparse: first run `analyze_micro_evolution.py` to identify the bottleneck, then run the multi-grid tuner, then paper-test any `recommendation.decision == "recommended"` candidate before changing config. The tuner is report-only. It never overwrites `config/local.json`, does not enable minute engines in live, and marks weaker candidates as `diagnostic_only` even when they increase trade count.
+
+For a repeatable log review checklist, including how to interpret `entry_diagnostics`, `live_order_errors`, `live_unsupported_signal_engine`, and kabu `HTTP 429`, see [docs/log_review.md](docs/log_review.md).
 
 Latest 2026-04-27 pipeline result: the report-only evolution gate correctly rejected the imbalance-only challenger. Across the aggregated paper replay (`401k+` books), paper PnL was negative, short-horizon markout was negative, and walk-forward pass rate was `0.0`. Treat `imbalance_entry` tuning as insufficient by itself. The next safe experiments are:
 

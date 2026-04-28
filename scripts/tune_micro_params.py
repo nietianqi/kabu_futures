@@ -11,17 +11,21 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from kabu_futures.config import load_json_config
-from kabu_futures.tuning import DEFAULT_IMBALANCE_GRID, tune_micro_params
+from kabu_futures.tuning import DEFAULT_IMBALANCE_GRID, DEFAULT_MICROPRICE_GRID, DEFAULT_SPREAD_GRID, tune_micro_params
 
 
 def _float_tuple(value: str) -> tuple[float, ...]:
     return tuple(float(item.strip()) for item in value.split(",") if item.strip())
 
 
+def _int_tuple(value: str) -> tuple[int, ...]:
+    return tuple(int(item.strip()) for item in value.split(",") if item.strip())
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tune_micro_params.py",
-        description="Replay JSONL books across a conservative micro imbalance grid. Report-only; never rewrites live config.",
+        description="Replay JSONL books across a conservative micro parameter grid. Report-only; never rewrites live config.",
     )
     parser.add_argument("path", help="Live JSONL log path to replay.")
     parser.add_argument("--config", default=str(ROOT / "config" / "local.json"))
@@ -31,6 +35,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--imbalance-grid",
         default=",".join(str(value) for value in DEFAULT_IMBALANCE_GRID),
         help="Comma-separated imbalance_entry candidates. Default: 0.18,0.20,0.22,0.25,0.30.",
+    )
+    parser.add_argument(
+        "--microprice-grid",
+        default=",".join(str(value) for value in DEFAULT_MICROPRICE_GRID),
+        help="Comma-separated microprice_entry_ticks candidates. Default: 0.10,0.12,0.15.",
+    )
+    parser.add_argument(
+        "--spread-grid",
+        default=",".join(str(value) for value in DEFAULT_SPREAD_GRID),
+        help="Comma-separated spread_ticks_required candidates. Default: 1.",
+    )
+    parser.add_argument(
+        "--max-drawdown-worsen-ratio",
+        type=float,
+        default=0.25,
+        help="Allowed relative drawdown deterioration before a candidate stops being recommended.",
     )
     parser.add_argument(
         "--paper-fill-model",
@@ -48,8 +68,11 @@ def main() -> int:
         args.path,
         load_json_config(args.config),
         imbalance_grid=_float_tuple(args.imbalance_grid),
+        microprice_grid=_float_tuple(args.microprice_grid),
+        spread_grid=_int_tuple(args.spread_grid),
         max_books=args.max_books,
         min_trades=args.min_trades,
+        max_drawdown_worsen_ratio=args.max_drawdown_worsen_ratio,
         paper_fill_model=args.paper_fill_model,
     )
     text = json.dumps(report, ensure_ascii=False, indent=2)
