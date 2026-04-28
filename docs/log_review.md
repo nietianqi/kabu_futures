@@ -8,6 +8,9 @@ This project writes structured JSONL logs so live runs can be reviewed without g
 # Latest full offline attribution report. This is report-only.
 python scripts\analyze_micro_evolution.py logs\live_20260428_124855.jsonl --config config\local.json --output reports\micro_evolution_latest.json
 
+# Same report with explicit FAK entry fill assumptions.
+python scripts\analyze_micro_evolution.py logs\live_20260428_124855.jsonl --config config\local.json --entry-fill-slippage-grid 0,1,2 --entry-fill-latency-ms 0,100,250,500,1000 --output reports\entry_fill_latest.json
+
 # Conservative multi-grid search. This does not write config/local.json.
 python scripts\tune_micro_params.py logs\live_20260428_124855.jsonl --config config\local.json --imbalance-grid 0.18,0.20,0.22,0.25,0.30 --microprice-grid 0.10,0.12,0.15 --spread-grid 1,2 --output reports\micro_tuning_latest.json
 
@@ -18,6 +21,9 @@ python scripts\analyze_micro_evolution.py logs\live_20260428_124855.jsonl --conf
 ## What To Check
 
 - `entry_diagnostics.failed_checks_top`: the best first answer to "why are trades sparse?". `imbalance_not_met`, `ofi_not_met`, `microprice_not_met`, and `spread_not_required_width` mean the micro front gates are the bottleneck.
+- `entry_fill_diagnostics.observed_live_funnel`: the live FAK entry funnel. Compare `entry_submitted`, `own_fills_detected`, `expired_unfilled`, `api_errors`, `rejected`, `timeout_after_grace`, `cooldown_rejects`, and `fill_rate` before changing execution settings.
+- `entry_fill_diagnostics.fak_fill_simulation`: an offline estimate for `entry_slippage_ticks` under latency assumptions. A long simulated order fills when the adjusted limit is at or above the future best ask; a short fills when it is at or below the future best bid.
+- `signals.by_key` and `paper.positions[*].symbol`: confirm whether `NK225micro` and `TOPIXmini` are both producing executable `micro_book` paths. TOPIXmini uses `tick_sizes.TOPIXmini=0.25` and `tick_values_yen.TOPIXmini=250`, so do not compare raw price moves to Nikkei's 5-point tick.
 - `evaluations.decisions`: the micro allow/reject rate. A very low allow rate is expected for conservative settings, but it should be explained by the diagnostics before tuning.
 - `signals.by_key`: confirms which engines produced signals. Minute signals can appear in research logs while live execution remains gated to `micro_book`.
 - `paper.trades`, `paper.net_pnl_ticks`, and `markout.summary`: frequency alone is not enough. Only consider candidates that improve trades without damaging PnL, average PnL, drawdown, or markout.
@@ -39,7 +45,9 @@ The 2026-04-28 logs show sparse trading is mainly a micro-entry gate issue, not 
 ## Safe Interpretation
 
 - Do not enable minute engines in live just because `minute_vwap` appears in logs. Treat those signals as research evidence until a separate opt-in live plan is reviewed.
+- TOPIXmini is now a live-capable `micro_book` trade symbol, not only a filter. If you only want Nikkei entries for a run, set `symbols.trade=["NK225micro"]` locally before startup.
 - Do not loosen live thresholds directly from one log. Run the multi-grid tuner, then require `recommendation.decision == "recommended"`, then validate in paper or tiny live size.
+- Do not change `live_execution.entry_slippage_ticks` just because 0-tick FAK fills are weak. First require a clear 1-tick simulation improvement, then confirm paper PnL and markout are still acceptable, then manually opt in through `config/local.json` with tiny size.
 - If kabu `HTTP 429` appears again, stop evaluating strategy quality from that run first. The order path was rate-limited, so execution health must be fixed before PnL conclusions are useful.
 - If `live_position_count > 0` and `live_pending_exits` is empty for more than one heartbeat, investigate immediately because a synced live position may not have a resting TP order.
 - If `live_exit_blocked` is non-empty or an event reason is `exit_order_blocked_after_retries`, the bot has stopped automatic TP resubmission for that hold ID. Check kabu Station manually before restarting or re-enabling new entries.

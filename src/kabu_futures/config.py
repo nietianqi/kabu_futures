@@ -10,6 +10,7 @@ from typing import Any
 class SymbolsConfig:
     primary: str = "NK225micro"
     filter: str = "TOPIXmini"
+    trade: tuple[str, ...] = ("NK225micro", "TOPIXmini")
     deriv_month: int = 0
     rollover_business_days_before_last_trade: int = 3
 
@@ -182,6 +183,31 @@ class StrategyConfig:
     api: ApiConfig = field(default_factory=ApiConfig)
     tick_size: float = 5.0
     micro225_tick_value: float = 50.0
+    tick_sizes: dict[str, float] = field(
+        default_factory=lambda: {
+            "NK225micro": 5.0,
+            "TOPIXmini": 0.25,
+        }
+    )
+    tick_values_yen: dict[str, float] = field(
+        default_factory=lambda: {
+            "NK225micro": 50.0,
+            "TOPIXmini": 250.0,
+        }
+    )
+
+    def trade_symbols(self) -> tuple[str, ...]:
+        symbols = tuple(str(symbol) for symbol in self.symbols.trade if str(symbol))
+        return symbols or (self.symbols.primary,)
+
+    def is_trade_symbol(self, symbol: str) -> bool:
+        return symbol in self.trade_symbols()
+
+    def tick_size_for(self, symbol: str) -> float:
+        return float(self.tick_sizes.get(symbol, self.tick_size))
+
+    def tick_value_yen_for(self, symbol: str) -> float:
+        return float(self.tick_values_yen.get(symbol, self.micro225_tick_value))
 
     def validate(self) -> None:
         """Raise ValueError if parameter combinations are inconsistent."""
@@ -231,6 +257,15 @@ class StrategyConfig:
             raise ValueError(f"max_positions_per_symbol must be positive, got {self.risk.max_positions_per_symbol}")
         if self.tick_size <= 0:
             raise ValueError(f"tick_size must be positive, got {self.tick_size}")
+        if not self.trade_symbols():
+            raise ValueError("symbols.trade must contain at least one symbol")
+        for symbol in self.trade_symbols():
+            tick_size = self.tick_size_for(symbol)
+            if tick_size <= 0:
+                raise ValueError(f"tick_sizes[{symbol!r}] must be positive, got {tick_size}")
+            tick_value = self.tick_value_yen_for(symbol)
+            if tick_value <= 0:
+                raise ValueError(f"tick_values_yen[{symbol!r}] must be positive, got {tick_value}")
         windows = self.nt_spread.zscore_windows
         if len(windows) < 1 or any(w <= 0 for w in windows):
             raise ValueError(f"nt_spread.zscore_windows must be positive integers, got {windows}")
@@ -244,7 +279,10 @@ def default_config() -> StrategyConfig:
 
 def _merge_dataclass(cls: type, values: dict[str, Any]) -> Any:
     valid = {field_.name for field_ in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
-    return cls(**{key: value for key, value in values.items() if key in valid})
+    normalized = {key: value for key, value in values.items() if key in valid}
+    if cls is SymbolsConfig and "trade" in normalized and isinstance(normalized["trade"], list):
+        normalized["trade"] = tuple(str(item) for item in normalized["trade"])
+    return cls(**normalized)
 
 
 def load_json_config(path: str | Path) -> StrategyConfig:
@@ -261,6 +299,16 @@ def load_json_config(path: str | Path) -> StrategyConfig:
         multi_timeframe=_merge_dataclass(MultiTimeframeConfig, data.get("multi_timeframe", {})),
         risk=_merge_dataclass(RiskConfig, data.get("risk", {})),
         api=_merge_dataclass(ApiConfig, data.get("api", {})),
+        tick_size=float(data.get("tick_size", StrategyConfig.tick_size)),
+        micro225_tick_value=float(data.get("micro225_tick_value", StrategyConfig.micro225_tick_value)),
+        tick_sizes={
+            **StrategyConfig().tick_sizes,
+            **{str(key): float(value) for key, value in data.get("tick_sizes", {}).items()},
+        },
+        tick_values_yen={
+            **StrategyConfig().tick_values_yen,
+            **{str(key): float(value) for key, value in data.get("tick_values_yen", {}).items()},
+        },
     )
     config.validate()
     return config

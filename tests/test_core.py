@@ -67,7 +67,33 @@ def book(ts: datetime, bid_qty: float = 100, ask_qty: float = 50, bid: float = 5
     )
 
 
+def topix_book(
+    ts: datetime,
+    bid_qty: float = 100,
+    ask_qty: float = 50,
+    bid: float = 3770.5,
+    ask: float = 3770.75,
+) -> OrderBook:
+    return OrderBook(
+        symbol="TOPIXmini",
+        timestamp=ts,
+        best_bid_price=bid,
+        best_bid_qty=bid_qty,
+        best_ask_price=ask,
+        best_ask_qty=ask_qty,
+        buy_levels=(Level(bid, bid_qty), Level(bid - 0.25, 80), Level(bid - 0.5, 60)),
+        sell_levels=(Level(ask, ask_qty), Level(ask + 0.25, 40), Level(ask + 0.5, 30)),
+    )
+
+
 class ConfigTests(unittest.TestCase):
+    def test_default_config_trades_topix_with_symbol_specific_tick_size(self) -> None:
+        cfg = default_config()
+        self.assertIn("TOPIXmini", cfg.trade_symbols())
+        self.assertEqual(cfg.tick_size_for("NK225micro"), 5.0)
+        self.assertEqual(cfg.tick_size_for("TOPIXmini"), 0.25)
+        self.assertEqual(cfg.tick_value_yen_for("TOPIXmini"), 250.0)
+
     def test_load_json_config_validates_inconsistent_micro_thresholds(self) -> None:
         with TemporaryDirectory() as temp_dir:
             path = pathlib.Path(temp_dir) / "bad_config.json"
@@ -226,6 +252,38 @@ class MicrostructureTests(unittest.TestCase):
         self.assertEqual(signal.metadata["raw_signal_direction"], "long")
         self.assertEqual(signal.metadata["executed_signal_direction"], "short")
         self.assertEqual(evaluation.candidate_direction, "short")
+
+    def test_dual_engine_generates_micro_signal_for_topix_trade_symbol(self) -> None:
+        cfg = default_config()
+        cfg = replace(
+            cfg,
+            micro_engine=replace(
+                cfg.micro_engine,
+                imbalance_entry=0.1,
+                imbalance_exit=0.05,
+                microprice_entry_ticks=0.01,
+                min_order_interval_seconds=0,
+            ),
+            multi_timeframe=replace(
+                cfg.multi_timeframe,
+                min_total_score_to_trade=0,
+                min_execution_score_to_chase=0,
+            ),
+        )
+        engine = DualStrategyEngine(cfg)
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        routed_signal = Signal("micro_book", "TOPIXmini", "long", 0.8, 3770.75, "micro_book_long")
+        routed_eval = SignalEvaluation("micro_book", "TOPIXmini", ts, "allow", "micro_book_long", "long")
+        engine.micro_engines["TOPIXmini"].evaluate_book = Mock(return_value=(routed_signal, routed_eval))  # type: ignore[method-assign]
+        signals = engine.on_order_book(topix_book(ts), now=ts)
+
+        tradeable = [signal for signal in signals if signal.engine == "micro_book" and signal.is_tradeable]
+        self.assertTrue(tradeable)
+        self.assertEqual(tradeable[0].symbol, "TOPIXmini")
+        self.assertEqual(tradeable[0].price, 3770.75)
+        engine.micro_engines["TOPIXmini"].evaluate_book.assert_called_once()
+        self.assertEqual(engine.latest_signal_evaluations[-1].decision, "allow")
+        self.assertEqual(engine.latest_signal_evaluations[-1].symbol, "TOPIXmini")
 
     def test_micro_strategy_evaluation_records_reject_reason(self) -> None:
         cfg = default_config().micro_engine
@@ -829,6 +887,19 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertEqual(events[0].event_type, "paper_exit")
         self.assertGreater(events[0].pnl_ticks or 0, 0)
 
+    def test_paper_topix_micro_trade_uses_topix_tick_value(self) -> None:
+        cfg = default_config()
+        controller = PaperExecutionController(cfg, trade_mode="paper")
+        ts = datetime(2026, 4, 27, 9, 0, tzinfo=JST)
+        entry = controller.on_signal(Signal("micro_book", "TOPIXmini", "long", 0.8, 3770.75), topix_book(ts))
+        self.assertEqual(entry[0].event_type, "paper_entry")
+        self.assertEqual(entry[0].metadata["take_profit_price"], 3771.0)
+
+        exits = controller.on_book(topix_book(ts + timedelta(seconds=1), bid=3771.0, ask=3771.25))
+        self.assertEqual(exits[0].event_type, "paper_exit")
+        self.assertEqual(exits[0].pnl_ticks, 1.0)
+        self.assertEqual(exits[0].pnl_yen, 250.0)
+
     def test_live_micro_signal_submits_kabu_future_order(self) -> None:
         class FakeClient:
             def __init__(self) -> None:
@@ -864,6 +935,83 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertEqual(heartbeat["live_entry_orders_submitted"], 1)
         self.assertEqual(heartbeat["live_exit_orders_submitted"], 0)
         self.assertEqual(heartbeat["live_entry_fill_rate"], 0.0)
+
+    def test_live_topix_micro_signal_uses_topix_symbol_code_and_tick_size(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                return {"Result": 0, "OrderId": "O1"}
+
+            def positions(self, **query: object) -> dict[str, object]:
+                return {"data": []}
+
+        client = FakeClient()
+        cfg = default_config()
+        cfg = replace(cfg, live_execution=replace(cfg.live_execution, entry_slippage_ticks=1))
+        controller = LiveExecutionController(
+            client,
+            cfg,
+            {"NK225micro": "161060023", "TOPIXmini": "161060006"},
+        )  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+        signal = Signal("micro_book", "TOPIXmini", "long", 0.8, 3770.75)
+        events = controller.on_signal(signal, topix_book(ts), exchange=24)
+
+        self.assertEqual(events[0].event_type, "live_order_submitted")
+        self.assertEqual(client.sent[0]["Symbol"], "161060006")
+        self.assertEqual(client.sent[0]["Exchange"], 24)
+        self.assertEqual(client.sent[0]["Price"], 3771.0)
+        self.assertEqual(events[0].metadata["entry_slippage_ticks"], 1)
+        self.assertEqual(events[0].metadata["entry_order_price"], 3771.0)
+
+    def test_live_sync_topix_position_submits_topix_take_profit_order(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                return {"Result": 0, "OrderId": f"O{len(self.sent)}"}
+
+            def positions(self, **query: object) -> dict[str, object]:
+                if query.get("symbol") != "161060006":
+                    return {"data": []}
+                return {
+                    "data": [
+                        {
+                            "ExecutionID": "T1",
+                            "Symbol": "161060006",
+                            "Exchange": 24,
+                            "Side": "2",
+                            "Price": 3770.75,
+                            "LeavesQty": 1,
+                        }
+                    ]
+                }
+
+        client = FakeClient()
+        controller = LiveExecutionController(
+            client,
+            default_config(),
+            {"NK225micro": "161060023", "TOPIXmini": "161060006"},
+        )  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+        events = controller.on_book(topix_book(ts), None, exchange=24)
+
+        self.assertTrue(any(event.event_type == "live_position_detected" and event.symbol == "TOPIXmini" for event in events))
+        tp_events = [
+            event
+            for event in events
+            if event.event_type == "live_order_submitted" and event.metadata.get("exit_reason") == "take_profit"
+        ]
+        self.assertEqual(len(tp_events), 1)
+        self.assertEqual(client.sent[0]["Symbol"], "161060006")
+        self.assertEqual(client.sent[0]["TradeType"], 2)
+        self.assertEqual(client.sent[0]["Price"], 3771.0)
+        self.assertEqual(client.sent[0]["ClosePositions"], [{"HoldID": "T1", "Qty": 1}])
 
     def test_live_minute_signal_submits_kabu_future_order(self) -> None:
         class FakeClient:
@@ -2147,6 +2295,257 @@ class EvolutionAndTuningTests(unittest.TestCase):
         self.assertEqual(diagnostics["blocked_by"]["multi_timeframe"], 1)
         self.assertEqual(diagnostics["policy_reasons"]["execution_score_below_threshold"], 1)
         self.assertEqual(diagnostics["recorded_live_unsupported_engines"]["minute_vwap"], 1)
+
+    def test_analyze_micro_log_entry_fill_diagnostics_counts_observed_live_fill(self) -> None:
+        class FakeEngine:
+            latest_signal_evaluations: list[SignalEvaluation] = []
+            latest_book_features = None
+
+            def __init__(self, config: object) -> None:
+                pass
+
+            def on_order_book(self, order_book: OrderBook, now: datetime | None = None) -> list[Signal]:
+                return []
+
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "market.jsonl"
+            ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            recorder.write_book(book(ts))
+            recorder.close()
+            with path.open("a", encoding="utf-8") as handle:
+                import json as _json
+
+                handle.write(
+                    _json.dumps(
+                        {
+                            "kind": "live_order_submitted",
+                            "payload": {
+                                "event_type": "live_order_submitted",
+                                "symbol": "NK225micro",
+                                "direction": "long",
+                                "qty": 1,
+                                "entry_price": 50005,
+                                "reason": "entry_limit_fak_submitted",
+                                "timestamp": ts.isoformat(),
+                                "metadata": {
+                                    "order_id": "O1",
+                                    "entry_slippage_ticks": 1,
+                                    "signal": {
+                                        "engine": "micro_book",
+                                        "symbol": "NK225micro",
+                                        "direction": "long",
+                                        "price": 50005,
+                                        "reason": "micro_book_long",
+                                    },
+                                },
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+                handle.write(
+                    _json.dumps(
+                        {
+                            "kind": "live_position_detected",
+                            "payload": {
+                                "event_type": "live_position_detected",
+                                "symbol": "NK225micro",
+                                "direction": "long",
+                                "qty": 1,
+                                "entry_price": 50010,
+                                "reason": "position_sync",
+                                "timestamp": (ts + timedelta(seconds=1)).isoformat(),
+                                "metadata": {"own_entry_detected": True},
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            with patch("kabu_futures.evolution.DualStrategyEngine", FakeEngine):
+                report = analyze_micro_log(path, default_config(), include_regime=False)
+
+        funnel = report["entry_fill_diagnostics"]["observed_live_funnel"]
+        self.assertEqual(funnel["entry_submitted"], 1)
+        self.assertEqual(funnel["own_fills_detected"], 1)
+        self.assertEqual(funnel["fill_rate"], 1.0)
+        self.assertEqual(funnel["by_slippage_ticks"]["1"]["entry_submitted"], 1)
+        self.assertEqual(funnel["by_slippage_ticks"]["1"]["own_fills_detected"], 1)
+
+    def test_analyze_micro_log_entry_fill_diagnostics_buckets_live_failures(self) -> None:
+        class FakeEngine:
+            latest_signal_evaluations: list[SignalEvaluation] = []
+            latest_book_features = None
+
+            def __init__(self, config: object) -> None:
+                pass
+
+            def on_order_book(self, order_book: OrderBook, now: datetime | None = None) -> list[Signal]:
+                return []
+
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "market.jsonl"
+            ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            recorder.write_book(book(ts))
+            recorder.close()
+            with path.open("a", encoding="utf-8") as handle:
+                import json as _json
+
+                for row in (
+                    {
+                        "kind": "live_order_submitted",
+                        "payload": {
+                            "event_type": "live_order_submitted",
+                            "symbol": "NK225micro",
+                            "direction": "long",
+                            "reason": "entry_limit_fak_submitted",
+                            "metadata": {"order_id": "O2", "entry_slippage_ticks": 0},
+                        },
+                    },
+                    {
+                        "kind": "live_order_expired",
+                        "payload": {
+                            "event_type": "live_order_expired",
+                            "symbol": "NK225micro",
+                            "direction": "long",
+                            "reason": "entry_order_expired_or_unfilled",
+                            "metadata": {"order_id": "O2"},
+                        },
+                    },
+                    {
+                        "kind": "live_order_submitted",
+                        "payload": {
+                            "event_type": "live_order_submitted",
+                            "symbol": "NK225micro",
+                            "direction": "short",
+                            "reason": "entry_limit_fak_submitted",
+                            "metadata": {"order_id": "O3", "entry_slippage_ticks": 2},
+                        },
+                    },
+                    {
+                        "kind": "live_sync_error",
+                        "payload": {
+                            "event_type": "live_sync_error",
+                            "symbol": "NK225micro",
+                            "direction": "short",
+                            "reason": "pending_entry_timeout_after_grace",
+                            "metadata": {"order_id": "O3"},
+                        },
+                    },
+                    {
+                        "kind": "live_order_error",
+                        "payload": {
+                            "event_type": "live_order_error",
+                            "symbol": "NK225micro",
+                            "direction": "long",
+                            "reason": "entry_order_api_error",
+                            "metadata": {
+                                "signal": {"direction": "long", "price": 50005},
+                                "order_payload": {"Price": 50010},
+                            },
+                        },
+                    },
+                    {
+                        "kind": "live_order_error",
+                        "payload": {
+                            "event_type": "live_order_error",
+                            "symbol": "NK225micro",
+                            "direction": "long",
+                            "reason": "entry_order_rejected",
+                            "metadata": {"entry_slippage_ticks": 1},
+                        },
+                    },
+                    {
+                        "kind": "execution_reject",
+                        "payload": {
+                            "event_type": "execution_reject",
+                            "symbol": "NK225micro",
+                            "direction": "long",
+                            "reason": "entry_failure_cooldown",
+                            "metadata": {},
+                        },
+                    },
+                ):
+                    handle.write(_json.dumps(row) + "\n")
+            with patch("kabu_futures.evolution.DualStrategyEngine", FakeEngine):
+                report = analyze_micro_log(path, default_config(), include_regime=False)
+
+        funnel = report["entry_fill_diagnostics"]["observed_live_funnel"]
+        self.assertEqual(funnel["entry_submitted"], 2)
+        self.assertEqual(funnel["expired_unfilled"], 1)
+        self.assertEqual(funnel["timeout_after_grace"], 1)
+        self.assertEqual(funnel["api_errors"], 1)
+        self.assertEqual(funnel["rejected"], 1)
+        self.assertEqual(funnel["cooldown_rejects"], 1)
+        self.assertEqual(funnel["by_slippage_ticks"]["0"]["expired_unfilled"], 1)
+        self.assertEqual(funnel["by_slippage_ticks"]["2"]["timeout_after_grace"], 1)
+
+    def test_analyze_micro_log_entry_fill_simulation_estimates_slippage_fill_rate(self) -> None:
+        class FakeEngine:
+            latest_signal_evaluations: list[SignalEvaluation] = []
+            latest_book_features = None
+
+            def __init__(self, config: object) -> None:
+                self.calls = 0
+
+            def on_order_book(self, order_book: OrderBook, now: datetime | None = None) -> list[Signal]:
+                self.calls += 1
+                if self.calls == 1:
+                    return [Signal("micro_book", "NK225micro", "long", 0.8, 50005, "micro_book_long")]
+                return []
+
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "market.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+            recorder.write_book(book(ts, bid=50000, ask=50005))
+            recorder.write_book(book(ts + timedelta(milliseconds=100), bid=50005, ask=50010))
+            recorder.close()
+            with patch("kabu_futures.evolution.DualStrategyEngine", FakeEngine):
+                report = analyze_micro_log(
+                    path,
+                    default_config(),
+                    include_regime=False,
+                    entry_fill_slippage_ticks=(0, 1),
+                    entry_fill_latency_ms=(100,),
+                )
+
+        simulation = report["entry_fill_diagnostics"]["fak_fill_simulation"]["by_slippage_latency"]
+        self.assertEqual(simulation["0"]["100"]["signals"], 1)
+        self.assertEqual(simulation["0"]["100"]["fills"], 0)
+        self.assertEqual(simulation["1"]["100"]["fills"], 1)
+
+    def test_analyze_micro_evolution_cli_passes_entry_fill_grids(self) -> None:
+        from scripts import analyze_micro_evolution as cli
+
+        captured: dict[str, object] = {}
+
+        def fake_analyze(path: object, config: object, **kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return {"ok": True}
+
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "analyze_micro_evolution.py",
+                "dummy.jsonl",
+                "--entry-fill-slippage-grid",
+                "0,2",
+                "--entry-fill-latency-ms",
+                "0,250",
+            ],
+        ):
+            with patch.object(cli, "load_json_config", lambda path: default_config()):
+                with patch.object(cli, "analyze_micro_log", fake_analyze):
+                    import io
+
+                    with patch("sys.stdout", io.StringIO()):
+                        self.assertEqual(cli.main(), 0)
+
+        self.assertEqual(captured["entry_fill_slippage_ticks"], (0, 2))
+        self.assertEqual(captured["entry_fill_latency_ms"], (0, 250))
 
     def test_evaluate_micro_config_does_not_execute_minute_signals(self) -> None:
         class FakeEngine:

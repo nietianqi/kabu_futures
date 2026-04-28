@@ -52,7 +52,7 @@ def main() -> None:
         config = load_json_config(args.config) if args.config else default_config()
         password_env = args.password_env or config.api.api_password_env
         password = _password_from_args(args.password, password_env, config.api.api_password)
-        future_codes = args.symbols or [config.symbols.primary, config.symbols.filter]
+        future_codes = args.symbols or list(dict.fromkeys((*config.trade_symbols(), config.symbols.filter)))
         deriv_month = args.deriv_month if args.deriv_month is not None else config.symbols.deriv_month
         exchanges = args.exchanges or [23]
         client = KabuStationClient(password, config.api, production=args.production)

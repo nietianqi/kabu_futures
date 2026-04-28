@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -65,11 +66,14 @@ class LiveExecutionController:
         self.symbol_codes = symbol_codes or {}
         self.orders = KabuFutureOrderBuilder()
         self.entry_policy = LiveEntryPolicy(self.config)
-        self.trade_manager = MicroTradeManager(self.config.micro_engine, self.config.tick_size)
+        self.trade_manager = MicroTradeManager(
+            self.config.micro_engine,
+            self.config.tick_size_for(self.config.symbols.primary),
+        )
         self.minute_trade_manager = MinuteTradeManager(
             self.config.minute_engine,
             self.config.micro_engine.qty,
-            self.config.tick_size,
+            self.config.tick_size_for(self.config.symbols.primary),
         )
         self.pending_entry: PendingLiveOrder | None = None
         self.pending_exits: dict[str, PendingLiveOrder] = {}
@@ -150,7 +154,7 @@ class LiveExecutionController:
                     ),
                 )
             ]
-        if self._position_capacity_used() >= self.config.risk.max_positions_per_symbol:
+        if self._position_capacity_used(signal.symbol) >= self.config.risk.max_positions_per_symbol:
             return events + [
                 _event(
                     "execution_reject",
@@ -161,9 +165,12 @@ class LiveExecutionController:
                         "max_positions_per_symbol",
                         "position_limit",
                         {
-                            "open_positions": len(self.live_positions),
-                            "pending_entry": self.pending_entry is not None,
+                            "open_positions": sum(
+                                1 for slot in self.live_positions.values() if slot.position.symbol == signal.symbol
+                            ),
+                            "pending_entry": self.pending_entry is not None and self.pending_entry.symbol == signal.symbol,
                             "max_positions_per_symbol": self.config.risk.max_positions_per_symbol,
+                            "symbol": signal.symbol,
                         },
                     ),
                 )
@@ -179,7 +186,7 @@ class LiveExecutionController:
             signal.direction,
             signal.price,
             self.config.live_execution.entry_slippage_ticks,
-            self.config.tick_size,
+            self.config.tick_size_for(signal.symbol),
         )
         intent = self.orders.new_limit(
             symbol_code,
@@ -254,7 +261,7 @@ class LiveExecutionController:
 
     def on_book(self, book: OrderBook, features: BookFeatures | None, exchange: int) -> list[ExecutionEvent]:
         events: list[ExecutionEvent] = []
-        if book.symbol != self.config.symbols.primary:
+        if not self.config.is_trade_symbol(book.symbol):
             return events
         event_time = book_event_time(book)
         if self._should_poll_positions(event_time):
@@ -449,47 +456,69 @@ class LiveExecutionController:
         events: list[ExecutionEvent] = []
         event_time = book_event_time(book)
         self.last_position_poll_at = event_time
-        symbol_code = self._symbol_code(self.config.symbols.primary)
-        if symbol_code is None:
-            return events
-        try:
-            positions = _positions_list(self.client.positions(product=3, symbol=symbol_code, addinfo="true"))
-        except KabuApiError as exc:
-            self.order_errors += 1
-            self.position_sync_blocked = True
-            return [
-                ExecutionEvent(
-                    "live_sync_error",
-                    self.config.symbols.primary,
-                    "flat",
-                    reason="positions_api_error",
-                    timestamp=event_time,
-                    metadata={
-                        **_live_reject_metadata("positions_api_error", "kabu_api"),
-                        "error": str(exc),
-                        "symbol_code": symbol_code,
-                    },
+        active: list[LivePositionState] = []
+        symbol_by_code = {code: symbol for symbol, code in self.symbol_codes.items()}
+        sync_failed = False
+        for symbol in self.config.trade_symbols():
+            symbol_code = self._symbol_code(symbol)
+            if symbol_code is None:
+                continue
+            try:
+                positions = _positions_list(self.client.positions(product=3, symbol=symbol_code, addinfo="true"))
+            except KabuApiError as exc:
+                self.order_errors += 1
+                self.position_sync_blocked = True
+                sync_failed = True
+                events.append(
+                    ExecutionEvent(
+                        "live_sync_error",
+                        symbol,
+                        "flat",
+                        reason="positions_api_error",
+                        timestamp=event_time,
+                        metadata={
+                            **_live_reject_metadata("positions_api_error", "kabu_api"),
+                            "error": str(exc),
+                            "symbol_code": symbol_code,
+                        },
+                    )
                 )
-            ]
-        active = [_normalize_position(item) for item in positions if _position_qty(item) > 0]
-        active = [item for item in active if item is not None and item.symbol_code == symbol_code]
+                continue
+            active.extend(
+                position
+                for item in positions
+                if _position_qty(item) > 0
+                for position in (_normalize_position(item, symbol_by_code),)
+                if position is not None and position.symbol_code == symbol_code
+            )
+        if sync_failed:
+            return events
         self.position_sync_blocked = False
-        if len(active) > 1 and any(position.hold_id is None for position in active):
+        positions_by_symbol: defaultdict[str, list[LivePositionState]] = defaultdict(list)
+        for position in active:
+            positions_by_symbol[position.symbol].append(position)
+        missing_hold_id_symbols = [
+            symbol
+            for symbol, positions in positions_by_symbol.items()
+            if len(positions) > 1 and any(position.hold_id is None for position in positions)
+        ]
+        if missing_hold_id_symbols:
             self.position_sync_blocked = True
             events.append(
                 ExecutionEvent(
                     "live_sync_error",
-                    self.config.symbols.primary,
+                    ",".join(missing_hold_id_symbols),
                     "flat",
                     reason="missing_hold_id_for_multiple_positions",
                     timestamp=event_time,
                     metadata={
                         **_live_reject_metadata("missing_hold_id_for_multiple_positions", "position_state"),
-                        "positions": [item.__dict__ for item in active],
+                        "symbols": missing_hold_id_symbols,
+                        "positions": [item.__dict__ for item in active if item.symbol in missing_hold_id_symbols],
                     },
                 )
             )
-            active = [position for position in active if position.hold_id is not None]
+            active = [position for position in active if position.symbol not in missing_hold_id_symbols or position.hold_id is not None]
 
         current_positions = {_position_key(position): position for position in active}
         for position_key, slot in tuple(self.live_positions.items()):
@@ -525,15 +554,20 @@ class LiveExecutionController:
                 continue
             source_signal = None
             own_entry_detected = False
-            if self.entry_signal is not None and not pending_entry_consumed:
+            if self.entry_signal is not None and self.entry_signal.symbol == position.symbol and not pending_entry_consumed:
                 source_signal = self.entry_signal
                 pending_entry_consumed = True
                 own_entry_detected = True
-            elif self._orphan_entry_signal_active(event_time) and not orphan_entry_consumed:
+            elif (
+                self._orphan_entry_signal_active(event_time)
+                and self.orphan_entry_signal is not None
+                and self.orphan_entry_signal.symbol == position.symbol
+                and not orphan_entry_consumed
+            ):
                 source_signal = self.orphan_entry_signal
                 orphan_entry_consumed = True
                 own_entry_detected = True
-            entry_signal = _position_entry_signal(source_signal, position, self.config.symbols.primary)
+            entry_signal = _position_entry_signal(source_signal, position, position.symbol)
             trade = self._trade_from_position(entry_signal, event_time, position.qty)
             self.live_positions[position_key] = LivePositionSlot(position, trade, entry_signal)
             self.positions_detected += 1
@@ -718,16 +752,27 @@ class LiveExecutionController:
             if retry_after is not None and event_time < retry_after:
                 continue
             decision = ExitDecision(True, "take_profit", getattr(slot.trade, "take_profit_price", None))
-            exit_event = self._submit_exit_order(position_key, slot, decision, book, exchange, event_time)
+            exit_event = self._submit_exit_order(
+                position_key,
+                slot,
+                decision,
+                book,
+                slot.position.exchange or exchange,
+                event_time,
+            )
             if exit_event is not None:
                 events.append(exit_event)
         return events
 
     def _trade_from_position(self, signal: Signal, event_time: datetime, qty: int) -> Any:
         if signal.engine == "micro_book":
-            manager = MicroTradeManager(self.config.micro_engine, self.config.tick_size)
+            manager = MicroTradeManager(self.config.micro_engine, self.config.tick_size_for(signal.symbol))
             return manager.open_from_signal(signal, event_time, qty=qty)
-        manager = MinuteTradeManager(self.config.minute_engine, self.config.micro_engine.qty, self.config.tick_size)
+        manager = MinuteTradeManager(
+            self.config.minute_engine,
+            self.config.micro_engine.qty,
+            self.config.tick_size_for(signal.symbol),
+        )
         return manager.open_from_signal(signal, event_time, qty=qty)
 
     def _should_poll_positions(self, event_time: datetime) -> bool:
@@ -738,8 +783,12 @@ class LiveExecutionController:
     def _symbol_code(self, symbol: str) -> str | None:
         return self.symbol_codes.get(symbol)
 
-    def _position_capacity_used(self) -> int:
-        return len(self.live_positions) + (1 if self.pending_entry is not None else 0)
+    def _position_capacity_used(self, symbol: str | None = None) -> int:
+        if symbol is None:
+            return len(self.live_positions) + (1 if self.pending_entry is not None else 0)
+        positions = sum(1 for slot in self.live_positions.values() if slot.position.symbol == symbol)
+        pending = 1 if self.pending_entry is not None and self.pending_entry.symbol == symbol else 0
+        return positions + pending
 
     def _handle_pending_entry_timeout(self, book: OrderBook, event_time: datetime) -> list[ExecutionEvent]:
         if self.pending_entry is None:
@@ -948,7 +997,7 @@ def _position_entry_signal(source_signal: Signal | None, position: LivePositionS
 def _position_key(position: LivePositionState) -> str:
     if position.hold_id:
         return f"hold:{position.hold_id}"
-    return "single_position_without_hold_id"
+    return f"single_position_without_hold_id:{position.symbol_code}"
 
 
 def _trade_engine(trade: Any | None) -> str | None:
@@ -1094,7 +1143,7 @@ def _position_qty(item: dict[str, Any]) -> int:
         return 0
 
 
-def _normalize_position(item: dict[str, Any]) -> LivePositionState | None:
+def _normalize_position(item: dict[str, Any], symbol_by_code: dict[str, str] | None = None) -> LivePositionState | None:
     symbol_code = item.get("Symbol")
     side = item.get("Side")
     price = item.get("Price")
@@ -1107,8 +1156,9 @@ def _normalize_position(item: dict[str, Any]) -> LivePositionState | None:
         return None
     direction: Direction = "long" if side == KabuConstants.SIDE_BUY else "short"
     hold_id = item.get("ExecutionID") or item.get("HoldID")
+    symbol = (symbol_by_code or {}).get(str(symbol_code), "NK225micro")
     return LivePositionState(
-        symbol="NK225micro",
+        symbol=symbol,
         symbol_code=str(symbol_code),
         exchange=int(item.get("Exchange") or 0),
         direction=direction,

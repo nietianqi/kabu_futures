@@ -280,7 +280,7 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
             )
         )
         return 2
-    future_codes = options.future_codes or (config.symbols.primary, config.symbols.filter)
+    future_codes = options.future_codes or tuple(dict.fromkeys((*config.trade_symbols(), config.symbols.filter)))
     deriv_month = options.deriv_month if options.deriv_month is not None else config.symbols.deriv_month
     client = KabuStationClient(password, config.api, production=options.production)
     token = client.authenticate()

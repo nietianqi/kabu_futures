@@ -2,6 +2,7 @@
   "symbols": {
     "primary": "NK225micro",
     "filter": "TOPIXmini",
+    "trade": ["NK225micro", "TOPIXmini"],
     "deriv_month": 0,
     "_deriv_month_note": "0 means nearest contract. Use yyyyMM such as 202606 to force the June 2026 contract.",
     "rollover_business_days_before_last_trade": 3
@@ -137,5 +138,13 @@
     "info_requests_per_second": 10,
     "max_registered_symbols": 50,
     "max_active_orders_same_symbol": 5
+  },
+  "tick_sizes": {
+    "NK225micro": 5.0,
+    "TOPIXmini": 0.25
+  },
+  "tick_values_yen": {
+    "NK225micro": 50.0,
+    "TOPIXmini": 250.0
   }
 }

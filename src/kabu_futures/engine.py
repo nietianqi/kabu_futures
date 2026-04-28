@@ -38,8 +38,15 @@ class DualStrategyEngine:
             self.config.symbols,
             tick_size=self.config.tick_size,
         )
-        self.micro_engine = MicroStrategyEngine(self.config.micro_engine, tick_size=self.config.tick_size)
-        self.book_features = BookFeatureEngine(self.config.micro_engine, tick_size=self.config.tick_size)
+        self.micro_engines = {
+            symbol: MicroStrategyEngine(self.config.micro_engine, tick_size=self.config.tick_size_for(symbol))
+            for symbol in self.config.trade_symbols()
+        }
+        self.micro_engine = self.micro_engines.get(self.config.symbols.primary) or next(iter(self.micro_engines.values()))
+        self.book_features_by_symbol = {
+            symbol: BookFeatureEngine(self.config.micro_engine, tick_size=self.config.tick_size_for(symbol))
+            for symbol in self.config.trade_symbols()
+        }
         self.multi_timeframe = MultiTimeframeScorer(self.config.multi_timeframe)
         self.risk = RiskManager(self.config.risk, self.config.micro_engine)
         self.throttle = OrderThrottle(
@@ -52,11 +59,15 @@ class DualStrategyEngine:
         self.lead_lag = USJapanLeadLagScorer(self.config.lead_lag)
         self.alpha_stack = StrategyArbiter(self.config.alpha_stack, self.config.risk)
         self.last_minute_bias: Direction = "flat"
+        self.last_minute_bias_by_symbol: dict[str, Direction] = {
+            symbol: "flat" for symbol in self.config.trade_symbols()
+        }
         self.last_topix_bias: Direction = "flat"
         self.last_nt_signal: AlphaSignal | None = None
         self.latest_prices: dict[str, float] = {}
         self.portfolio_exposure = PortfolioExposure()
-        self.position = PositionState(self.config.symbols.primary)
+        self.positions = {symbol: PositionState(symbol) for symbol in self.config.trade_symbols()}
+        self.position = self.positions[self.config.symbols.primary]
         self.latest_book_features: BookFeatures | None = None
         self.latest_signal_evaluations: list[SignalEvaluation] = []
 
@@ -74,14 +85,16 @@ class DualStrategyEngine:
         latest_features = None
         self.latest_book_features = None
         self.latest_signal_evaluations = []
-        if book.symbol == self.config.symbols.primary:
-            latest_features = self.book_features.update(book, now=now)
+        if book.symbol in self.book_features_by_symbol:
+            latest_features = self.book_features_by_symbol[book.symbol].update(book, now=now)
             self.latest_book_features = latest_features
         price = book.last_price if book.last_price is not None else book.mid_price
         self._update_latest_price(book.symbol, price, book.timestamp)
         closed_bar = self.bar_builder_1m.update(book.symbol, book.timestamp, price, book.volume)
         if closed_bar is not None:
             minute_signal = self.minute_engine.on_bar(closed_bar)
+            if closed_bar.symbol in self.last_minute_bias_by_symbol:
+                self.last_minute_bias_by_symbol[closed_bar.symbol] = self.minute_engine.trend_bias(closed_bar.symbol)
             if closed_bar.symbol == self.config.symbols.primary:
                 self.last_minute_bias = self.minute_engine.trend_bias(closed_bar.symbol)
             elif closed_bar.symbol == self.config.symbols.filter:
@@ -95,7 +108,7 @@ class DualStrategyEngine:
                     closed_bar.end,
                     mtf_score,
                     intent,
-                    self.position,
+                    self._position_for(minute_signal.symbol),
                 )
                 if decision.allowed:
                     signals.append(_with_extra_metadata(scored_minute_signal, decision.merged_metadata))
@@ -115,11 +128,13 @@ class DualStrategyEngine:
                         )
                     )
 
-        if book.symbol == self.config.symbols.primary:
-            micro_signal, micro_evaluation = self.micro_engine.evaluate_book(
+        if book.symbol in self.micro_engines:
+            minute_bias = self.last_minute_bias_by_symbol.get(book.symbol, "flat")
+            topix_bias = "flat" if book.symbol == self.config.symbols.filter else self.last_topix_bias
+            micro_signal, micro_evaluation = self.micro_engines[book.symbol].evaluate_book(
                 book,
-                self.last_minute_bias,
-                self.last_topix_bias,
+                minute_bias,
+                topix_bias,
                 now=now,
                 features=latest_features,
             )
@@ -133,7 +148,7 @@ class DualStrategyEngine:
                     book.timestamp,
                     mtf_score,
                     intent,
-                    self.position,
+                    self._position_for(book.symbol),
                 )
                 evaluation_metadata = dict(micro_evaluation.metadata)
                 evaluation_metadata.update(decision.merged_metadata)
@@ -210,6 +225,11 @@ class DualStrategyEngine:
             external_score=external_score,
             portfolio=self.portfolio_exposure,
         )
+
+    def _position_for(self, symbol: str) -> PositionState:
+        if symbol not in self.positions:
+            self.positions[symbol] = PositionState(symbol)
+        return self.positions[symbol]
 
     def _with_strategy_metadata(self, signal: Signal, score: MultiTimeframeScore, intent: StrategyIntent) -> Signal:
         metadata = dict(signal.metadata)

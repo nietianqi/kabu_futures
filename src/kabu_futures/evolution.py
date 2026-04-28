@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from bisect import bisect_left
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import json
@@ -17,6 +18,8 @@ from .serialization import event_time as book_event_time
 
 
 DEFAULT_MARKOUT_SECONDS = (0.5, 1.0, 3.0, 5.0, 30.0, 60.0)
+DEFAULT_ENTRY_FILL_SLIPPAGE_TICKS = (0, 1, 2)
+DEFAULT_ENTRY_FILL_LATENCY_MS = (0, 100, 250, 500, 1000)
 
 
 @dataclass
@@ -64,6 +67,37 @@ class _EntryDiagnostics:
     recorded_live_unsupported_engines: Counter[str] = field(default_factory=Counter)
 
 
+@dataclass(frozen=True)
+class _BookQuote:
+    timestamp: datetime
+    symbol: str
+    best_bid_price: float
+    best_ask_price: float
+
+
+@dataclass(frozen=True)
+class _EntrySignalSample:
+    timestamp: datetime
+    symbol: str
+    direction: Direction
+    signal_price: float
+    reason: str
+
+
+@dataclass
+class _EntryFillDiagnostics:
+    entry_submitted: int = 0
+    own_fills_detected: int = 0
+    expired_unfilled: int = 0
+    api_errors: int = 0
+    rejected: int = 0
+    timeout_after_grace: int = 0
+    cooldown_rejects: int = 0
+    positions_detected: int = 0
+    external_or_unknown_positions_detected: int = 0
+    by_slippage_ticks: defaultdict[str, Counter[str]] = field(default_factory=lambda: defaultdict(Counter))
+
+
 def calculate_markout_ticks(direction: Direction, entry_price: float, future_mid_price: float, tick_size: float) -> float:
     if tick_size <= 0:
         raise ValueError(f"tick_size must be positive, got {tick_size}")
@@ -82,8 +116,12 @@ def analyze_micro_log(
     paper_fill_model: PaperFillModel = "immediate",
     include_regime: bool = True,
     regime_kwargs: dict[str, object] | None = None,
+    entry_fill_slippage_ticks: Iterable[int] = DEFAULT_ENTRY_FILL_SLIPPAGE_TICKS,
+    entry_fill_latency_ms: Iterable[int] = DEFAULT_ENTRY_FILL_LATENCY_MS,
 ) -> dict[str, object]:
     horizons = tuple(float(value) for value in markout_seconds)
+    fill_slippage_ticks = _non_negative_int_tuple(entry_fill_slippage_ticks, "entry_fill_slippage_ticks")
+    fill_latency_ms = _non_negative_int_tuple(entry_fill_latency_ms, "entry_fill_latency_ms")
     engine = DualStrategyEngine(config)
     execution = PaperExecutionController(config, trade_mode="paper", paper_fill_model=paper_fill_model)
     regime_classifier = RegimeClassifier(**(regime_kwargs or {})) if include_regime else None
@@ -107,15 +145,18 @@ def analyze_micro_log(
     exits: list[ExecutionEvent] = []
     entries = 0
     entry_diagnostics = _EntryDiagnostics()
+    book_quotes: list[_BookQuote] = []
+    entry_signal_samples: list[_EntrySignalSample] = []
 
     for book in iter_books(path):
         books += 1
         event_time = book_event_time(book)
+        book_quotes.append(_BookQuote(event_time, book.symbol, book.best_bid_price, book.best_ask_price))
         current_regime = regime_classifier.update(book) if regime_classifier is not None else None
         if regime_stats is not None and current_regime is not None:
             regime_stats.distribution[current_regime] += 1
 
-        _update_pending_markouts(book, pending_markouts, markout_values, markout_by_reason, config.tick_size, regime_stats)
+        _update_pending_markouts(book, pending_markouts, markout_values, markout_by_reason, config, regime_stats)
         hourly[_hour_key(event_time)]["books"] += 1
 
         signals = engine.on_order_book(book, now=event_time)
@@ -154,6 +195,10 @@ def analyze_micro_log(
             signal_counts[signal_key] += 1
             signal_reasons[signal.reason] += 1
             signal_directions[signal.direction] += 1
+            if signal.engine == "micro_book" and signal.is_tradeable and signal.price is not None:
+                entry_signal_samples.append(
+                    _EntrySignalSample(event_time, signal.symbol, signal.direction, float(signal.price), signal.reason)
+                )
             if regime_stats is not None and current_regime is not None:
                 regime_stats.signal_counts[current_regime][signal_key] += 1
                 regime_stats.signal_reasons[current_regime][signal.reason] += 1
@@ -180,6 +225,14 @@ def analyze_micro_log(
 
     pnl_values = [float(event.pnl_ticks or 0.0) for event in exits]
     _record_logged_execution_rejects(path, entry_diagnostics)
+    entry_fill_observed = _record_logged_entry_fill_diagnostics(path, config)
+    entry_fill_simulation = _simulate_fak_entry_fills(
+        entry_signal_samples,
+        book_quotes,
+        fill_slippage_ticks,
+        fill_latency_ms,
+        config,
+    )
     report: dict[str, object] = {
         "source": str(path),
         "books": books,
@@ -197,6 +250,7 @@ def analyze_micro_log(
             "by_direction": dict(signal_directions),
         },
         "entry_diagnostics": _entry_diagnostics_summary(entry_diagnostics),
+        "entry_fill_diagnostics": _entry_fill_diagnostics_summary(entry_fill_observed, entry_fill_simulation),
         "paper": {
             **_paper_summary(pnl_values, execution.heartbeat_metadata()),
             "events": dict(paper_events),
@@ -341,6 +395,14 @@ def _both_false(metadata: dict[str, object], left_key: str, right_key: str) -> b
     return metadata.get(left_key) is False and metadata.get(right_key) is False
 
 
+def _non_negative_int_tuple(values: Iterable[int], name: str) -> tuple[int, ...]:
+    result = tuple(int(value) for value in values)
+    for value in result:
+        if value < 0:
+            raise ValueError(f"{name} values must be non-negative, got {value}")
+    return result
+
+
 def _record_logged_execution_rejects(path: str | Path, diagnostics: _EntryDiagnostics) -> None:
     for jsonl_file in _jsonl_files(path):
         try:
@@ -365,6 +427,179 @@ def _record_logged_execution_rejects(path: str | Path, diagnostics: _EntryDiagno
                     signal = _payload_signal(payload)
                     engine = signal.get("engine") if isinstance(signal, dict) else None
                     diagnostics.recorded_live_unsupported_engines[str(engine or "unknown")] += 1
+
+
+def _record_logged_entry_fill_diagnostics(path: str | Path, config: StrategyConfig) -> _EntryFillDiagnostics:
+    diagnostics = _EntryFillDiagnostics()
+    pending_by_order_id: dict[str, str] = {}
+    pending_by_symbol_direction: defaultdict[tuple[str, str], deque[str]] = defaultdict(deque)
+
+    for row in _iter_jsonl_rows(path):
+        payload = row.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        event_type = _payload_event_type(row, payload)
+        reason = str(payload.get("reason") or "")
+        if event_type == "live_order_submitted" and _is_entry_submission(payload):
+            bucket = _entry_slippage_bucket(payload, config.tick_size_for(_payload_symbol(payload)))
+            diagnostics.entry_submitted += 1
+            diagnostics.by_slippage_ticks[bucket]["entry_submitted"] += 1
+            order_id = _payload_order_id(payload)
+            if order_id:
+                pending_by_order_id[order_id] = bucket
+                pending_by_symbol_direction[_payload_symbol_direction(payload)].append(order_id)
+        elif event_type == "live_position_detected":
+            diagnostics.positions_detected += 1
+            metadata = _payload_metadata(payload)
+            if metadata.get("own_entry_detected") is True:
+                bucket = _consume_pending_entry_bucket(payload, pending_by_order_id, pending_by_symbol_direction)
+                diagnostics.own_fills_detected += 1
+                diagnostics.by_slippage_ticks[bucket]["own_fills_detected"] += 1
+            else:
+                diagnostics.external_or_unknown_positions_detected += 1
+        elif event_type == "live_order_expired" and reason == "entry_order_expired_or_unfilled":
+            bucket = _pending_bucket_for_payload(payload, pending_by_order_id, config.tick_size_for(_payload_symbol(payload)))
+            diagnostics.expired_unfilled += 1
+            diagnostics.by_slippage_ticks[bucket]["expired_unfilled"] += 1
+        elif event_type == "live_sync_error" and reason == "pending_entry_timeout_after_grace":
+            bucket = _pending_bucket_for_payload(payload, pending_by_order_id, config.tick_size_for(_payload_symbol(payload)))
+            diagnostics.timeout_after_grace += 1
+            diagnostics.by_slippage_ticks[bucket]["timeout_after_grace"] += 1
+        elif event_type == "live_order_error" and reason == "entry_order_api_error":
+            bucket = _entry_slippage_bucket(payload, config.tick_size_for(_payload_symbol(payload)))
+            diagnostics.api_errors += 1
+            diagnostics.by_slippage_ticks[bucket]["api_errors"] += 1
+        elif event_type == "live_order_error" and reason == "entry_order_rejected":
+            bucket = _entry_slippage_bucket(payload, config.tick_size_for(_payload_symbol(payload)))
+            diagnostics.rejected += 1
+            diagnostics.by_slippage_ticks[bucket]["rejected"] += 1
+        elif event_type == "execution_reject" and reason == "entry_failure_cooldown":
+            diagnostics.cooldown_rejects += 1
+            diagnostics.by_slippage_ticks["unknown"]["cooldown_rejects"] += 1
+
+    return diagnostics
+
+
+def _iter_jsonl_rows(path: str | Path) -> Iterable[dict[str, object]]:
+    for jsonl_file in _jsonl_files(path):
+        try:
+            handle = jsonl_file.open(encoding="utf-8")
+        except OSError:
+            continue
+        with handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict):
+                    yield row
+
+
+def _payload_event_type(row: dict[str, object], payload: dict[str, object]) -> str:
+    return str(payload.get("event_type") or payload.get("event") or row.get("kind") or "")
+
+
+def _is_entry_submission(payload: dict[str, object]) -> bool:
+    if payload.get("reason") == "entry_limit_fak_submitted":
+        return True
+    metadata = _payload_metadata(payload)
+    if metadata.get("exit_reason"):
+        return False
+    order_payload = metadata.get("order_payload")
+    return isinstance(order_payload, dict) and str(order_payload.get("TradeType")) == "1"
+
+
+def _payload_metadata(payload: dict[str, object]) -> dict[str, object]:
+    metadata = payload.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _payload_order_id(payload: dict[str, object]) -> str | None:
+    metadata = _payload_metadata(payload)
+    for source in (metadata, payload):
+        order_id = source.get("order_id") or source.get("OrderId") or source.get("OrderID") or source.get("ID")
+        if order_id:
+            return str(order_id)
+    response = metadata.get("response")
+    if isinstance(response, dict):
+        order_id = response.get("OrderId") or response.get("OrderID")
+        if order_id:
+            return str(order_id)
+    return None
+
+
+def _payload_symbol_direction(payload: dict[str, object]) -> tuple[str, str]:
+    return (_payload_symbol(payload), str(payload.get("direction") or ""))
+
+
+def _payload_symbol(payload: dict[str, object]) -> str:
+    symbol = payload.get("symbol")
+    if symbol:
+        return str(symbol)
+    signal = _payload_signal(payload)
+    return str(signal.get("symbol") or "NK225micro")
+
+
+def _pending_bucket_for_payload(
+    payload: dict[str, object],
+    pending_by_order_id: dict[str, str],
+    tick_size: float,
+) -> str:
+    order_id = _payload_order_id(payload)
+    if order_id is not None:
+        bucket = pending_by_order_id.pop(order_id, None)
+        if bucket is not None:
+            return bucket
+    return _entry_slippage_bucket(payload, tick_size)
+
+
+def _consume_pending_entry_bucket(
+    payload: dict[str, object],
+    pending_by_order_id: dict[str, str],
+    pending_by_symbol_direction: defaultdict[tuple[str, str], deque[str]],
+) -> str:
+    queue = pending_by_symbol_direction[_payload_symbol_direction(payload)]
+    while queue:
+        order_id = queue.popleft()
+        bucket = pending_by_order_id.pop(order_id, None)
+        if bucket is not None:
+            return bucket
+    return "unknown"
+
+
+def _entry_slippage_bucket(payload: dict[str, object], tick_size: float) -> str:
+    metadata = _payload_metadata(payload)
+    raw_slippage = metadata.get("entry_slippage_ticks")
+    if isinstance(raw_slippage, (int, float, str)) and str(raw_slippage).strip() != "":
+        return str(int(float(raw_slippage)))
+
+    signal = _payload_signal(payload)
+    direction = str(payload.get("direction") or signal.get("direction") or "")
+    signal_price = _float_from_any(metadata.get("entry_signal_price") or signal.get("price") or payload.get("entry_price"))
+    order_price = _float_from_any(metadata.get("entry_order_price"))
+    order_payload = metadata.get("order_payload")
+    if order_price is None and isinstance(order_payload, dict):
+        order_price = _float_from_any(order_payload.get("Price"))
+    if signal_price is None or order_price is None or tick_size <= 0:
+        return "unknown"
+
+    if direction == "long":
+        ticks = (order_price - signal_price) / tick_size
+    elif direction == "short":
+        ticks = (signal_price - order_price) / tick_size
+    else:
+        return "unknown"
+    return str(max(0, int(round(ticks))))
+
+
+def _float_from_any(value: object) -> float | None:
+    if isinstance(value, (int, float, str)) and str(value).strip() != "":
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _jsonl_files(path: str | Path) -> list[Path]:
@@ -399,12 +634,150 @@ def _entry_diagnostics_summary(diagnostics: _EntryDiagnostics) -> dict[str, obje
     }
 
 
+def _entry_fill_diagnostics_summary(
+    observed: _EntryFillDiagnostics,
+    simulation: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "observed_live_funnel": {
+            "entry_submitted": observed.entry_submitted,
+            "own_fills_detected": observed.own_fills_detected,
+            "expired_unfilled": observed.expired_unfilled,
+            "api_errors": observed.api_errors,
+            "rejected": observed.rejected,
+            "timeout_after_grace": observed.timeout_after_grace,
+            "cooldown_rejects": observed.cooldown_rejects,
+            "positions_detected": observed.positions_detected,
+            "external_or_unknown_positions_detected": observed.external_or_unknown_positions_detected,
+            "fill_rate": _safe_ratio(observed.own_fills_detected, observed.entry_submitted),
+            "by_slippage_ticks": {
+                bucket: _entry_fill_bucket_summary(counts)
+                for bucket, counts in sorted(observed.by_slippage_ticks.items(), key=lambda item: _bucket_sort_key(item[0]))
+            },
+        },
+        "fak_fill_simulation": simulation,
+    }
+
+
+def _entry_fill_bucket_summary(counts: Counter[str]) -> dict[str, object]:
+    submitted = int(counts.get("entry_submitted", 0))
+    fills = int(counts.get("own_fills_detected", 0))
+    return {
+        "entry_submitted": submitted,
+        "own_fills_detected": fills,
+        "expired_unfilled": int(counts.get("expired_unfilled", 0)),
+        "api_errors": int(counts.get("api_errors", 0)),
+        "rejected": int(counts.get("rejected", 0)),
+        "timeout_after_grace": int(counts.get("timeout_after_grace", 0)),
+        "cooldown_rejects": int(counts.get("cooldown_rejects", 0)),
+        "fill_rate": _safe_ratio(fills, submitted),
+    }
+
+
+def _simulate_fak_entry_fills(
+    samples: list[_EntrySignalSample],
+    book_quotes: list[_BookQuote],
+    slippage_ticks: tuple[int, ...],
+    latency_ms: tuple[int, ...],
+    config: StrategyConfig,
+) -> dict[str, object]:
+    quotes_by_symbol: defaultdict[str, list[_BookQuote]] = defaultdict(list)
+    for quote in book_quotes:
+        quotes_by_symbol[quote.symbol].append(quote)
+    quote_times_by_symbol: dict[str, list[datetime]] = {}
+    for symbol, quotes in quotes_by_symbol.items():
+        quotes.sort(key=lambda quote: quote.timestamp)
+        quote_times_by_symbol[symbol] = [quote.timestamp for quote in quotes]
+
+    by_slippage_latency: dict[str, dict[str, dict[str, object]]] = {}
+    for slippage in slippage_ticks:
+        slippage_key = str(slippage)
+        by_slippage_latency[slippage_key] = {}
+        for latency in latency_ms:
+            fills = 0
+            no_future_quote = 0
+            for sample in samples:
+                quote = _future_quote(sample, latency, quotes_by_symbol, quote_times_by_symbol)
+                if quote is None:
+                    no_future_quote += 1
+                    continue
+                limit_price = _simulated_entry_limit(
+                    sample.direction,
+                    sample.signal_price,
+                    slippage,
+                    config.tick_size_for(sample.symbol),
+                )
+                if _would_fak_fill(sample.direction, limit_price, quote):
+                    fills += 1
+            total = len(samples)
+            misses = max(0, total - fills - no_future_quote)
+            by_slippage_latency[slippage_key][str(latency)] = {
+                "signals": total,
+                "fills": fills,
+                "misses": misses,
+                "no_future_quote": no_future_quote,
+                "fill_rate": _safe_ratio(fills, total),
+            }
+
+    return {
+        "total_signals": len(samples),
+        "slippage_ticks": list(slippage_ticks),
+        "latency_ms": list(latency_ms),
+        "by_slippage_latency": by_slippage_latency,
+    }
+
+
+def _future_quote(
+    sample: _EntrySignalSample,
+    latency_ms: int,
+    quotes_by_symbol: dict[str, list[_BookQuote]],
+    quote_times_by_symbol: dict[str, list[datetime]],
+) -> _BookQuote | None:
+    quotes = quotes_by_symbol.get(sample.symbol)
+    times = quote_times_by_symbol.get(sample.symbol)
+    if not quotes or not times:
+        return None
+    target_time = sample.timestamp + timedelta(milliseconds=latency_ms)
+    index = bisect_left(times, target_time)
+    if index >= len(quotes):
+        return None
+    return quotes[index]
+
+
+def _simulated_entry_limit(direction: Direction, signal_price: float, slippage_ticks: int, tick_size: float) -> float:
+    offset = slippage_ticks * tick_size
+    if direction == "long":
+        return signal_price + offset
+    if direction == "short":
+        return signal_price - offset
+    return signal_price
+
+
+def _would_fak_fill(direction: Direction, limit_price: float, quote: _BookQuote) -> bool:
+    if direction == "long":
+        return limit_price >= quote.best_ask_price
+    if direction == "short":
+        return limit_price <= quote.best_bid_price
+    return False
+
+
+def _safe_ratio(numerator: int, denominator: int) -> float:
+    return round(numerator / denominator, 4) if denominator else 0.0
+
+
+def _bucket_sort_key(value: str) -> tuple[int, float | str]:
+    try:
+        return (0, float(value))
+    except ValueError:
+        return (1, value)
+
+
 def _update_pending_markouts(
     book: OrderBook,
     pending_markouts: list[_PendingMarkout],
     markout_values: defaultdict[str, list[float]],
     markout_by_reason: defaultdict[str, defaultdict[str, list[float]]],
-    tick_size: float,
+    config: StrategyConfig,
     regime_stats: _RegimeAttribution | None = None,
 ) -> None:
     if not pending_markouts:
@@ -419,7 +792,12 @@ def _update_pending_markouts(
         for horizon, target_time in entry.targets.items():
             if event_time >= target_time:
                 label = _horizon_label(horizon)
-                value = calculate_markout_ticks(entry.direction, entry.entry_price, book.mid_price, tick_size)
+                value = calculate_markout_ticks(
+                    entry.direction,
+                    entry.entry_price,
+                    book.mid_price,
+                    config.tick_size_for(entry.symbol),
+                )
                 markout_values[label].append(value)
                 markout_by_reason[entry.signal_reason][label].append(value)
                 if regime_stats is not None and entry.regime is not None:
