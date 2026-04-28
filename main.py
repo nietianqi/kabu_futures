@@ -15,6 +15,7 @@ if str(SRC) not in sys.path:
 from kabu_futures.api import KabuApiError, KabuStationClient, build_future_registration_symbols
 from kabu_futures.config import default_config, load_json_config
 from kabu_futures.live import LiveRunOptions, run_live
+from kabu_futures.log_diagnostics import diagnose_log
 from kabu_futures.replay import replay_jsonl
 
 
@@ -111,6 +112,14 @@ def replay_sample(args: argparse.Namespace) -> int:
     return 0
 
 
+def diagnose_log_cli(args: argparse.Namespace) -> int:
+    config_path = Path(args.config) if args.config else None
+    config = load_json_config(config_path) if config_path is not None and config_path.exists() else default_config()
+    diagnostics = diagnose_log(args.diagnose_log, config, max_rows=args.diagnose_max_rows)
+    print(json.dumps(diagnostics, ensure_ascii=False, indent=2))
+    return 0
+
+
 def run_tests() -> int:
     import unittest
 
@@ -133,6 +142,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exchange", action="append", type=int, dest="exchanges", help="Exchange to register. Default: 23 and 24.")
     parser.add_argument("--replay-sample", action="store_true")
     parser.add_argument("--path", help="JSONL path for --replay-sample.")
+    parser.add_argument("--diagnose-log", help="Stream a live JSONL log and summarize PnL, losses, API errors, and safety issues.")
+    parser.add_argument("--diagnose-max-rows", type=int, help="Optional row limit for --diagnose-log.")
     parser.add_argument("--test", action="store_true")
     parser.add_argument("--register-only", action="store_true", help="Register symbols and exit instead of running the live loop.")
     parser.add_argument("--max-events", type=int, help="Stop live loop after N WebSocket book events.")
@@ -198,6 +209,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.test:
         return run_tests()
+    if args.diagnose_log:
+        return diagnose_log_cli(args)
     if args.replay_sample:
         return replay_sample(args)
     if args.register_only:

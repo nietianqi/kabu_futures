@@ -13,6 +13,7 @@ from .orders import KabuConstants, KabuFutureOrderBuilder
 from .paper_execution import ExecutionEvent
 from .policy import LiveEntryPolicy, event_trace_metadata
 from .serialization import event_time as book_event_time, signal_snapshot
+from .live_safety import LiveSafetyState
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,7 @@ class LiveExecutionController:
             self.config.tick_size_for(self.config.symbols.primary),
         )
         self.pending_entry: PendingLiveOrder | None = None
+        self.live_safety = LiveSafetyState(self.config)
         self.pending_exits: dict[str, PendingLiveOrder] = {}
         self.live_positions: dict[str, LivePositionSlot] = {}
         self.pending_exit: PendingLiveOrder | None = None
@@ -123,6 +125,9 @@ class LiveExecutionController:
         decision = self.entry_policy.evaluate_signal(signal)
         if not decision.allowed:
             return [_event("execution_reject", signal, book, decision.reason, decision.merged_metadata)]
+        safety_decision = self.live_safety.evaluate_entry(signal, event_time)
+        if not safety_decision.allowed:
+            return [_event("execution_reject", signal, book, safety_decision.reason, safety_decision.metadata)]
         qty = min(self.config.micro_engine.qty, self.config.live_execution.max_order_qty)
         if qty <= 0:
             return [_event("execution_reject", signal, book, "live_qty_not_positive", _live_reject_metadata("live_qty_not_positive", "qty", {"qty": qty}))]
@@ -252,6 +257,7 @@ class LiveExecutionController:
         self.entry_orders_submitted += 1
         self.pending_entry = PendingLiveOrder(order_id, signal.symbol, symbol_code, exchange, signal.direction, qty, event_time, "entry", signal)
         self.entry_signal = signal
+        self.live_safety.record_entry(signal, event_time)
         events.append(
             _event(
                 "live_order_submitted",
@@ -266,6 +272,7 @@ class LiveExecutionController:
                     "entry_slippage_ticks": self.config.live_execution.entry_slippage_ticks,
                     "order_payload": payload,
                     "response": response,
+                    "live_safety_state": self.live_safety.summary(event_time),
                 },
                 qty=qty,
             )
@@ -340,6 +347,7 @@ class LiveExecutionController:
             else None,
             "live_position_sync_blocked": self.position_sync_blocked,
             "live_exit_retry_after": {key: value.isoformat() for key, value in self.exit_retry_after.items()},
+            "live_safety_state": self.live_safety.summary(),
         }
 
     def _sync_order_status(self, book: OrderBook) -> list[ExecutionEvent]:
@@ -701,6 +709,8 @@ class LiveExecutionController:
             self.live_losses += 1
         self.live_pnl_ticks += pnl_ticks
         self.live_pnl_yen += pnl_yen
+        engine = _trade_engine(slot.trade) or slot.entry_signal.engine
+        self.live_safety.record_exit(engine, slot.position.direction, slot.entry_signal.reason, pending.reason, pnl_ticks, event_time)
 
         trade_record: dict[str, object] = {
             "symbol": symbol,
@@ -726,6 +736,9 @@ class LiveExecutionController:
             "exit_execution_qty": order_status.get("execution_qty"),
             "tick_size": tick_size,
             "tick_value_yen": tick_value,
+            "engine": engine,
+            "signal_reason": slot.entry_signal.reason,
+            "live_safety_state": self.live_safety.summary(event_time),
         }
         self.closed_trade_by_position_key[position_key] = trade_record
         return ExecutionEvent(
@@ -871,8 +884,11 @@ class LiveExecutionController:
         if decision.price is None:
             return None
         trade = slot.trade
+        symbol_code = _validated_symbol_code(slot.position)
+        if symbol_code is None:
+            return None
         return self.orders.close_aggressive_limit(
-            slot.position.symbol_code,
+            symbol_code,
             exchange,
             trade.direction,
             slot.position.qty,
@@ -1148,6 +1164,13 @@ def _trade_engine(trade: Any | None) -> str | None:
     if trade is None:
         return None
     return str(getattr(trade, "engine", "micro_book"))
+
+
+def _validated_symbol_code(position: LivePositionState) -> str | None:
+    symbol_code = str(position.symbol_code or "")
+    if symbol_code and symbol_code != position.symbol and symbol_code.isdigit():
+        return symbol_code
+    return None
 
 
 def _event(

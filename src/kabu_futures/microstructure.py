@@ -158,9 +158,9 @@ class BookFeatureEngine:
     def _jump_detected(self, book: OrderBook, spread_ticks: float, event_gap_ms: float, latency_ms: float) -> bool:
         if spread_ticks > 2.0:
             return True
-        if event_gap_ms > self.config.websocket_latency_stop_ms:
-            return True
         if latency_ms > self.config.websocket_latency_stop_ms:
+            return True
+        if book.received_at is None and event_gap_ms > self.config.websocket_latency_stop_ms:
             return True
         if self.previous is None:
             return False

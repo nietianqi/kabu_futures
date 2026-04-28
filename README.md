@@ -25,6 +25,8 @@ The code is intentionally safe by default:
 - `src/kabu_futures/execution.py`: shared TP-only exit manager for micro and minute trades.
 - `src/kabu_futures/paper_execution.py`: paper-only controller/executor lifecycle for micro and minute-level signals.
 - `src/kabu_futures/live_execution.py`: explicitly gated kabu `/sendorder/future` executor for real futures orders.
+- `src/kabu_futures/live_safety.py`: live-only cooldown, pause, and consecutive-loss state.
+- `src/kabu_futures/log_diagnostics.py`: streaming JSONL diagnosis for live PnL, losses, API errors, and stale safety checks.
 - `src/kabu_futures/sessions.py`: JST futures session classification and new-entry gate.
 - `src/kabu_futures/evolution.py`: offline replay report with signal attribution, paper PnL, and markout.
 - `src/kabu_futures/tuning.py`: report-only micro parameter grid evaluation.
@@ -127,8 +129,8 @@ python main.py --real-trading
 
 Live execution is intentionally gated:
 
-- supports `micro_book` by default through `live_execution.supported_engines`; minute engines can be opt-in after review;
-- permits `micro_book` entries for every symbol in `symbols.trade`, currently `NK225micro` and `TOPIXmini`;
+- supports `micro_book`, `minute_orb`, `minute_vwap`, and `directional_intraday` by default through `live_execution.supported_engines`;
+- permits one-lot entries for every symbol in `symbols.trade`, currently `NK225micro` and `TOPIXmini`;
 - submits FAK limit entry orders through `/sendorder/future`;
 - can optionally add `live_execution.entry_slippage_ticks` to the entry limit price so tiny smoke-test orders are less likely to miss the queue (`long` adds ticks, `short` subtracts ticks);
 - applies per-symbol tick sizes for entry slippage, TP price, PnL ticks, markout, and reports, so TOPIXmini uses `0.25` point ticks instead of Nikkei's `5.0`;
@@ -141,12 +143,14 @@ Live execution is intentionally gated:
 - stops automatic TP resubmission after `live_execution.max_consecutive_exit_failures` consecutive close-order failures for a hold ID, marks the hold as blocked, and requires manual review instead of sending a market fallback;
 - pauses new entries for `live_execution.entry_failure_cooldown_seconds` after repeated entry order failures;
 - rejects minute-level live entries when `atr` is missing/non-positive or `execution_score` is below `multi_timeframe.min_execution_score_to_chase`;
-- submits close orders through `/sendorder/future`, using `ClosePositions` when a hold ID is available;
+- adds a live-only second gate for `minute_vwap trend_pullback_*`: ATR must be positive, `execution_score` must be at least 10, entries cool down for `live_execution.minute_cooldown_seconds`, and two same-direction stop losses pause that pullback strategy until the next 15-minute window;
+- pauses `micro_book` live entries for `live_execution.micro_loss_pause_seconds` after `live_execution.max_consecutive_micro_small_losses` small losses caused by `imbalance_neutral` or `microprice_neutral_or_reverse`;
+- submits close orders through `/sendorder/future`, using numeric kabu symbol codes and `ClosePositions` when a hold ID is available;
 - allows up to `risk.max_positions_per_symbol` independent positions per symbol, including mixed long/short hold IDs, while keeping only one pending entry order at a time.
 
 Live events are written to JSONL as `live_order_submitted`, `live_order_status`, `live_order_expired`, `live_order_error`, `live_position_detected`, `live_trade_closed`, `live_position_flat`, and `live_sync_error`. `live_order_status.order_status` exposes the kabu order snapshot plus execution fields parsed from filled `Details`: `execution_price`, `execution_id`, `execution_day`, `execution_qty`, and `execution_source`. If a synced position price differs from the entry execution detail, `live_position_detected.metadata.entry_price_mismatch=true` records the discrepancy without changing the kabu position price used by the state machine.
 
-Heartbeats include `live_position`, `live_positions`, `live_position_count`, `live_pending_entry`, `live_pending_exit`, `live_pending_exits`, `live_last_order_statuses`, `live_orders_submitted`, and `live_order_errors`. They also split the live fill funnel into `live_entry_orders_submitted`, `live_entry_orders_expired`, `live_own_entry_fills_detected`, `live_positions_detected`, `live_entry_fill_rate`, `live_exit_orders_submitted`, `live_exit_orders_expired`, and `live_positions_flat`. Closed live PnL is exposed as `live_trades_count`, `live_wins`, `live_losses`, `live_win_rate`, `live_pnl_ticks`, `live_pnl_yen`, and `live_avg_pnl_ticks`. Safety fields `live_exit_blocked`, `live_exit_failure_counts`, `live_entry_failure_count`, and `live_entry_cooldown_until` should be empty or zero during normal operation. If `live_exit_blocked` is non-empty, stop adding new exposure, inspect the kabu Station position/order screen, and manually decide whether to cancel/replace the TP or close the hold. Entry/reject/exit events include `decision_trace`, `decision_stage`, `decision_action`, and optional `blocked_by` metadata for post-trade diagnosis.
+Heartbeats include `live_position`, `live_positions`, `live_position_count`, `live_pending_entry`, `live_pending_exit`, `live_pending_exits`, `live_last_order_statuses`, `live_orders_submitted`, and `live_order_errors`. They also split the live fill funnel into `live_entry_orders_submitted`, `live_entry_orders_expired`, `live_own_entry_fills_detected`, `live_positions_detected`, `live_entry_fill_rate`, `live_exit_orders_submitted`, `live_exit_orders_expired`, and `live_positions_flat`. Closed live PnL is exposed as `live_trades_count`, `live_wins`, `live_losses`, `live_win_rate`, `live_pnl_ticks`, `live_pnl_yen`, and `live_avg_pnl_ticks`. Safety fields `live_exit_blocked`, `live_exit_failure_counts`, `live_entry_failure_count`, `live_entry_cooldown_until`, and `live_safety_state` should be empty or calm during normal operation. If `live_exit_blocked` is non-empty, stop adding new exposure, inspect the kabu Station position/order screen, and manually decide whether to cancel/replace the TP or close the hold. Startup logs include `code_fingerprint`, `config_fingerprint`, `live_minute_atr_filter`, and `min_execution_score_to_chase`; entry/reject/exit events include `decision_trace`, `decision_stage`, `decision_action`, and optional `blocked_by` metadata for post-trade diagnosis.
 
 The current micro strategy remains conservative and may submit zero live orders if no `micro_book` signal passes all gates. If live order plumbing must be smoke-tested, use a tiny `max_order_qty=1` config and watch `live_orders_submitted`, `live_order_errors`, `live_positions`, and the kabu Station order screen. If you want to temporarily disable TOPIXmini execution while keeping it as a filter, set `symbols.trade` to `["NK225micro"]` in `config/local.json`.
 
@@ -174,9 +178,12 @@ For large logs, `--max-books` now also limits logged live diagnostics unless `--
 ```powershell
 python scripts\analyze_micro_evolution.py logs\live_20260428_165430.jsonl --config config\local.json --max-books 5000 --no-regime
 python scripts\analyze_micro_evolution.py logs\live_20260428_165430.jsonl --config config\local.json --max-books 5000 --diagnostics-max-rows 0 --no-regime
+python main.py --diagnose-log logs\live_20260428_165430.jsonl
 ```
 
-Keep live defaults conservative while reviewing this. Only consider manually setting `live_execution.entry_slippage_ticks=1` in `config/local.json` for tiny-size validation if the 1-tick simulation materially improves fill rate and the same log's paper PnL/markout remains acceptable. The analyzer never writes config, never retries/reprices live orders, and does not enable minute live execution.
+`--diagnose-log` includes a `micro_entry_funnel` section with signal-evaluation allow/reject counts, top failed checks, live entry/expiry/fill counts, and minute signals blocked by stale `live_supported_engines`.
+
+Keep live defaults conservative while reviewing this. Only consider manually setting `live_execution.entry_slippage_ticks=1` in `config/local.json` for tiny-size validation if the 1-tick simulation materially improves fill rate and the same log's paper PnL/markout remains acceptable. The analyzer never writes config and never retries/reprices live orders; minute live remains one-lot only and must pass the ATR, execution-score, cooldown, and pause gates.
 
 For real live fills, use `live_trade_diagnostics` in the offline report. It reads `live_trade_closed` when present and can reconstruct older logs from `live_position_detected`, exit `live_order_submitted`, and filled `live_order_status` details. Check `entry_price_mismatches` before trusting PnL from a new venue/API behavior. `jump_diagnostics` breaks logged `jump_detected` rejects down by `symbol`, `session_phase`, and `spread_ticks` so night-open/TOPIXmini spikes can be reviewed without changing the live jump filter.
 

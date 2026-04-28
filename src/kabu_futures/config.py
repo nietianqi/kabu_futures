@@ -71,7 +71,7 @@ class SessionScheduleConfig:
 @dataclass(frozen=True)
 class LiveExecutionConfig:
     max_order_qty: int = 1
-    supported_engines: tuple[str, ...] = ("micro_book",)
+    supported_engines: tuple[str, ...] = ("micro_book", "minute_orb", "minute_vwap", "directional_intraday")
     entry_slippage_ticks: int = 0
     entry_time_in_force: int = 2
     exit_time_in_force: int = 1
@@ -81,6 +81,9 @@ class LiveExecutionConfig:
     max_consecutive_exit_failures: int = 3
     max_consecutive_entry_failures: int = 3
     entry_failure_cooldown_seconds: int = 30
+    minute_cooldown_seconds: int = 180
+    micro_loss_pause_seconds: int = 300
+    max_consecutive_micro_small_losses: int = 3
 
 
 @dataclass(frozen=True)
@@ -253,6 +256,21 @@ class StrategyConfig:
                 "live_execution.entry_failure_cooldown_seconds must be non-negative, "
                 f"got {self.live_execution.entry_failure_cooldown_seconds}"
             )
+        if self.live_execution.minute_cooldown_seconds < 0:
+            raise ValueError(
+                "live_execution.minute_cooldown_seconds must be non-negative, "
+                f"got {self.live_execution.minute_cooldown_seconds}"
+            )
+        if self.live_execution.micro_loss_pause_seconds < 0:
+            raise ValueError(
+                "live_execution.micro_loss_pause_seconds must be non-negative, "
+                f"got {self.live_execution.micro_loss_pause_seconds}"
+            )
+        if self.live_execution.max_consecutive_micro_small_losses <= 0:
+            raise ValueError(
+                "live_execution.max_consecutive_micro_small_losses must be positive, "
+                f"got {self.live_execution.max_consecutive_micro_small_losses}"
+            )
         if self.risk.max_positions_per_symbol <= 0:
             raise ValueError(f"max_positions_per_symbol must be positive, got {self.risk.max_positions_per_symbol}")
         if self.tick_size <= 0:
@@ -282,6 +300,8 @@ def _merge_dataclass(cls: type, values: dict[str, Any]) -> Any:
     normalized = {key: value for key, value in values.items() if key in valid}
     if cls is SymbolsConfig and "trade" in normalized and isinstance(normalized["trade"], list):
         normalized["trade"] = tuple(str(item) for item in normalized["trade"])
+    if cls is LiveExecutionConfig and "supported_engines" in normalized and isinstance(normalized["supported_engines"], list):
+        normalized["supported_engines"] = tuple(str(item) for item in normalized["supported_engines"])
     return cls(**normalized)
 
 

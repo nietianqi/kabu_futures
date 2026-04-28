@@ -14,6 +14,7 @@ from .live_execution import LiveExecutionController
 from .marketdata import BufferedJsonlMarketRecorder, KabuBoardNormalizer, KabuWebSocketStream, MarketDataError, MarketDataSkip
 from .models import OrderBook, SignalEvaluation
 from .paper_execution import ExecutionEvent, PaperExecutionController, PaperFillModel, TradeMode
+from .runtime import live_startup_self_check
 from .serialization import signal_to_dict
 from .sessions import SessionState, classify_jst_session
 
@@ -303,6 +304,7 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
         batch_size=options.log_batch_size,
         flush_interval_seconds=options.log_flush_interval_seconds,
     )
+    startup_self_check = live_startup_self_check(config)
     recorder.write(
         "startup",
         {
@@ -325,7 +327,7 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
             "paper_fill_model": options.paper_fill_model,
             "paper_console": options.paper_console,
             "live_orders": options.live_orders,
-            "live_supported_engines": config.live_execution.supported_engines,
+            **startup_self_check,
             **_session_state_to_dict(startup_session),
             "no_new_entry_windows_jst": config.micro_engine.no_new_entry_windows_jst,
         },
@@ -339,6 +341,10 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                 "resolved": resolved,
                 "trade_mode": options.trade_mode,
                 "live_orders": options.live_orders,
+                "code_fingerprint": startup_self_check["code_fingerprint"],
+                "config_fingerprint": startup_self_check["config_fingerprint"],
+                "live_minute_atr_filter": startup_self_check["live_minute_atr_filter"],
+                "min_execution_score_to_chase": startup_self_check["min_execution_score_to_chase"],
                 **_session_state_to_dict(startup_session),
             },
             ensure_ascii=False,
