@@ -17,11 +17,12 @@ The code is intentionally safe by default:
 - `src/kabu_futures/strategies.py`: minute ORB, trend-pullback, trend-continuation, and micro book engines.
 - `src/kabu_futures/microstructure.py`: imbalance, OFI, microprice, jump filters.
 - `src/kabu_futures/multitimeframe.py`: year/month/week/day/hour regime and bias scoring.
+- `src/kabu_futures/policy.py`: unified trade authorization and `decision_trace` metadata.
 - `src/kabu_futures/risk.py`: daily risk controls and order throttling.
 - `src/kabu_futures/orders.py`: kabu futures order payload builders and synthetic OCO state.
 - `src/kabu_futures/api.py`: minimal kabu Station REST client.
 - `src/kabu_futures/marketdata.py`: kabu board/PUSH normalizer, optional WebSocket reader, JSONL recorder.
-- `src/kabu_futures/execution.py`: micro-trade take-profit/stop-loss/time-stop manager.
+- `src/kabu_futures/execution.py`: shared TP-only exit manager for micro and minute trades.
 - `src/kabu_futures/paper_execution.py`: paper-only controller/executor lifecycle for micro and minute-level signals.
 - `src/kabu_futures/live_execution.py`: explicitly gated kabu `/sendorder/future` executor for real futures orders.
 - `src/kabu_futures/sessions.py`: JST futures session classification and new-entry gate.
@@ -85,11 +86,13 @@ The strategy uses a unified JST session gate. Market data, bars, micro features,
 
 Practical rhythm: start kabu Station after `06:30`, prepare symbols before `08:45`, stop aggressive new entries at `15:40`, prepare night session at `16:45`, trade again from `17:00`, stop new entries at `05:55`, then save/exit before `06:15`. The old `micro_engine.no_new_entry_windows_jst` field still exists for extra local blackout windows, but its default is empty because the session gate now owns the official JPX/kabu schedule.
 
-`minute_vwap` trend-pullback signals and `directional_intraday` long signals are observe-only by default after the 2026-04-27 log review. They remain visible in logs as diagnostics, but do not create paper entries unless the corresponding `minute_engine.*_observe_only` flags are disabled in config.
+`minute_vwap` trend-pullback signals and `directional_intraday` long signals are tradeable by default. If you want to shadow them without entries, set the corresponding `minute_engine.*_observe_only` flags to `true` in config.
 
 ## Paper Execution
 
 Paper execution never sends real orders. It reacts to tradeable `micro_book` signals and minute-level signals (`minute_orb`, `minute_vwap`, `directional_intraday`) for offline/paper research.
+
+Paper exits are TP-only: losing positions, time stops, and book-feature reversals no longer close the trade. The default target is 1 tick from the actual entry price; if the fill is worse than the original signal price, the target widens to 2 ticks. Paper mode can hold up to `risk.max_positions_per_symbol` independent positions for the same symbol, including mixed long/short slots; the default is `5`.
 
 ```powershell
 # Safe default: observe only, no paper position and no live order
@@ -105,7 +108,7 @@ python main.py --trade-mode paper --paper-fill-model touch
 python main.py --replay-sample --path logs\live_20260423_222539.jsonl --trade-mode paper --paper-fill-model touch
 ```
 
-Paper events are written to the JSONL log as `paper_pending`, `paper_entry`, `paper_exit`, `paper_cancel`, `execution_reject`, and `execution_skip`. In observe mode, tradeable signals produce `execution_skip` with reason `observe_mode`. V1 keeps a single active paper position across micro and minute executors. Heartbeats keep the legacy aggregate fields `paper_position`, `paper_pending_order`, `paper_trades`, `paper_pnl_ticks`, and `paper_pnl_yen`, and add split fields such as `paper_micro_position`, `paper_minute_position`, `paper_micro_trades`, and `paper_minute_trades`.
+Paper events are written to the JSONL log as `paper_pending`, `paper_entry`, `paper_exit`, `paper_cancel`, `execution_reject`, and `execution_skip`. In observe mode, tradeable signals produce `execution_skip` with reason `observe_mode`. Heartbeats keep the legacy aggregate fields `paper_position`, `paper_pending_order`, `paper_trades`, `paper_pnl_ticks`, and `paper_pnl_yen`, and add split/multi-position fields such as `paper_positions`, `paper_position_count`, `paper_micro_position`, `paper_minute_position`, `paper_micro_trades`, and `paper_minute_trades`.
 
 ## Live Execution
 
@@ -118,18 +121,21 @@ python main.py --trade-mode live --live-orders
 python main.py --real-trading
 ```
 
-Live v1 is intentionally narrow:
+Live execution is intentionally gated:
 
-- supports only `micro_book` signals;
-- rejects `minute_orb`, `minute_vwap`, and `directional_intraday` with `live_unsupported_signal_engine`;
+- supports `micro_book` by default through `live_execution.supported_engines`; minute engines can be opt-in after review;
 - submits FAK limit entry orders through `/sendorder/future`;
+- can optionally add `live_execution.entry_slippage_ticks` to the entry limit price so tiny smoke-test orders are less likely to miss the queue (`long` adds ticks, `short` subtracts ticks);
 - polls `/orders?product=3&id=...&details=true` to distinguish filled, expired, and unfilled FAK orders;
-- polls `/positions?product=3&symbol=...` to confirm the real position before managing exits;
-- uses the same micro exit logic for take-profit, stop-loss, time-stop, and feature exits;
+- polls `/positions?product=3&symbol=...` to confirm the real position before placing the exit order;
+- immediately submits one resting close-limit take-profit order per synced hold ID;
+- uses a 1 tick profit target from actual entry price, or 2 ticks when the actual fill has adverse slippage vs the original signal price;
+- does not submit loss stop, time stop, or feature-reversal exits;
+- rejects minute-level live entries when `atr` is missing/non-positive or `execution_score` is below `multi_timeframe.min_execution_score_to_chase`;
 - submits close orders through `/sendorder/future`, using `ClosePositions` when a hold ID is available;
-- keeps one active live position/order path at a time.
+- allows up to `risk.max_positions_per_symbol` independent positions per symbol, including mixed long/short hold IDs, while keeping only one pending entry order at a time.
 
-Live events are written to JSONL as `live_order_submitted`, `live_order_status`, `live_order_expired`, `live_order_error`, `live_position_detected`, `live_position_flat`, and `live_sync_error`. Heartbeats include `live_position`, `live_pending_entry`, `live_pending_exit`, `live_last_order_statuses`, `live_orders_submitted`, and `live_order_errors`.
+Live events are written to JSONL as `live_order_submitted`, `live_order_status`, `live_order_expired`, `live_order_error`, `live_position_detected`, `live_position_flat`, and `live_sync_error`. Heartbeats include `live_position`, `live_positions`, `live_position_count`, `live_pending_entry`, `live_pending_exit`, `live_pending_exits`, `live_last_order_statuses`, `live_orders_submitted`, and `live_order_errors`. They also split the live fill funnel into `live_entry_orders_submitted`, `live_entry_orders_expired`, `live_positions_detected`, `live_entry_fill_rate`, `live_exit_orders_submitted`, `live_exit_orders_expired`, and `live_positions_flat`. Entry/reject/exit events include `decision_trace`, `decision_stage`, `decision_action`, and optional `blocked_by` metadata for post-trade diagnosis.
 
 The current micro strategy remains conservative and may submit zero live orders if no `micro_book` signal passes all gates. If live order plumbing must be smoke-tested, use a tiny `max_order_qty=1` config and watch `live_orders_submitted`, `live_order_errors`, and the kabu Station order screen.
 
@@ -144,6 +150,13 @@ python scripts\analyze_micro_evolution.py logs\live_20260427_145035.jsonl --outp
 
 Markout is the post-entry mid-price move at fixed horizons. For a long entry it is `future_mid - entry_price`; for a short entry it is `entry_price - future_mid`. The report converts markout to ticks so it can be compared with spread, stop, and take-profit settings.
 
+By default, the analyzer now adds a `regime` section that attributes books, allow/reject decisions, signals, paper PnL, exit reasons, and markout to `warmup`, `high_vol`, and `low_vol` volatility regimes. Use this after a rejected challenger to see whether losses cluster in a specific volatility state:
+
+```powershell
+python scripts\analyze_micro_evolution.py logs\live_20260428_104649.jsonl --config config\local.json --regime-warmup-periods 5 --regime-high-vol-percentile 75
+python scripts\analyze_micro_evolution.py logs\live_20260428_104649.jsonl --no-regime
+```
+
 Run the conservative imbalance experiment from the latest log analysis:
 
 ```powershell
@@ -154,7 +167,7 @@ The tuner is report-only. It never overwrites `config/local.json`; use the outpu
 
 Latest 2026-04-27 pipeline result: the report-only evolution gate correctly rejected the imbalance-only challenger. Across the aggregated paper replay (`401k+` books), paper PnL was negative, short-horizon markout was negative, and walk-forward pass rate was `0.0`. Treat `imbalance_entry` tuning as insufficient by itself. The next safe experiments are:
 
-- keep `trend_pullback_long/short` observe-only;
+- keep minute-level live entries small and require valid ATR plus sufficient execution score;
 - test `micro_engine.invert_direction=true` only in paper/offline mode;
 - split markout by regime before promoting any new live configuration.
 

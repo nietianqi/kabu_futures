@@ -37,6 +37,23 @@ def build_parser() -> argparse.ArgumentParser:
         default="immediate",
         help="Paper fill model used during replay.",
     )
+    parser.add_argument(
+        "--no-regime",
+        action="store_true",
+        help="Disable volatility-regime attribution in the JSON report.",
+    )
+    parser.add_argument(
+        "--regime-warmup-periods",
+        type=int,
+        default=5,
+        help="Regime classifier warmup periods before high/low-vol labeling.",
+    )
+    parser.add_argument(
+        "--regime-high-vol-percentile",
+        type=float,
+        default=75.0,
+        help="Rolling percentile threshold used to label high-vol books.",
+    )
     parser.add_argument("--output", help="Optional JSON report path.")
     return parser
 
@@ -49,6 +66,11 @@ def main() -> int:
         max_books=args.max_books,
         markout_seconds=_float_tuple(args.markout_seconds),
         paper_fill_model=args.paper_fill_model,
+        include_regime=not args.no_regime,
+        regime_kwargs={
+            "warmup_periods": args.regime_warmup_periods,
+            "high_vol_percentile": args.regime_high_vol_percentile,
+        },
     )
     text = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:

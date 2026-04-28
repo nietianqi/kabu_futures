@@ -12,8 +12,9 @@ from .config import StrategyConfig
 from .engine import DualStrategyEngine
 from .live_execution import LiveExecutionController
 from .marketdata import BufferedJsonlMarketRecorder, KabuBoardNormalizer, KabuWebSocketStream, MarketDataError, MarketDataSkip
-from .models import OrderBook, Signal
+from .models import OrderBook
 from .paper_execution import ExecutionEvent, PaperExecutionController, PaperFillModel, TradeMode
+from .serialization import signal_to_dict
 from .sessions import SessionState, classify_jst_session
 
 
@@ -43,24 +44,6 @@ class LiveRunOptions:
     paper_fill_model: PaperFillModel = "immediate"
     paper_console: bool = True
     live_orders: bool = False
-
-
-def signal_to_dict(signal: Signal) -> dict[str, Any]:
-    return {
-        "engine": signal.engine,
-        "symbol": signal.symbol,
-        "direction": signal.direction,
-        "confidence": signal.confidence,
-        "price": signal.price,
-        "reason": signal.reason,
-        "metadata": signal.metadata,
-        "score": signal.score,
-        "signal_horizon": signal.signal_horizon,
-        "expected_hold_seconds": signal.expected_hold_seconds,
-        "risk_budget_pct": signal.risk_budget_pct,
-        "veto_reason": signal.veto_reason,
-        "position_scale": signal.position_scale,
-    }
 
 
 def tick_to_dict(book: OrderBook, processed: int) -> dict[str, Any]:

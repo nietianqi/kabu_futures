@@ -25,9 +25,9 @@ class MinuteEngineConfig:
     take_profit_r: float = 1.5
     breakeven_after_r: float = 1.0
     max_hold_minutes: int = 45
-    trend_pullback_long_observe_only: bool = True
-    trend_pullback_short_observe_only: bool = True
-    directional_intraday_long_observe_only: bool = True
+    trend_pullback_long_observe_only: bool = False
+    trend_pullback_short_observe_only: bool = False
+    directional_intraday_long_observe_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -40,7 +40,7 @@ class MicroEngineConfig:
     imbalance_exit: float = 0.10
     microprice_entry_ticks: float = 0.15
     spread_ticks_required: int = 1
-    take_profit_ticks: int = 2
+    take_profit_ticks: int = 1
     stop_loss_ticks: int = 3
     time_stop_seconds: int = 20
     max_hold_seconds: int = 30
@@ -71,8 +71,9 @@ class SessionScheduleConfig:
 class LiveExecutionConfig:
     max_order_qty: int = 1
     supported_engines: tuple[str, ...] = ("micro_book",)
+    entry_slippage_ticks: int = 0
     entry_time_in_force: int = 2
-    exit_time_in_force: int = 2
+    exit_time_in_force: int = 1
     position_poll_interval_seconds: float = 1.0
     max_pending_entry_seconds: int = 8
 
@@ -137,7 +138,8 @@ class MultiTimeframeConfig:
 class RiskConfig:
     account_daily_loss_pct: float = 1.0
     account_daily_loss_r: float = 3.0
-    max_micro225_net_qty: int = 3
+    max_micro225_net_qty: int = 5
+    max_positions_per_symbol: int = 5
     margin_buffer_ratio: float = 1.5
     directional_risk_per_trade_pct_min: float = 0.25
     directional_risk_per_trade_pct_max: float = 0.40
@@ -188,6 +190,12 @@ class StrategyConfig:
             raise ValueError(f"stop_loss_ticks must be positive, got {m.stop_loss_ticks}")
         if m.take_profit_ticks <= 0:
             raise ValueError(f"take_profit_ticks must be positive, got {m.take_profit_ticks}")
+        if self.live_execution.entry_slippage_ticks < 0:
+            raise ValueError(
+                f"live_execution.entry_slippage_ticks must be non-negative, got {self.live_execution.entry_slippage_ticks}"
+            )
+        if self.risk.max_positions_per_symbol <= 0:
+            raise ValueError(f"max_positions_per_symbol must be positive, got {self.risk.max_positions_per_symbol}")
         if self.tick_size <= 0:
             raise ValueError(f"tick_size must be positive, got {self.tick_size}")
         windows = self.nt_spread.zscore_windows
