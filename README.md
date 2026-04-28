@@ -49,7 +49,7 @@ python main.py
 
 By default, `main.py` registers `NK225micro` and `TOPIXmini` on production `18080`, day and night sessions `Exchange=23,24`. It reads API settings from `config/local.json`. After registration it connects to kabu WebSocket and keeps running until you press `Ctrl+C`.
 
-Console tick printing is off by default. Startup, heartbeat, signal, paper execution, and error events still print; full market data is still recorded to JSONL unless you change `--book-log-mode`. Microstructure signal decisions are written to JSONL as `signal_eval`, so you can inspect why a book was rejected without flooding the console.
+Console tick printing is off by default. Startup, heartbeat, signal, paper execution, and error events still print; full market data is still recorded to JSONL unless you change `--book-log-mode`. Microstructure signal decisions are written to JSONL as `signal_eval`; the default `--signal-eval-log-mode summary` aggregates repeated rejects into `signal_eval_summary` while preserving allow events, and `full` keeps every evaluation.
 
 Useful safe commands:
 
@@ -60,6 +60,7 @@ python main.py --replay-sample
 python main.py --sandbox --dry-run
 python main.py --register-only
 python main.py --tick-log-mode changes
+python main.py --signal-eval-log-mode full
 ```
 
 For the next research capture, use paper mode so the JSONL contains simulated entries/exits and PnL:

@@ -90,6 +90,7 @@ def live_loop(args: argparse.Namespace) -> int:
             heartbeat_interval_events=args.heartbeat_events,
             tick_log_mode=args.tick_log_mode,
             tick_log_interval_events=args.tick_log_interval,
+            signal_eval_log_mode=args.signal_eval_log_mode,
             clear_registered_symbols=not args.keep_registered_symbols,
             trade_mode=trade_mode,
             paper_fill_model=args.paper_fill_model,
@@ -151,6 +152,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print tick snapshots to console. Default: off, so heartbeat/signal/paper/error logs remain readable.",
     )
     parser.add_argument("--tick-log-interval", type=int, default=1, help="Console tick interval when --tick-log-mode sample is used.")
+    parser.add_argument(
+        "--signal-eval-log-mode",
+        choices=("full", "summary", "allow_only", "off"),
+        default="summary",
+        help="Signal evaluation logging. summary aggregates repeated rejects while preserving allow events.",
+    )
     parser.add_argument(
         "--trade-mode",
         choices=("observe", "paper", "live"),

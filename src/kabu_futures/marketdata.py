@@ -18,6 +18,20 @@ class MarketDataError(ValueError):
 class MarketDataSkip(ValueError):
     """Recoverable market-data condition that should be logged as a skip, not an error."""
 
+    def __init__(self, reason: str, message: str | None = None, metadata: dict[str, Any] | None = None) -> None:
+        super().__init__(message or reason)
+        self.reason = reason
+        self.metadata = metadata or {}
+
+    def to_payload(self, raw: str, received_at: datetime) -> dict[str, Any]:
+        return {
+            "reason": self.reason,
+            "message": str(self),
+            "metadata": self.metadata,
+            "raw": raw,
+            "received_at": received_at.isoformat(),
+        }
+
 
 def _parse_time(value: Any, fallback: datetime | None = None) -> datetime:
     if isinstance(value, datetime):
@@ -86,9 +100,17 @@ class KabuBoardNormalizer:
             raise MarketDataError("Payload does not include valid bid/ask prices")
 
         if raw_sell_price <= raw_buy_price:
+            reason = "locked_quote" if raw_sell_price == raw_buy_price else "crossed_quote"
             raise MarketDataSkip(
+                reason,
                 f"Invalid kabu quote: best sell must be greater than best buy "
-                f"(raw BidPrice={raw_sell_price}, raw AskPrice={raw_buy_price})"
+                f"(raw BidPrice={raw_sell_price}, raw AskPrice={raw_buy_price})",
+                {
+                    "symbol": symbol,
+                    "raw_symbol": raw_symbol,
+                    "raw_bid_price": raw_sell_price,
+                    "raw_ask_price": raw_buy_price,
+                },
             )
 
         buy_levels = buy_levels or (Level(raw_buy_price, raw_buy_qty),)
