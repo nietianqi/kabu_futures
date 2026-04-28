@@ -11,7 +11,13 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from kabu_futures.config import load_json_config
-from kabu_futures.tuning import DEFAULT_IMBALANCE_GRID, DEFAULT_MICROPRICE_GRID, DEFAULT_SPREAD_GRID, tune_micro_params
+from kabu_futures.tuning import (
+    DEFAULT_IMBALANCE_GRID,
+    DEFAULT_MICROPRICE_GRID,
+    DEFAULT_OFI_PERCENTILE_GRID,
+    DEFAULT_SPREAD_GRID,
+    tune_micro_params,
+)
 
 
 def _float_tuple(value: str) -> tuple[float, ...]:
@@ -34,12 +40,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--imbalance-grid",
         default=",".join(str(value) for value in DEFAULT_IMBALANCE_GRID),
-        help="Comma-separated imbalance_entry candidates. Default: 0.18,0.20,0.22,0.25,0.30.",
+        help="Comma-separated imbalance_entry candidates. Default: 0.28,0.26,0.24.",
     )
     parser.add_argument(
         "--microprice-grid",
         default=",".join(str(value) for value in DEFAULT_MICROPRICE_GRID),
-        help="Comma-separated microprice_entry_ticks candidates. Default: 0.10,0.12,0.15.",
+        help="Comma-separated microprice_entry_ticks candidates. Default: 0.12,0.10.",
+    )
+    parser.add_argument(
+        "--ofi-percentile-grid",
+        default=",".join(str(value) for value in DEFAULT_OFI_PERCENTILE_GRID),
+        help="Comma-separated OFI percentile candidates. Default: 70,65,60.",
     )
     parser.add_argument(
         "--spread-grid",
@@ -49,9 +60,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-drawdown-worsen-ratio",
         type=float,
-        default=0.25,
+        default=0.20,
         help="Allowed relative drawdown deterioration before a candidate stops being recommended.",
     )
+    parser.add_argument("--min-fill-rate", type=float, default=0.70, help="Minimum simulated entry fill rate for recommendation.")
     parser.add_argument(
         "--paper-fill-model",
         choices=("immediate", "touch"),
@@ -69,10 +81,12 @@ def main() -> int:
         load_json_config(args.config),
         imbalance_grid=_float_tuple(args.imbalance_grid),
         microprice_grid=_float_tuple(args.microprice_grid),
+        ofi_percentile_grid=_float_tuple(args.ofi_percentile_grid),
         spread_grid=_int_tuple(args.spread_grid),
         max_books=args.max_books,
         min_trades=args.min_trades,
         max_drawdown_worsen_ratio=args.max_drawdown_worsen_ratio,
+        min_fill_rate=args.min_fill_rate,
         paper_fill_model=args.paper_fill_model,
     )
     text = json.dumps(report, ensure_ascii=False, indent=2)

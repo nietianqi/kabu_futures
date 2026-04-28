@@ -12,14 +12,17 @@ from .config import StrategyConfig
 from .engine import DualStrategyEngine
 from .live_execution import LiveExecutionController
 from .marketdata import BufferedJsonlMarketRecorder, KabuBoardNormalizer, KabuWebSocketStream, MarketDataError, MarketDataSkip
-from .models import OrderBook
+from .micro_candidates import candidate_metadata_snapshot, near_miss_key
+from .models import OrderBook, SignalEvaluation
 from .paper_execution import ExecutionEvent, PaperExecutionController, PaperFillModel, TradeMode
+from .runtime import live_startup_self_check
 from .serialization import signal_to_dict
 from .sessions import SessionState, classify_jst_session
 
 
 BookLogMode = Literal["full", "sample", "signals_only", "off"]
 TickLogMode = Literal["off", "sample", "changes", "all"]
+SignalEvalLogMode = Literal["full", "summary", "allow_only", "off"]
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,7 @@ class LiveRunOptions:
     heartbeat_interval_events: int = 100
     tick_log_mode: TickLogMode = "off"
     tick_log_interval_events: int = 1
+    signal_eval_log_mode: SignalEvalLogMode = "summary"
     clear_registered_symbols: bool = True
     trade_mode: TradeMode = "observe"
     paper_fill_model: PaperFillModel = "immediate"
@@ -131,6 +135,196 @@ def _should_log_book(mode: BookLogMode, processed: int, sample_interval: int) ->
     return False
 
 
+def _compact_eval_metadata(metadata: dict[str, object]) -> dict[str, object]:
+    keys = (
+        "spread_ticks",
+        "spread_required_ticks",
+        "spread_ok",
+        "imbalance",
+        "imbalance_entry",
+        "imbalance_long_ok",
+        "imbalance_short_ok",
+        "ofi_ewma",
+        "ofi_threshold",
+        "ofi_percentile",
+        "ofi_long_ok",
+        "ofi_short_ok",
+        "microprice_edge_ticks",
+        "microprice_entry_ticks",
+        "microprice_long_ok",
+        "microprice_short_ok",
+        "minute_bias",
+        "topix_bias",
+        "jump_detected",
+        "jump_reason",
+        "too_soon",
+        "latency_ms",
+        "long_failed_checks",
+        "short_failed_checks",
+        "long_near_miss",
+        "short_near_miss",
+        "near_miss",
+        "near_miss_direction",
+        "near_miss_missing",
+        "reject_stage",
+        "throttle_ok",
+        "throttle_reason",
+        "mtf_ok",
+        "mtf_reason",
+        "risk_ok",
+        "risk_reason",
+        "alpha_ok",
+        "alpha_reason",
+        "total_score",
+        "veto_reason",
+        "position_scale",
+    )
+    return {key: metadata[key] for key in keys if key in metadata}
+
+
+class SignalEvaluationLogger:
+    """Write signal evaluations with optional reject aggregation."""
+
+    def __init__(self, recorder: BufferedJsonlMarketRecorder, mode: SignalEvalLogMode = "summary") -> None:
+        self.recorder = recorder
+        self.mode = mode
+        self._summary: dict[str, object] | None = None
+        self._summary_key: tuple[object, ...] | None = None
+
+    def write(self, evaluation: SignalEvaluation) -> None:
+        if self.mode == "off":
+            return
+        if self.mode == "full":
+            self.recorder.write("signal_eval", evaluation)
+            return
+        if evaluation.decision == "allow":
+            self.flush()
+            if self.mode in ("summary", "allow_only"):
+                self.recorder.write("signal_eval", evaluation, force_flush=True)
+            return
+        if self.mode == "allow_only":
+            return
+
+        metadata = evaluation.metadata
+        key = (
+            evaluation.engine,
+            evaluation.symbol,
+            evaluation.reason,
+            evaluation.candidate_direction,
+            metadata.get("reject_stage"),
+            metadata.get("near_miss"),
+            metadata.get("near_miss_direction"),
+            metadata.get("near_miss_missing"),
+        )
+        if self._summary_key != key:
+            self.flush()
+            self._summary_key = key
+            self._summary = {
+                "engine": evaluation.engine,
+                "symbol": evaluation.symbol,
+                "decision": evaluation.decision,
+                "reason": evaluation.reason,
+                "candidate_direction": evaluation.candidate_direction,
+                "reject_stage": metadata.get("reject_stage"),
+                "count": 0,
+                "start_timestamp": evaluation.timestamp.isoformat(),
+                "end_timestamp": evaluation.timestamp.isoformat(),
+                "first_metadata": _compact_eval_metadata(metadata),
+                "last_metadata": _compact_eval_metadata(metadata),
+            }
+        assert self._summary is not None
+        self._summary["count"] = int(self._summary["count"]) + 1
+        self._summary["end_timestamp"] = evaluation.timestamp.isoformat()
+        self._summary["last_metadata"] = _compact_eval_metadata(metadata)
+
+    def flush(self) -> None:
+        if self._summary is None:
+            return
+        self.recorder.write("signal_eval_summary", self._summary)
+        self._summary = None
+        self._summary_key = None
+
+
+class MicroCandidateEmitter:
+    """Emit ``micro_candidate`` JSONL events for near-miss micro evaluations.
+
+    A candidate is recorded only when the underlying ``SignalEvaluation``
+    metadata flags ``near_miss=True``. The emitter throttles per
+    ``(symbol, direction, missing_check)`` so a quiet near-miss only logs once
+    every ``min_interval_seconds`` (default 30s). Aggregation counts how many
+    near-misses were collapsed into the throttled window.
+
+    The emitter does NOT generate any orders or strategy signals — it is purely
+    diagnostic. Output is the JSONL ``kind=micro_candidate`` event with the same
+    metadata shape SignalEvaluation already produces, plus a ``candidate_count``
+    field for the throttled total.
+    """
+
+    def __init__(
+        self,
+        recorder: BufferedJsonlMarketRecorder,
+        min_interval_seconds: float = 30.0,
+        enabled: bool = True,
+    ) -> None:
+        self.recorder = recorder
+        self.min_interval_seconds = max(0.0, float(min_interval_seconds))
+        self.enabled = enabled
+        self._last_emit_at: dict[tuple[str, str, str], datetime] = {}
+        self._pending_count: dict[tuple[str, str, str], int] = {}
+        self.total_candidates = 0
+        self.emitted_candidates = 0
+
+    def write(self, evaluation: SignalEvaluation) -> None:
+        if not self.enabled:
+            return
+        metadata = evaluation.metadata
+        if not isinstance(metadata, dict):
+            return
+        if not metadata.get("near_miss"):
+            return
+        # Use SignalEvaluation.engine to scope this to micro evaluations only.
+        if evaluation.engine != "micro_book":
+            return
+        # Identify which direction is the near-miss and the single missing check.
+        key_parts = near_miss_key(metadata)
+        if key_parts is None:
+            return
+        direction, missing = key_parts
+        key = (str(evaluation.symbol), str(direction), str(missing))
+        self.total_candidates += 1
+        self._pending_count[key] = self._pending_count.get(key, 0) + 1
+        last = self._last_emit_at.get(key)
+        ts = evaluation.timestamp
+        if last is not None and self.min_interval_seconds > 0:
+            elapsed = (ts - last).total_seconds()
+            if elapsed < self.min_interval_seconds:
+                return
+        self._emit(evaluation, direction, missing, key, ts)
+
+    def _emit(
+        self,
+        evaluation: SignalEvaluation,
+        direction: object,
+        missing: object,
+        key: tuple[str, str, str],
+        timestamp: datetime,
+    ) -> None:
+        candidate_count = self._pending_count.get(key, 1)
+        payload: dict[str, object] = {
+            "engine": evaluation.engine,
+            "symbol": evaluation.symbol,
+            "candidate_direction": evaluation.candidate_direction,
+            "near_miss_direction": direction,
+            "near_miss_missing": missing,
+            "candidate_count": candidate_count,
+            "timestamp": timestamp.isoformat(),
+            "metadata": candidate_metadata_snapshot(evaluation.metadata),
+        }
+        self.recorder.write("micro_candidate", payload)
+        self._last_emit_at[key] = timestamp
+        self._pending_count[key] = 0
+        self.emitted_candidates += 1
+
 def _write_execution_events(
     recorder: BufferedJsonlMarketRecorder,
     events: list[ExecutionEvent],
@@ -180,7 +374,7 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
             )
         )
         return 2
-    future_codes = options.future_codes or (config.symbols.primary, config.symbols.filter)
+    future_codes = options.future_codes or tuple(dict.fromkeys((*config.trade_symbols(), config.symbols.filter)))
     deriv_month = options.deriv_month if options.deriv_month is not None else config.symbols.deriv_month
     client = KabuStationClient(password, config.api, production=options.production)
     token = client.authenticate()
@@ -203,6 +397,7 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
         batch_size=options.log_batch_size,
         flush_interval_seconds=options.log_flush_interval_seconds,
     )
+    startup_self_check = live_startup_self_check(config)
     recorder.write(
         "startup",
         {
@@ -219,12 +414,13 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
             "log_batch_size": options.log_batch_size,
             "log_flush_interval_seconds": options.log_flush_interval_seconds,
             "tick_log_mode": options.tick_log_mode,
+            "signal_eval_log_mode": options.signal_eval_log_mode,
             "clear_registered_symbols": options.clear_registered_symbols,
             "trade_mode": options.trade_mode,
             "paper_fill_model": options.paper_fill_model,
             "paper_console": options.paper_console,
             "live_orders": options.live_orders,
-            "live_supported_engines": config.live_execution.supported_engines,
+            **startup_self_check,
             **_session_state_to_dict(startup_session),
             "no_new_entry_windows_jst": config.micro_engine.no_new_entry_windows_jst,
         },
@@ -238,6 +434,10 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                 "resolved": resolved,
                 "trade_mode": options.trade_mode,
                 "live_orders": options.live_orders,
+                "code_fingerprint": startup_self_check["code_fingerprint"],
+                "config_fingerprint": startup_self_check["config_fingerprint"],
+                "live_minute_atr_filter": startup_self_check["live_minute_atr_filter"],
+                "min_execution_score_to_chase": startup_self_check["min_execution_score_to_chase"],
                 **_session_state_to_dict(startup_session),
             },
             ensure_ascii=False,
@@ -256,6 +456,8 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
         execution = PaperExecutionController(config, options.trade_mode, options.paper_fill_model)
     normalizer = KabuBoardNormalizer(symbol_aliases=_symbol_aliases(resolved))
     stream = KabuWebSocketStream(client.websocket_base_url(), normalizer)
+    signal_eval_logger = SignalEvaluationLogger(recorder, options.signal_eval_log_mode)
+    micro_candidate_emitter = MicroCandidateEmitter(recorder)
     processed = 0
     market_data_errors = 0
     market_data_skips = 0
@@ -281,7 +483,7 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                         market_data_skips += 1
                         recorder.write(
                             "market_data_skip",
-                            {"reason": str(exc), "raw": raw, "received_at": received_at.isoformat()},
+                            exc.to_payload(raw, received_at),
                             force_flush=market_data_skips == 1 or market_data_skips % error_sample_rate == 0,
                         )
                         if market_data_skips == 1 or market_data_skips % error_sample_rate == 0:
@@ -329,7 +531,8 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                     signal_allow_count += sum(1 for evaluation in signal_evaluations if evaluation.decision == "allow")
                     signal_reject_count += sum(1 for evaluation in signal_evaluations if evaluation.decision == "reject")
                     for evaluation in signal_evaluations:
-                        recorder.write("signal_eval", evaluation)
+                        signal_eval_logger.write(evaluation)
+                        micro_candidate_emitter.write(evaluation)
                     if options.trade_mode == "live":
                         execution_events = execution.on_book(book, engine.latest_book_features, exchange)
                     else:
@@ -350,6 +553,7 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                         _write_execution_events(recorder, execution_events, options.paper_console)
                     process_time_total_ms += (time.perf_counter() - event_start) * 1000.0
                     if processed % heartbeat_interval == 0:
+                        signal_eval_logger.flush()
                         elapsed = max(0.001, time.perf_counter() - started_perf)
                         heartbeat = {
                             "event": "heartbeat",
@@ -362,26 +566,37 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                             "signal_eval_count": signal_eval_count,
                             "signal_allow_count": signal_allow_count,
                             "signal_reject_count": signal_reject_count,
+                            "micro_candidate_count": micro_candidate_emitter.total_candidates,
+                            "micro_candidate_events": micro_candidate_emitter.emitted_candidates,
                             "execution_events_count": execution_events_count,
                             "last_symbol": book.symbol,
                             "raw_symbol": book.raw_symbol,
                             "ts": book.timestamp.isoformat(),
+                            "websocket_last_receive_at": received_at.isoformat(),
+                            "websocket_seconds_since_last_message": round(
+                                (datetime.now(timezone.utc) - received_at).total_seconds(),
+                                4,
+                            ),
                             **_session_state_to_dict(session_state),
                         }
                         heartbeat.update(execution.heartbeat_metadata())
                         recorder.write("heartbeat", heartbeat)
                         print(json.dumps(heartbeat, ensure_ascii=False))
                     if options.max_events is not None and processed >= options.max_events:
+                        signal_eval_logger.flush()
                         recorder.write("max_events_reached", {"books": processed}, force_flush=True)
                         print(json.dumps({"event": "max_events_reached", "books": processed}, ensure_ascii=False))
                         return 0
             except (RuntimeError, OSError) as exc:
+                signal_eval_logger.flush()
                 recorder.write("live_error", {"error": str(exc), "books": processed}, force_flush=True)
                 print(json.dumps({"event": "live_error", "error": str(exc), "reconnect_seconds": options.reconnect_seconds}, ensure_ascii=False))
                 time.sleep(options.reconnect_seconds)
     except KeyboardInterrupt:
+        signal_eval_logger.flush()
         recorder.write("stopped_by_user", {"books": processed}, force_flush=True)
         print(json.dumps({"event": "stopped_by_user", "books": processed}, ensure_ascii=False))
         return 0
     finally:
+        signal_eval_logger.flush()
         recorder.close()

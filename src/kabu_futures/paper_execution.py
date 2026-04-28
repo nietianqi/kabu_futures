@@ -21,11 +21,13 @@ ExecutionEventType = Literal[
     "execution_reject",
     "execution_skip",
     "live_order_submitted",
+    "live_order_cancelled",
     "live_order_status",
     "live_order_expired",
     "live_order_error",
     "live_position_detected",
     "live_position_flat",
+    "live_trade_closed",
     "live_sync_error",
 ]
 
@@ -109,9 +111,9 @@ class PaperMicroExecutor:
             return [self._reject(signal, book, "non_tradeable_signal")]
         if signal.price is None:
             return [self._reject(signal, book, "missing_signal_price")]
-        if signal.symbol != self.config.symbols.primary:
+        if not self.config.is_trade_symbol(signal.symbol):
             return [self._reject(signal, book, "unsupported_symbol")]
-        if self.position_count() >= self.config.risk.max_positions_per_symbol:
+        if self.position_count(signal.symbol) >= self.config.risk.max_positions_per_symbol:
             return [self._reject(signal, book, "max_positions_per_symbol")]
         if self.pending_order is not None:
             return [self._reject(signal, book, "already_has_pending_order")]
@@ -192,8 +194,11 @@ class PaperMicroExecutor:
             )
         return summaries
 
-    def position_count(self) -> int:
-        return len(self.position_summaries())
+    def position_count(self, symbol: str | None = None) -> int:
+        summaries = self.position_summaries()
+        if symbol is None:
+            return len(summaries)
+        return sum(1 for summary in summaries if summary.get("symbol") == symbol)
 
     def pending_count(self) -> int:
         return 1 if self.pending_order is not None else 0
@@ -205,8 +210,9 @@ class PaperMicroExecutor:
         book: OrderBook,
         entry_signal: Signal | None,
     ) -> ExecutionEvent:
-        pnl_ticks = calculate_pnl_ticks(closed.direction, closed.entry_price, decision.price, self.config.tick_size)
-        pnl_yen = pnl_ticks * closed.qty * self.config.micro225_tick_value
+        tick_size = self.config.tick_size_for(closed.symbol)
+        pnl_ticks = calculate_pnl_ticks(closed.direction, closed.entry_price, decision.price, tick_size)
+        pnl_yen = pnl_ticks * closed.qty * self.config.tick_value_yen_for(closed.symbol)
         self.trades += 1
         self.pnl_ticks += pnl_ticks
         self.pnl_yen += pnl_yen
@@ -304,7 +310,7 @@ class PaperMicroExecutor:
         return []
 
     def _open_position(self, signal: Signal, book: OrderBook, event_time: datetime, reason: str) -> ExecutionEvent:
-        trade_manager = MicroTradeManager(self.config.micro_engine, self.config.tick_size)
+        trade_manager = MicroTradeManager(self.config.micro_engine, self.config.tick_size_for(signal.symbol))
         trade = trade_manager.open_from_signal(signal, event_time, qty=self.config.micro_engine.qty)
         self.trade_slots.append(_PaperMicroSlot(trade_manager, signal))
         return ExecutionEvent(
@@ -354,9 +360,9 @@ class PaperMinuteExecutor:
             return [_reject_signal(signal, book, "non_tradeable_signal")]
         if signal.price is None:
             return [_reject_signal(signal, book, "missing_signal_price")]
-        if signal.symbol != self.config.symbols.primary:
+        if not self.config.is_trade_symbol(signal.symbol):
             return [_reject_signal(signal, book, "unsupported_symbol")]
-        if self.position_count() >= self.config.risk.max_positions_per_symbol:
+        if self.position_count(signal.symbol) >= self.config.risk.max_positions_per_symbol:
             return [_reject_signal(signal, book, "max_positions_per_symbol")]
         return [self._open_position(signal, book_event_time(book), "minute_paper_fill")]
 
@@ -377,35 +383,35 @@ class PaperMinuteExecutor:
             if closed is None:
                 continue
             pnl_ticks = slot.trade_manager.pnl_ticks(closed.direction, closed.entry_price, decision.price)
-            pnl_yen = pnl_ticks * closed.qty * self.config.micro225_tick_value
+            pnl_yen = pnl_ticks * closed.qty * self.config.tick_value_yen_for(closed.symbol)
             self.trades += 1
             self.pnl_ticks += pnl_ticks
             self.pnl_yen += pnl_yen
             events.append(
                 ExecutionEvent(
-                "paper_exit",
-                closed.symbol,
-                closed.direction,
-                qty=closed.qty,
-                entry_price=closed.entry_price,
-                exit_price=decision.price,
-                reason=decision.reason,
-                pnl_ticks=round(pnl_ticks, 4),
-                pnl_yen=round(pnl_yen, 2),
-                timestamp=event_time,
-                metadata={
-                    **event_trace_metadata("position_lifecycle", "exit", decision.reason, checks={"engine": closed.engine}),
-                    "engine": closed.engine,
-                    "emergency": decision.emergency,
-                    "hold_seconds": round((event_time - closed.entry_time).total_seconds(), 3),
-                    "take_profit_price": closed.take_profit_price,
-                    "stop_loss_price": closed.stop_loss_price,
-                    "stop_distance_ticks": closed.stop_distance_ticks,
-                    "take_profit_ticks": closed.take_profit_ticks,
-                    "breakeven_armed": closed.breakeven_armed,
-                    "signal": signal_snapshot(slot.entry_signal) if slot.entry_signal is not None else None,
-                },
-            )
+                    "paper_exit",
+                    closed.symbol,
+                    closed.direction,
+                    qty=closed.qty,
+                    entry_price=closed.entry_price,
+                    exit_price=decision.price,
+                    reason=decision.reason,
+                    pnl_ticks=round(pnl_ticks, 4),
+                    pnl_yen=round(pnl_yen, 2),
+                    timestamp=event_time,
+                    metadata={
+                        **event_trace_metadata("position_lifecycle", "exit", decision.reason, checks={"engine": closed.engine}),
+                        "engine": closed.engine,
+                        "emergency": decision.emergency,
+                        "hold_seconds": round((event_time - closed.entry_time).total_seconds(), 3),
+                        "take_profit_price": closed.take_profit_price,
+                        "stop_loss_price": closed.stop_loss_price,
+                        "stop_distance_ticks": closed.stop_distance_ticks,
+                        "take_profit_ticks": closed.take_profit_ticks,
+                        "breakeven_armed": closed.breakeven_armed,
+                        "signal": signal_snapshot(slot.entry_signal) if slot.entry_signal is not None else None,
+                    },
+                )
             )
         self.trade_slots = active
         return events
@@ -425,8 +431,11 @@ class PaperMinuteExecutor:
             summaries.append(summary)
         return summaries
 
-    def position_count(self) -> int:
-        return len(self.position_summaries())
+    def position_count(self, symbol: str | None = None) -> int:
+        summaries = self.position_summaries()
+        if symbol is None:
+            return len(summaries)
+        return sum(1 for summary in summaries if summary.get("symbol") == symbol)
 
     def stats(self) -> PaperExecutionStats:
         return PaperExecutionStats(self.trades, self.pnl_ticks, self.pnl_yen, 0)
@@ -435,7 +444,7 @@ class PaperMinuteExecutor:
         trade_manager = MinuteTradeManager(
             self.config.minute_engine,
             self.config.micro_engine.qty,
-            self.config.tick_size,
+            self.config.tick_size_for(signal.symbol),
         )
         trade = trade_manager.open_from_signal(signal, event_time, qty=self.config.micro_engine.qty)
         self.trade_slots.append(_PaperMinuteSlot(trade_manager, signal))
@@ -493,13 +502,16 @@ class PaperExecutionController:
                 )
             ]
         if signal.engine == "micro_book":
-            if self._position_count() + self._pending_entry_count() >= self.config.risk.max_positions_per_symbol:
+            if (
+                self._position_count(signal.symbol) + self._pending_entry_count(signal.symbol)
+                >= self.config.risk.max_positions_per_symbol
+            ):
                 return [_reject_signal(signal, book, "max_positions_per_symbol")]
             return self.micro_executor.on_signal(signal, book)
         if signal.engine in PaperMinuteExecutor.SUPPORTED_ENGINES:
             if self.micro_executor.pending_summary() is not None:
                 return [_reject_signal(signal, book, "already_has_pending_order")]
-            if self._position_count() >= self.config.risk.max_positions_per_symbol:
+            if self._position_count(signal.symbol) >= self.config.risk.max_positions_per_symbol:
                 return [_reject_signal(signal, book, "max_positions_per_symbol")]
             return self.minute_executor.on_signal(signal, book)
         return [_reject_signal(signal, book, "unsupported_signal_engine")]
@@ -536,11 +548,14 @@ class PaperExecutionController:
             "paper_minute_pnl_ticks": round(minute_stats.pnl_ticks, 4),
         }
 
-    def _position_count(self) -> int:
-        return self.micro_executor.position_count() + self.minute_executor.position_count()
+    def _position_count(self, symbol: str | None = None) -> int:
+        return self.micro_executor.position_count(symbol) + self.minute_executor.position_count(symbol)
 
-    def _pending_entry_count(self) -> int:
-        return self.micro_executor.pending_count()
+    def _pending_entry_count(self, symbol: str | None = None) -> int:
+        if symbol is None:
+            return self.micro_executor.pending_count()
+        pending = self.micro_executor.pending_summary()
+        return 1 if pending is not None and pending.get("symbol") == symbol else 0
 
 
 def _pending_timeout(max_hold_seconds: int) -> timedelta:

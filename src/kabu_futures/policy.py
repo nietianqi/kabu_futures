@@ -223,6 +223,7 @@ class LiveEntryPolicy:
             "is_tradeable": signal.is_tradeable,
             "symbol": signal.symbol,
             "primary_symbol": self.config.symbols.primary,
+            "trade_symbols": self.config.trade_symbols(),
         }
         if signal.engine not in self.config.live_execution.supported_engines:
             return _live_reject("live_unsupported_signal_engine", "live_supported_engines", checks)
@@ -230,7 +231,7 @@ class LiveEntryPolicy:
             return _live_reject("non_tradeable_signal", "signal_tradeability", checks)
         if signal.price is None:
             return _live_reject("missing_signal_price", "signal_price", checks)
-        if signal.symbol != self.config.symbols.primary:
+        if not self.config.is_trade_symbol(signal.symbol):
             return _live_reject("unsupported_symbol", "symbol", checks)
         if signal.engine in MINUTE_SIGNAL_ENGINES:
             minute_decision = self._evaluate_minute_signal(signal, checks)

@@ -15,6 +15,7 @@ if str(SRC) not in sys.path:
 from kabu_futures.api import KabuApiError, KabuStationClient, build_future_registration_symbols
 from kabu_futures.config import default_config, load_json_config
 from kabu_futures.live import LiveRunOptions, run_live
+from kabu_futures.log_diagnostics import diagnose_log
 from kabu_futures.replay import replay_jsonl
 
 
@@ -90,6 +91,7 @@ def live_loop(args: argparse.Namespace) -> int:
             heartbeat_interval_events=args.heartbeat_events,
             tick_log_mode=args.tick_log_mode,
             tick_log_interval_events=args.tick_log_interval,
+            signal_eval_log_mode=args.signal_eval_log_mode,
             clear_registered_symbols=not args.keep_registered_symbols,
             trade_mode=trade_mode,
             paper_fill_model=args.paper_fill_model,
@@ -107,6 +109,19 @@ def replay_sample(args: argparse.Namespace) -> int:
     replay_path = args.path or ROOT / "data" / "sample_market_data.jsonl"
     for event in replay_jsonl(replay_path, config_path, trade_mode=args.trade_mode):
         print(json.dumps(event, ensure_ascii=False))
+    return 0
+
+
+def diagnose_log_cli(args: argparse.Namespace) -> int:
+    config_path = Path(args.config) if args.config else None
+    config = load_json_config(config_path) if config_path is not None and config_path.exists() else default_config()
+    diagnostics = diagnose_log(args.diagnose_log, config, max_rows=args.diagnose_max_rows)
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (OSError, ValueError):
+            pass
+    print(json.dumps(diagnostics, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -132,6 +147,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exchange", action="append", type=int, dest="exchanges", help="Exchange to register. Default: 23 and 24.")
     parser.add_argument("--replay-sample", action="store_true")
     parser.add_argument("--path", help="JSONL path for --replay-sample.")
+    parser.add_argument("--diagnose-log", help="Stream a live JSONL log and summarize PnL, losses, API errors, and safety issues.")
+    parser.add_argument("--diagnose-max-rows", type=int, help="Optional row limit for --diagnose-log.")
     parser.add_argument("--test", action="store_true")
     parser.add_argument("--register-only", action="store_true", help="Register symbols and exit instead of running the live loop.")
     parser.add_argument("--max-events", type=int, help="Stop live loop after N WebSocket book events.")
@@ -151,6 +168,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print tick snapshots to console. Default: off, so heartbeat/signal/paper/error logs remain readable.",
     )
     parser.add_argument("--tick-log-interval", type=int, default=1, help="Console tick interval when --tick-log-mode sample is used.")
+    parser.add_argument(
+        "--signal-eval-log-mode",
+        choices=("full", "summary", "allow_only", "off"),
+        default="summary",
+        help="Signal evaluation logging. summary aggregates repeated rejects while preserving allow events.",
+    )
     parser.add_argument(
         "--trade-mode",
         choices=("observe", "paper", "live"),
@@ -191,6 +214,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.test:
         return run_tests()
+    if args.diagnose_log:
+        return diagnose_log_cli(args)
     if args.replay_sample:
         return replay_sample(args)
     if args.register_only:

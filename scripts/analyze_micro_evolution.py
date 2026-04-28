@@ -11,11 +11,20 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from kabu_futures.config import load_json_config
-from kabu_futures.evolution import DEFAULT_MARKOUT_SECONDS, analyze_micro_log
+from kabu_futures.evolution import (
+    DEFAULT_ENTRY_FILL_LATENCY_MS,
+    DEFAULT_ENTRY_FILL_SLIPPAGE_TICKS,
+    DEFAULT_MARKOUT_SECONDS,
+    analyze_micro_log,
+)
 
 
 def _float_tuple(value: str) -> tuple[float, ...]:
     return tuple(float(item.strip()) for item in value.split(",") if item.strip())
+
+
+def _int_tuple(value: str) -> tuple[int, ...]:
+    return tuple(int(item.strip()) for item in value.split(",") if item.strip())
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,6 +63,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=75.0,
         help="Rolling percentile threshold used to label high-vol books.",
     )
+    parser.add_argument(
+        "--entry-fill-slippage-grid",
+        default=",".join(str(value) for value in DEFAULT_ENTRY_FILL_SLIPPAGE_TICKS),
+        help="Comma-separated entry slippage ticks for FAK fill simulation, e.g. 0,1,2.",
+    )
+    parser.add_argument(
+        "--entry-fill-latency-ms",
+        default=",".join(str(value) for value in DEFAULT_ENTRY_FILL_LATENCY_MS),
+        help="Comma-separated latency assumptions in milliseconds for FAK fill simulation.",
+    )
+    parser.add_argument(
+        "--diagnostics-max-rows",
+        type=int,
+        default=None,
+        help=(
+            "Limit logged live-diagnostic JSONL rows. Defaults to --max-books for smoke tests; "
+            "use 0 for full-log diagnostics."
+        ),
+    )
     parser.add_argument("--output", help="Optional JSON report path.")
     return parser
 
@@ -71,6 +99,11 @@ def main() -> int:
             "warmup_periods": args.regime_warmup_periods,
             "high_vol_percentile": args.regime_high_vol_percentile,
         },
+        entry_fill_slippage_ticks=_int_tuple(args.entry_fill_slippage_grid),
+        entry_fill_latency_ms=_int_tuple(args.entry_fill_latency_ms),
+        logged_diagnostics_max_rows=args.diagnostics_max_rows
+        if args.diagnostics_max_rows is not None
+        else args.max_books,
     )
     text = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:

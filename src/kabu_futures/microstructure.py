@@ -112,11 +112,12 @@ class BookFeatureEngine:
         latency_ms = self._latency_ms(book, now)
         self.ofi_ewma = self._update_ewma(ofi, event_gap_ms)
         self.abs_ofi_percentile.update(abs(ofi))
-        ofi_threshold = self.abs_ofi_percentile.percentile(70.0)
+        ofi_threshold = self.abs_ofi_percentile.percentile(self.config.ofi_percentile)
         mp = microprice(book)
         edge_ticks = (mp - book.mid_price) / self.tick_size
         spread_ticks = book.spread / self.tick_size
-        jump_detected = self._jump_detected(book, spread_ticks, event_gap_ms, latency_ms)
+        jump_reason = self._jump_reason(book, spread_ticks, event_gap_ms, latency_ms)
+        jump_detected = jump_reason is not None
         self.previous = book
         return BookFeatures(
             timestamp=book.timestamp,
@@ -130,6 +131,7 @@ class BookFeatureEngine:
             microprice_edge_ticks=edge_ticks,
             total_depth=total_depth,
             jump_detected=jump_detected,
+            jump_reason=jump_reason,
             event_gap_ms=event_gap_ms,
             latency_ms=latency_ms,
         )
@@ -155,17 +157,19 @@ class BookFeatureEngine:
             return 0.0
         return max(0.0, (now - book.timestamp).total_seconds() * 1000.0)
 
-    def _jump_detected(self, book: OrderBook, spread_ticks: float, event_gap_ms: float, latency_ms: float) -> bool:
+    def _jump_reason(self, book: OrderBook, spread_ticks: float, event_gap_ms: float, latency_ms: float) -> str | None:
         if spread_ticks > 2.0:
-            return True
-        if event_gap_ms > self.config.websocket_latency_stop_ms:
-            return True
+            return "spread_wide"
         if latency_ms > self.config.websocket_latency_stop_ms:
-            return True
+            return "latency_high"
+        if book.received_at is None and event_gap_ms > self.config.websocket_latency_stop_ms:
+            return "event_gap_high"
         if self.previous is None:
-            return False
+            return None
         mid_move_ticks = abs(book.mid_price - self.previous.mid_price) / self.tick_size
-        return mid_move_ticks > 3.0
+        if mid_move_ticks > 3.0:
+            return "mid_move_jump"
+        return None
 
 
 class TapeFeatureEngine:

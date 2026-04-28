@@ -148,6 +148,7 @@ class BookFeatures:
     microprice_edge_ticks: float
     total_depth: float
     jump_detected: bool = False
+    jump_reason: str | None = None
     event_gap_ms: float = 0.0
     latency_ms: float = 0.0
 
