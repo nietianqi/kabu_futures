@@ -50,8 +50,6 @@ class RiskManager:
             return False, self.state.last_reason or "account_halted"
         if signal.engine == "micro_book" and self.state.micro_halted:
             return False, self.state.last_reason or "micro_halted"
-        if not position.is_flat and position.direction != signal.direction:
-            return False, "opposite_position_exists"
         if position.qty >= self.config.max_micro225_net_qty:
             return False, "max_net_qty"
         return True, "ok"

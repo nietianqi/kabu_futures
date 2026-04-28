@@ -8,6 +8,7 @@ import time
 from typing import Any, Iterable, Iterator
 
 from .models import Level, OrderBook, Signal, SignalEvaluation, TradeTick
+from .serialization import signal_to_dict
 
 
 class MarketDataError(ValueError):
@@ -271,24 +272,6 @@ def trade_tick_to_dict(trade: TradeTick) -> dict[str, Any]:
         "qty": trade.qty,
         "side": trade.side,
         "received_at": _dt(trade.received_at),
-    }
-
-
-def signal_to_dict(signal: Signal) -> dict[str, Any]:
-    return {
-        "engine": signal.engine,
-        "symbol": signal.symbol,
-        "direction": signal.direction,
-        "confidence": signal.confidence,
-        "price": signal.price,
-        "reason": signal.reason,
-        "metadata": signal.metadata,
-        "score": signal.score,
-        "signal_horizon": signal.signal_horizon,
-        "expected_hold_seconds": signal.expected_hold_seconds,
-        "risk_budget_pct": signal.risk_budget_pct,
-        "veto_reason": signal.veto_reason,
-        "position_scale": signal.position_scale,
     }
 
 

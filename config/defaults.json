@@ -16,9 +16,9 @@
     "take_profit_r": 1.5,
     "breakeven_after_r": 1.0,
     "max_hold_minutes": 45,
-    "trend_pullback_long_observe_only": true,
-    "trend_pullback_short_observe_only": true,
-    "directional_intraday_long_observe_only": true
+    "trend_pullback_long_observe_only": false,
+    "trend_pullback_short_observe_only": false,
+    "directional_intraday_long_observe_only": false
   },
   "micro_engine": {
     "mode": "observe_only",
@@ -29,7 +29,7 @@
     "imbalance_exit": 0.1,
     "microprice_entry_ticks": 0.15,
     "spread_ticks_required": 1,
-    "take_profit_ticks": 2,
+    "take_profit_ticks": 1,
     "stop_loss_ticks": 3,
     "time_stop_seconds": 20,
     "max_hold_seconds": 30,
@@ -57,7 +57,7 @@
     "max_order_qty": 1,
     "supported_engines": ["micro_book"],
     "entry_time_in_force": 2,
-    "exit_time_in_force": 2,
+    "exit_time_in_force": 1,
     "position_poll_interval_seconds": 1.0,
     "max_pending_entry_seconds": 8
   },
@@ -112,7 +112,8 @@
   "risk": {
     "account_daily_loss_pct": 1.0,
     "account_daily_loss_r": 3.0,
-    "max_micro225_net_qty": 3,
+    "max_micro225_net_qty": 5,
+    "max_positions_per_symbol": 5,
     "margin_buffer_ratio": 1.5,
     "directional_risk_per_trade_pct_min": 0.25,
     "directional_risk_per_trade_pct_max": 0.4,

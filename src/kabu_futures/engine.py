@@ -22,8 +22,8 @@ from .models import (
     StrategyIntent,
 )
 from .multitimeframe import MultiTimeframeScorer
+from .policy import StrategyEntryPolicy
 from .risk import OrderThrottle, RiskManager
-from .sessions import SessionState, classify_jst_session, time_in_jst_window
 from .strategies import MicroStrategyEngine, MinuteStrategyEngine
 
 
@@ -46,6 +46,7 @@ class DualStrategyEngine:
             self.config.micro_engine.min_order_interval_seconds,
             self.config.micro_engine.max_new_entries_per_minute,
         )
+        self.entry_policy = StrategyEntryPolicy(self.config, self.risk, self.throttle)
         self.bar_builder_1m = BarBuilder(60)
         self.nt_spread = NTRatioSpreadEngine(self.config.nt_spread)
         self.lead_lag = USJapanLeadLagScorer(self.config.lead_lag)
@@ -89,26 +90,25 @@ class DualStrategyEngine:
                 mtf_score = self.multi_timeframe.score(minute_signal.direction, minute_signal=minute_signal, book_features=latest_features)
                 intent = self._alpha_intent(minute_signal, mtf_score)
                 scored_minute_signal = self._with_strategy_metadata(minute_signal, mtf_score, intent)
-                allowed, reason = self._validate_signal(scored_minute_signal, mtf_score, intent)
-                block_reason, session_state, block_window = self._new_entry_block(closed_bar.end)
-                observe_reason = self._minute_observe_only_reason(scored_minute_signal)
-                if allowed and block_reason is None and observe_reason is None:
-                    signals.append(scored_minute_signal)
+                decision = self.entry_policy.evaluate_minute(
+                    scored_minute_signal,
+                    closed_bar.end,
+                    mtf_score,
+                    intent,
+                    self.position,
+                )
+                if decision.allowed:
+                    signals.append(_with_extra_metadata(scored_minute_signal, decision.merged_metadata))
                 else:
                     metadata = dict(scored_minute_signal.metadata)
-                    if block_reason is not None:
-                        reason = block_reason
-                        metadata.update(_session_metadata(session_state, block_window))
-                    elif observe_reason is not None:
-                        reason = observe_reason
-                        metadata["observe_only_signal"] = True
+                    metadata.update(decision.merged_metadata)
                     signals.append(
                         Signal(
                             "risk",
                             minute_signal.symbol,
                             "flat",
                             0.0,
-                            reason=reason,
+                            reason=decision.reason,
                             score=0,
                             signal_horizon="system",
                             metadata=metadata,
@@ -125,36 +125,23 @@ class DualStrategyEngine:
             )
             self.latest_signal_evaluations.append(micro_evaluation)
             if micro_signal is not None:
-                throttle_ok, throttle_reason = self.throttle.allow(book.timestamp)
                 mtf_score = self.multi_timeframe.score(micro_signal.direction, book_features=latest_features)
                 intent = self._alpha_intent(micro_signal, mtf_score)
                 scored_micro_signal = self._with_strategy_metadata(micro_signal, mtf_score, intent)
-                mtf_ok, mtf_reason = self._validate_mtf_score(mtf_score, require_execution=True)
-                risk_ok, risk_reason = self.risk.validate_signal(scored_micro_signal, self.position)
-                alpha_ok = intent.allowed
-                block_reason, session_state, block_window = self._new_entry_block(book.timestamp)
-                session_ok = block_reason is None
-                evaluation_metadata = dict(micro_evaluation.metadata)
-                evaluation_metadata.update(
-                    {
-                        "throttle_ok": throttle_ok,
-                        "throttle_reason": throttle_reason,
-                        "mtf_ok": mtf_ok,
-                        "mtf_reason": mtf_reason,
-                        "risk_ok": risk_ok,
-                        "risk_reason": risk_reason,
-                        "alpha_ok": alpha_ok,
-                        "alpha_reason": intent.veto_reason or intent.reason,
-                        "session_ok": session_ok,
-                        "session_reason": block_reason or "ok",
-                        **_session_metadata(session_state, block_window),
-                    }
+                decision = self.entry_policy.evaluate_micro(
+                    scored_micro_signal,
+                    book.timestamp,
+                    mtf_score,
+                    intent,
+                    self.position,
                 )
+                evaluation_metadata = dict(micro_evaluation.metadata)
+                evaluation_metadata.update(decision.merged_metadata)
                 evaluation_metadata.update(mtf_score.as_metadata())
                 evaluation_metadata.update(intent.as_metadata())
-                if session_ok and throttle_ok and mtf_ok and risk_ok and alpha_ok:
+                if decision.allowed:
                     self.throttle.record(book.timestamp)
-                    signals.append(scored_micro_signal)
+                    signals.append(_with_extra_metadata(scored_micro_signal, decision.merged_metadata))
                     self.latest_signal_evaluations[-1] = replace(
                         micro_evaluation,
                         decision="allow",
@@ -164,37 +151,14 @@ class DualStrategyEngine:
                     )
                 else:
                     risk_metadata = dict(scored_micro_signal.metadata)
-                    risk_metadata.update(_session_metadata(session_state, block_window))
-                    reject_stage = (
-                        "session_filter"
-                        if not session_ok
-                        else "throttle"
-                        if not throttle_ok
-                        else "multi_timeframe"
-                        if not mtf_ok
-                        else "risk"
-                        if not risk_ok
-                        else "alpha_stack"
-                    )
-                    reason = (
-                        block_reason
-                        if not session_ok
-                        else throttle_reason
-                        if not throttle_ok
-                        else mtf_reason
-                        if not mtf_ok
-                        else risk_reason
-                        if not risk_ok
-                        else intent.veto_reason or intent.reason
-                    )
-                    evaluation_metadata["reject_stage"] = reject_stage
+                    risk_metadata.update(decision.merged_metadata)
                     signals.append(
                         Signal(
                             "risk",
                             book.symbol,
                             "flat",
                             0.0,
-                            reason=reason,
+                            reason=decision.reason,
                             score=0,
                             signal_horizon="system",
                             metadata=risk_metadata,
@@ -203,41 +167,17 @@ class DualStrategyEngine:
                     self.latest_signal_evaluations[-1] = replace(
                         micro_evaluation,
                         decision="reject",
-                        reason=reason,
+                        reason=decision.reason,
                         candidate_direction=micro_signal.direction,
                         metadata=evaluation_metadata,
                     )
         return signals
 
-    def _new_entry_block(self, timestamp: datetime) -> tuple[str | None, SessionState, str | None]:
-        session_state = classify_jst_session(timestamp, self.config.session_schedule)
-        if not session_state.new_entries_allowed:
-            return "session_not_tradeable", session_state, None
-        for window in self.config.micro_engine.no_new_entry_windows_jst:
-            if time_in_jst_window(timestamp, window):
-                return "session_not_tradeable", session_state, window
-        return None, session_state, None
+    def _new_entry_block(self, timestamp: datetime):
+        return self.entry_policy.new_entry_block(timestamp)
 
     def _minute_observe_only_reason(self, signal: Signal) -> str | None:
-        if (
-            self.config.minute_engine.trend_pullback_long_observe_only
-            and signal.engine == "minute_vwap"
-            and signal.reason == "trend_pullback_long"
-        ):
-            return "trend_pullback_long_observe_only"
-        if (
-            self.config.minute_engine.trend_pullback_short_observe_only
-            and signal.engine == "minute_vwap"
-            and signal.reason == "trend_pullback_short"
-        ):
-            return "trend_pullback_short_observe_only"
-        if (
-            self.config.minute_engine.directional_intraday_long_observe_only
-            and signal.engine == "directional_intraday"
-            and signal.direction == "long"
-        ):
-            return "directional_intraday_long_observe_only"
-        return None
+        return self.entry_policy.minute_observe_only_reason(signal)
 
     def _update_latest_price(self, symbol: str, price: float, timestamp: datetime) -> None:
         self.latest_prices[symbol] = price
@@ -259,15 +199,7 @@ class DualStrategyEngine:
         return self.risk.validate_signal(signal, self.position)
 
     def _validate_mtf_score(self, score: MultiTimeframeScore, require_execution: bool) -> tuple[bool, str]:
-        if score.veto_reason is not None:
-            return False, score.veto_reason
-        if score.total_score < self.config.multi_timeframe.min_total_score_to_trade:
-            return False, "multi_timeframe_score_below_threshold"
-        if require_execution and score.execution_score < self.config.multi_timeframe.min_execution_score_to_chase:
-            return False, "execution_score_below_threshold"
-        if score.position_scale == "none":
-            return False, "position_scale_none"
-        return True, "ok"
+        return self.entry_policy.validate_mtf_score(score, require_execution)
 
     def _alpha_intent(self, signal: Signal, score: MultiTimeframeScore) -> StrategyIntent:
         external_score = self.lead_lag.score(signal.direction)
@@ -300,13 +232,21 @@ class DualStrategyEngine:
         )
 
 
-def _session_metadata(session_state: SessionState, extra_window: str | None = None) -> dict[str, object]:
-    metadata: dict[str, object] = {
-        "session_phase": session_state.phase,
-        "session_window_jst": session_state.window_jst,
-        "new_entries_allowed": session_state.new_entries_allowed and extra_window is None,
-        "api_window_status": session_state.api_window_status,
-    }
-    if extra_window is not None:
-        metadata["no_new_entry_window_jst"] = extra_window
-    return metadata
+def _with_extra_metadata(signal: Signal, extra_metadata: dict[str, object]) -> Signal:
+    metadata = dict(signal.metadata)
+    metadata.update(extra_metadata)
+    return Signal(
+        signal.engine,
+        signal.symbol,
+        signal.direction,
+        signal.confidence,
+        signal.price,
+        signal.reason,
+        metadata,
+        signal.score,
+        signal.signal_horizon,
+        signal.expected_hold_seconds,
+        signal.risk_budget_pct,
+        signal.veto_reason,
+        signal.position_scale,
+    )
