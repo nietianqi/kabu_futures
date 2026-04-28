@@ -44,9 +44,13 @@ def live_startup_self_check(config: StrategyConfig) -> dict[str, object]:
         "min_execution_score_to_chase": config.multi_timeframe.min_execution_score_to_chase,
         "live_supported_engines": config.live_execution.supported_engines,
         "live_safety": {
+            "max_positions_per_symbol": config.live_execution.max_positions_per_symbol,
             "minute_cooldown_seconds": config.live_execution.minute_cooldown_seconds,
             "micro_loss_pause_seconds": config.live_execution.micro_loss_pause_seconds,
             "max_consecutive_micro_small_losses": config.live_execution.max_consecutive_micro_small_losses,
+            "loss_hold_guard_ticks": config.live_execution.loss_hold_guard_ticks,
+            "daily_loss_limit_yen": config.live_execution.daily_loss_limit_yen,
+            "kill_switch_enabled": config.live_execution.kill_switch_enabled,
         },
     }
 

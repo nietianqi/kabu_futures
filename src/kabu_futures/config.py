@@ -40,6 +40,7 @@ class MicroEngineConfig:
     imbalance_entry: float = 0.30
     imbalance_exit: float = 0.10
     microprice_entry_ticks: float = 0.15
+    ofi_percentile: float = 70.0
     spread_ticks_required: int = 1
     take_profit_ticks: int = 1
     stop_loss_ticks: int = 3
@@ -71,6 +72,7 @@ class SessionScheduleConfig:
 @dataclass(frozen=True)
 class LiveExecutionConfig:
     max_order_qty: int = 1
+    max_positions_per_symbol: int = 1
     supported_engines: tuple[str, ...] = ("micro_book", "minute_orb", "minute_vwap", "directional_intraday")
     entry_slippage_ticks: int = 0
     entry_time_in_force: int = 2
@@ -84,6 +86,13 @@ class LiveExecutionConfig:
     minute_cooldown_seconds: int = 180
     micro_loss_pause_seconds: int = 300
     max_consecutive_micro_small_losses: int = 3
+    loss_hold_guard_ticks: float = 15.0
+    daily_loss_limit_yen: float = 5000.0
+    api_error_cooldown_seconds: int = 30
+    cancel_pending_entry_on_timeout: bool = True
+    kill_switch_enabled: bool = False
+    commission_yen_per_order: float = 0.0
+    assumed_slippage_ticks_per_trade: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -219,6 +228,8 @@ class StrategyConfig:
             raise ValueError(
                 f"imbalance_entry ({m.imbalance_entry}) must be greater than imbalance_exit ({m.imbalance_exit})"
             )
+        if not 0.0 <= m.ofi_percentile <= 100.0:
+            raise ValueError(f"micro_engine.ofi_percentile must be between 0 and 100, got {m.ofi_percentile}")
         if m.stop_loss_ticks <= 0:
             raise ValueError(f"stop_loss_ticks must be positive, got {m.stop_loss_ticks}")
         if m.take_profit_ticks <= 0:
@@ -231,6 +242,11 @@ class StrategyConfig:
             raise ValueError(
                 "live_execution.position_poll_interval_seconds must be positive, "
                 f"got {self.live_execution.position_poll_interval_seconds}"
+            )
+        if self.live_execution.max_positions_per_symbol <= 0:
+            raise ValueError(
+                "live_execution.max_positions_per_symbol must be positive, "
+                f"got {self.live_execution.max_positions_per_symbol}"
             )
         if self.live_execution.max_pending_entry_seconds <= 0:
             raise ValueError(
@@ -270,6 +286,31 @@ class StrategyConfig:
             raise ValueError(
                 "live_execution.max_consecutive_micro_small_losses must be positive, "
                 f"got {self.live_execution.max_consecutive_micro_small_losses}"
+            )
+        if self.live_execution.loss_hold_guard_ticks < 0:
+            raise ValueError(
+                "live_execution.loss_hold_guard_ticks must be non-negative, "
+                f"got {self.live_execution.loss_hold_guard_ticks}"
+            )
+        if self.live_execution.daily_loss_limit_yen < 0:
+            raise ValueError(
+                "live_execution.daily_loss_limit_yen must be non-negative, "
+                f"got {self.live_execution.daily_loss_limit_yen}"
+            )
+        if self.live_execution.api_error_cooldown_seconds < 0:
+            raise ValueError(
+                "live_execution.api_error_cooldown_seconds must be non-negative, "
+                f"got {self.live_execution.api_error_cooldown_seconds}"
+            )
+        if self.live_execution.commission_yen_per_order < 0:
+            raise ValueError(
+                "live_execution.commission_yen_per_order must be non-negative, "
+                f"got {self.live_execution.commission_yen_per_order}"
+            )
+        if self.live_execution.assumed_slippage_ticks_per_trade < 0:
+            raise ValueError(
+                "live_execution.assumed_slippage_ticks_per_trade must be non-negative, "
+                f"got {self.live_execution.assumed_slippage_ticks_per_trade}"
             )
         if self.risk.max_positions_per_symbol <= 0:
             raise ValueError(f"max_positions_per_symbol must be positive, got {self.risk.max_positions_per_symbol}")

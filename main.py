@@ -116,6 +116,11 @@ def diagnose_log_cli(args: argparse.Namespace) -> int:
     config_path = Path(args.config) if args.config else None
     config = load_json_config(config_path) if config_path is not None and config_path.exists() else default_config()
     diagnostics = diagnose_log(args.diagnose_log, config, max_rows=args.diagnose_max_rows)
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (OSError, ValueError):
+            pass
     print(json.dumps(diagnostics, ensure_ascii=False, indent=2))
     return 0
 

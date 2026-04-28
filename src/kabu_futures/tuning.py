@@ -13,8 +13,9 @@ from .models import OrderBook
 from .paper_execution import ExecutionEvent, PaperExecutionController, PaperFillModel
 
 
-DEFAULT_IMBALANCE_GRID = (0.18, 0.20, 0.22, 0.25, 0.30)
-DEFAULT_MICROPRICE_GRID = (0.10, 0.12, 0.15)
+DEFAULT_IMBALANCE_GRID = (0.28, 0.26, 0.24)
+DEFAULT_MICROPRICE_GRID = (0.12, 0.10)
+DEFAULT_OFI_PERCENTILE_GRID = (70.0, 65.0, 60.0)
 DEFAULT_SPREAD_GRID = (1,)
 
 
@@ -41,6 +42,7 @@ def evaluate_micro_config(
     paper_events: Counter[str] = Counter()
     exit_reasons: Counter[str] = Counter()
     exits: list[ExecutionEvent] = []
+    tradeable_micro_signals = 0
     processed = 0
 
     for book in books:
@@ -59,6 +61,7 @@ def evaluate_micro_config(
             signal_counts[f"{signal.engine}:{signal.direction}:{signal.reason}"] += 1
             if signal.engine != "micro_book" or not signal.is_tradeable:
                 continue
+            tradeable_micro_signals += 1
             for event in execution.on_signal(signal, book):
                 paper_events[event.event_type] += 1
                 if event.event_type == "paper_exit":
@@ -69,6 +72,7 @@ def evaluate_micro_config(
     trades = len(pnl_values)
     wins = sum(1 for value in pnl_values if value > 0)
     net = sum(pnl_values)
+    paper_entries = int(paper_events.get("paper_entry", 0))
     return {
         "parameters": dict(parameters),
         "books": processed,
@@ -77,6 +81,9 @@ def evaluate_micro_config(
         "signals": dict(signal_counts),
         "paper_events": dict(paper_events),
         "exit_reasons": dict(exit_reasons),
+        "tradeable_micro_signals": tradeable_micro_signals,
+        "paper_entries": paper_entries,
+        "simulated_fill_rate": round(paper_entries / tradeable_micro_signals, 4) if tradeable_micro_signals else 0.0,
         "trades": trades,
         "win_rate": round(wins / trades, 4) if trades else 0.0,
         "net_pnl_ticks": round(net, 4),
@@ -90,33 +97,39 @@ def tune_micro_params(
     config: StrategyConfig,
     imbalance_grid: Iterable[float] = DEFAULT_IMBALANCE_GRID,
     microprice_grid: Iterable[float] | None = None,
+    ofi_percentile_grid: Iterable[float] | None = None,
     spread_grid: Iterable[int] | None = None,
     max_books: int | None = None,
     min_trades: int = 20,
-    max_drawdown_worsen_ratio: float = 0.25,
+    max_drawdown_worsen_ratio: float = 0.20,
+    min_fill_rate: float = 0.70,
     paper_fill_model: PaperFillModel = "immediate",
 ) -> dict[str, object]:
     imbalance_values = tuple(float(value) for value in imbalance_grid)
     microprice_values = tuple(float(value) for value in (microprice_grid or DEFAULT_MICROPRICE_GRID))
+    ofi_percentile_values = tuple(float(value) for value in (ofi_percentile_grid or (config.micro_engine.ofi_percentile,)))
     spread_values = tuple(int(value) for value in (spread_grid or DEFAULT_SPREAD_GRID))
     books = load_books(path, max_books=max_books)
     baseline_parameters = {
         "imbalance_entry": config.micro_engine.imbalance_entry,
         "microprice_entry_ticks": config.micro_engine.microprice_entry_ticks,
+        "ofi_percentile": config.micro_engine.ofi_percentile,
         "spread_ticks_required": config.micro_engine.spread_ticks_required,
     }
     baseline = evaluate_micro_config(books, config, baseline_parameters, paper_fill_model=paper_fill_model)
 
     candidates: list[dict[str, object]] = []
     invalid_combos: list[dict[str, object]] = []
-    for imbalance_entry, microprice_entry_ticks, spread_ticks_required in product(
+    for imbalance_entry, microprice_entry_ticks, ofi_percentile, spread_ticks_required in product(
         imbalance_values,
         microprice_values,
+        ofi_percentile_values,
         spread_values,
     ):
         parameters = {
             "imbalance_entry": imbalance_entry,
             "microprice_entry_ticks": microprice_entry_ticks,
+            "ofi_percentile": ofi_percentile,
             "spread_ticks_required": spread_ticks_required,
         }
         try:
@@ -126,6 +139,7 @@ def tune_micro_params(
                     config.micro_engine,
                     imbalance_entry=imbalance_entry,
                     microprice_entry_ticks=microprice_entry_ticks,
+                    ofi_percentile=ofi_percentile,
                     spread_ticks_required=spread_ticks_required,
                 ),
             )
@@ -139,7 +153,7 @@ def tune_micro_params(
     ranked = sorted(candidates, key=_rank_key, reverse=True)
     valid = [candidate for candidate in ranked if int(candidate["trades"]) >= min_trades]
     best = valid[0] if valid else (ranked[0] if ranked else None)
-    recommendation = _recommend_candidate(baseline, ranked, min_trades, max_drawdown_worsen_ratio)
+    recommendation = _recommend_candidate(baseline, ranked, min_trades, max_drawdown_worsen_ratio, min_fill_rate)
     decision = "recommended" if recommendation["decision"] == "recommended" else "no_change"
     return {
         "source": str(path),
@@ -147,10 +161,12 @@ def tune_micro_params(
         "grid": {
             "imbalance_entry": list(imbalance_values),
             "microprice_entry_ticks": list(microprice_values),
+            "ofi_percentile": list(ofi_percentile_values),
             "spread_ticks_required": list(spread_values),
         },
         "min_trades": min_trades,
         "max_drawdown_worsen_ratio": max_drawdown_worsen_ratio,
+        "min_fill_rate": min_fill_rate,
         "baseline": baseline,
         "candidates": ranked,
         "invalid_combos": invalid_combos,
@@ -158,7 +174,7 @@ def tune_micro_params(
         "best_safe_candidate": recommendation["candidate"] if recommendation["decision"] == "recommended" else None,
         "recommendation": recommendation,
         "decision": decision,
-        "note": "Candidate parameters are report-only and never overwrite config/local.json.",
+        "note": "Candidate parameters are report-only and never overwrite config/local.json or live rules.",
     }
 
 
@@ -213,10 +229,11 @@ def _recommend_candidate(
     ranked: list[dict[str, object]],
     min_trades: int,
     max_drawdown_worsen_ratio: float,
+    min_fill_rate: float,
 ) -> dict[str, object]:
     for candidate in ranked:
-        checks = _recommendation_checks(baseline, candidate, min_trades, max_drawdown_worsen_ratio)
-        if all(checks.values()):
+        checks = _recommendation_checks(baseline, candidate, min_trades, max_drawdown_worsen_ratio, min_fill_rate)
+        if _passes_candidate_gates(checks):
             return {
                 "decision": "recommended",
                 "candidate": candidate,
@@ -231,13 +248,13 @@ def _recommend_candidate(
                 "manual_confirmation_required": True,
             }
     diagnostic = ranked[0] if ranked else None
-    checks = _recommendation_checks(baseline, diagnostic, min_trades, max_drawdown_worsen_ratio) if diagnostic else {}
+    checks = _recommendation_checks(baseline, diagnostic, min_trades, max_drawdown_worsen_ratio, min_fill_rate) if diagnostic else {}
     return {
         "decision": "diagnostic_only",
         "candidate": diagnostic,
         "checks": checks,
         "manual_confirmation_required": True,
-        "reason": "No grid candidate passed the safety gates for trades, PnL, average PnL, and drawdown.",
+        "reason": "No grid candidate passed the safety gates for 2x trades, net PnL, drawdown, and simulated fill rate.",
     }
 
 
@@ -246,18 +263,27 @@ def _recommendation_checks(
     candidate: dict[str, object] | None,
     min_trades: int,
     max_drawdown_worsen_ratio: float,
+    min_fill_rate: float,
 ) -> dict[str, bool]:
     if candidate is None:
         return {
             "trades_increase": False,
+            "trade_opportunity_2x": False,
             "min_trades": False,
+            "net_pnl_not_worse": False,
             "net_pnl_improved": False,
             "avg_pnl_not_worse": False,
             "drawdown_not_materially_worse": False,
+            "simulated_fill_rate_ok": False,
         }
+    baseline_trades = int(baseline["trades"])
+    candidate_trades = int(candidate["trades"])
+    candidate_fill_rate = float(candidate.get("simulated_fill_rate", 1.0))
     return {
-        "trades_increase": int(candidate["trades"]) > int(baseline["trades"]),
-        "min_trades": int(candidate["trades"]) >= min_trades,
+        "trades_increase": candidate_trades > baseline_trades,
+        "trade_opportunity_2x": candidate_trades >= max(1, baseline_trades * 2),
+        "min_trades": candidate_trades >= min_trades,
+        "net_pnl_not_worse": float(candidate["net_pnl_ticks"]) >= float(baseline["net_pnl_ticks"]),
         "net_pnl_improved": float(candidate["net_pnl_ticks"]) > float(baseline["net_pnl_ticks"]),
         "avg_pnl_not_worse": float(candidate["avg_pnl_ticks"]) >= float(baseline["avg_pnl_ticks"]),
         "drawdown_not_materially_worse": _drawdown_not_materially_worse(
@@ -265,7 +291,19 @@ def _recommendation_checks(
             float(candidate["max_drawdown_ticks"]),
             max_drawdown_worsen_ratio,
         ),
+        "simulated_fill_rate_ok": candidate_fill_rate >= min_fill_rate,
     }
+
+
+def _passes_candidate_gates(checks: dict[str, bool]) -> bool:
+    required = (
+        "trade_opportunity_2x",
+        "min_trades",
+        "net_pnl_not_worse",
+        "drawdown_not_materially_worse",
+        "simulated_fill_rate_ok",
+    )
+    return all(bool(checks.get(key)) for key in required)
 
 
 def _drawdown_not_materially_worse(baseline_drawdown: float, candidate_drawdown: float, worsen_ratio: float) -> bool:

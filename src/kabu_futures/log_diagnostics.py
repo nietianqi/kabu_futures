@@ -5,7 +5,10 @@ import json
 from pathlib import Path
 from typing import Any, Iterator
 
+from .api import classify_kabu_api_error
 from .config import StrategyConfig, default_config
+from .diagnostics_scoring import live_readiness_score
+from .micro_candidates import near_miss_key
 
 
 LOSS_SAMPLE_LIMIT = 200
@@ -20,6 +23,7 @@ def diagnose_log(source: str | Path, config: StrategyConfig | None = None, max_r
         "rows": 0,
         "events": Counter(),
         "api_errors": Counter(),
+        "api_error_categories": Counter(),
         "expired_orders": Counter(),
         "symbol_mapping_issues": Counter(),
         "minute_live_filter_violations": 0,
@@ -31,15 +35,32 @@ def diagnose_log(source: str | Path, config: StrategyConfig | None = None, max_r
         "signal_eval_engines": Counter(),
         "signal_eval_reject_reasons": Counter(),
         "signal_eval_failed_checks": Counter(),
+        "signal_eval_jump_reasons": Counter(),
+        "near_miss_from_signal_eval": 0,
+        "near_miss_missing_checks": Counter(),
+        "near_miss_directions": Counter(),
+        "micro_candidate_events": 0,
+        "micro_candidate_count": 0,
+        "micro_candidate_missing_checks": Counter(),
+        "micro_candidate_directions": Counter(),
+        "live_signals_by_engine": Counter(),
+        "live_tradeable_signals_by_engine": Counter(),
         "execution_rejects": Counter(),
         "execution_reject_blocked_by": Counter(),
+        "position_sync_blocked_rejects": 0,
         "live_unsupported_minute_signals": 0,
         "live_entry_orders_submitted": 0,
+        "live_entry_orders_submitted_by_engine": Counter(),
+        "live_entry_orders_cancelled": 0,
         "live_entry_orders_expired": 0,
         "live_entry_order_errors": 0,
         "live_positions_detected": 0,
         "live_trades_closed": 0,
         "live_exit_orders_submitted": 0,
+        "live_exit_orders_cancelled": 0,
+        "loss_hold_guard_events": 0,
+        "kill_switch_events": 0,
+        "order_latency_ms": defaultdict(list),
         "suspected_old_live_policy": False,
     }
     pnl_by_engine: dict[str, dict[str, float]] = defaultdict(_pnl_bucket)
@@ -66,17 +87,32 @@ def diagnose_log(source: str | Path, config: StrategyConfig | None = None, max_r
             _record_startup(payload, counters)
         if kind in {"signal_eval", "signal_eval_summary"} or event in {"signal_eval", "signal_eval_summary"}:
             _record_signal_evaluation(payload, counters)
+        if event == "micro_candidate" or kind == "micro_candidate":
+            _record_micro_candidate(payload, metadata, counters)
+        if event == "signal" or kind == "signal":
+            _record_signal(payload, metadata, counters)
         if event == "execution_reject":
             _record_execution_reject(payload, metadata, counters)
         if event in {"live_order_error", "live_sync_error", "market_data_error", "live_error"}:
             _record_error(payload, metadata, counters)
+        _record_order_timing(payload, metadata, counters)
         if event == "live_order_expired":
             counters["expired_orders"][str(payload.get("reason") or metadata.get("reason") or "unknown")] += 1
             if str(payload.get("reason") or "").startswith("entry_order_"):
                 counters["live_entry_orders_expired"] += 1
+        if event == "live_order_cancelled":
+            if metadata.get("is_entry") is False:
+                counters["live_exit_orders_cancelled"] += 1
+            else:
+                counters["live_entry_orders_cancelled"] += 1
+        if str(payload.get("reason") or "") == "loss_hold_guard_active":
+            counters["loss_hold_guard_events"] += 1
+        if str(payload.get("reason") or "") == "kill_switch_active":
+            counters["kill_switch_events"] += 1
 
         if event == "live_order_submitted" and payload.get("reason") == "entry_limit_fak_submitted":
             counters["live_entry_orders_submitted"] += 1
+            counters["live_entry_orders_submitted_by_engine"][_signal_engine(payload, metadata)] += 1
             _remember_entry_signal(payload, metadata, entry_signals_by_key)
         if event == "live_order_submitted" and payload.get("reason") == "exit_order_submitted":
             counters["live_exit_orders_submitted"] += 1
@@ -98,6 +134,7 @@ def diagnose_log(source: str | Path, config: StrategyConfig | None = None, max_r
                 pnl_by_engine,
                 pnl_by_exit_reason,
                 counters,
+                cfg,
             )
         _record_symbol_mapping_issue(event, metadata, counters, symbol_issue_samples)
         if _is_minute_live_filter_violation(event, payload, metadata, cfg):
@@ -105,7 +142,7 @@ def diagnose_log(source: str | Path, config: StrategyConfig | None = None, max_r
             counters["suspected_old_live_policy"] = True
         if event == "live_trade_closed":
             counters["live_trades_closed"] += 1
-            _record_closed_trade(payload, metadata, pnl_by_engine, pnl_by_exit_reason, counters)
+            _record_closed_trade(payload, metadata, pnl_by_engine, pnl_by_exit_reason, counters, cfg)
             exit_order_id = str(metadata.get("exit_order_id") or "")
             if exit_order_id:
                 recorded_exit_order_ids.add(exit_order_id)
@@ -120,11 +157,14 @@ def diagnose_log(source: str | Path, config: StrategyConfig | None = None, max_r
         "loss_samples": counters["loss_samples"],
         "loss_sample_limit": counters["loss_sample_limit"],
         "api_errors": dict(counters["api_errors"]),
+        "api_error_categories": dict(counters["api_error_categories"]),
         "expired_orders": dict(counters["expired_orders"]),
         "symbol_mapping_issues": dict(counters["symbol_mapping_issues"]),
         "symbol_issue_samples": symbol_issue_samples[:20],
         "minute_live_filter_violations": counters["minute_live_filter_violations"],
         "micro_entry_funnel": _micro_entry_funnel(counters),
+        "execution_latency_ms": _latency_summary(counters["order_latency_ms"]),
+        "live_readiness_score": live_readiness_score(counters, cfg),
         "startup_checks": counters["startup_checks"],
         "diagnosis_notes": _diagnosis_notes(counters),
         "suspected_old_live_policy": bool(counters["suspected_old_live_policy"]),
@@ -176,11 +216,39 @@ def _record_startup(payload: dict[str, Any], counters: dict[str, Any]) -> None:
 def _record_error(payload: dict[str, Any], metadata: dict[str, Any], counters: dict[str, Any]) -> None:
     reason = str(payload.get("reason") or metadata.get("reason") or payload.get("event") or "unknown")
     counters["api_errors"][reason] += 1
-    if reason.startswith("entry_order_"):
+    payload_body = metadata.get("order_payload")
+    trade_type = _to_float(payload_body.get("TradeType")) if isinstance(payload_body, dict) else None
+    if reason.startswith("entry_order_") or trade_type == 1:
         counters["live_entry_order_errors"] += 1
     error = metadata.get("error") or payload.get("error")
+    category = str(metadata.get("api_error_category") or metadata.get("category") or classify_kabu_api_error(error or reason))
+    counters["api_error_categories"][category] += 1
     if error:
         counters["api_errors"][f"error:{str(error)[:120]}"] += 1
+
+
+def _record_order_timing(payload: dict[str, Any], metadata: dict[str, Any], counters: dict[str, Any]) -> None:
+    for key in (
+        "signal_to_order_send_ms",
+        "order_send_to_api_response_ms",
+        "order_send_to_status_ms",
+        "fill_to_position_visible_ms",
+        "order_send_to_position_visible_ms",
+    ):
+        value = _to_float(metadata.get(key))
+        if value is not None:
+            counters["order_latency_ms"][key].append(value)
+
+
+def _record_signal(payload: dict[str, Any], metadata: dict[str, Any], counters: dict[str, Any]) -> None:
+    engine = _signal_engine(payload, metadata)
+    counters["live_signals_by_engine"][engine] += 1
+    direction = str(payload.get("direction") or _nested(metadata, "signal", "direction") or "")
+    confidence = _to_float(payload.get("confidence"))
+    if confidence is None:
+        confidence = _to_float(_nested(metadata, "signal", "confidence"))
+    if direction in {"long", "short"} and (confidence is None or confidence > 0):
+        counters["live_tradeable_signals_by_engine"][engine] += 1
 
 
 def _record_signal_evaluation(payload: dict[str, Any], counters: dict[str, Any]) -> None:
@@ -195,12 +263,37 @@ def _record_signal_evaluation(payload: dict[str, Any], counters: dict[str, Any])
         metadata = _signal_eval_metadata(payload)
         for failed_check in _failed_checks(reason, metadata):
             counters["signal_eval_failed_checks"][failed_check] += count
+        if reason == "jump_detected" or metadata.get("jump_detected") is True:
+            counters["signal_eval_jump_reasons"][str(metadata.get("jump_reason") or "unknown")] += count
+        _record_near_miss_from_metadata(metadata, counters, count)
+
+
+def _record_near_miss_from_metadata(metadata: dict[str, Any], counters: dict[str, Any], count: int = 1) -> None:
+    key = near_miss_key(metadata)
+    if key is None:
+        return
+    direction, missing = key
+    counters["near_miss_from_signal_eval"] += count
+    counters["near_miss_directions"][direction] += count
+    counters["near_miss_missing_checks"][missing] += count
+
+
+def _record_micro_candidate(payload: dict[str, Any], metadata: dict[str, Any], counters: dict[str, Any]) -> None:
+    candidate_count = int(_to_float(payload.get("candidate_count")) or 1)
+    counters["micro_candidate_events"] += 1
+    counters["micro_candidate_count"] += candidate_count
+    direction = str(payload.get("near_miss_direction") or metadata.get("near_miss_direction") or "unknown")
+    missing = str(payload.get("near_miss_missing") or metadata.get("near_miss_missing") or "unknown")
+    counters["micro_candidate_directions"][direction] += candidate_count
+    counters["micro_candidate_missing_checks"][missing] += candidate_count
 
 
 def _record_execution_reject(payload: dict[str, Any], metadata: dict[str, Any], counters: dict[str, Any]) -> None:
     reason = str(payload.get("reason") or "unknown")
     counters["execution_rejects"][reason] += 1
     counters["execution_reject_blocked_by"][str(metadata.get("blocked_by") or "unknown")] += 1
+    if reason == "position_sync_blocked":
+        counters["position_sync_blocked_rejects"] += 1
     signal = metadata.get("signal")
     engine = signal.get("engine") if isinstance(signal, dict) else metadata.get("engine")
     if reason == "live_unsupported_signal_engine" and engine in MINUTE_SIGNAL_ENGINES:
@@ -261,6 +354,13 @@ def _failed_checks(reason: str, metadata: dict[str, Any]) -> set[str]:
 
 def _both_false(metadata: dict[str, Any], long_key: str, short_key: str) -> bool:
     return metadata.get(long_key) is False and metadata.get(short_key) is False
+
+
+def _signal_engine(payload: dict[str, Any], metadata: dict[str, Any]) -> str:
+    signal = metadata.get("signal")
+    if isinstance(signal, dict) and signal.get("engine"):
+        return str(signal.get("engine"))
+    return str(payload.get("engine") or metadata.get("engine") or "unknown")
 
 
 def _record_symbol_mapping_issue(
@@ -405,6 +505,7 @@ def _record_position_flat(
     pnl_by_engine: dict[str, dict[str, float]],
     pnl_by_exit_reason: dict[str, dict[str, float]],
     counters: dict[str, Any],
+    config: StrategyConfig,
 ) -> None:
     live_trade = metadata.get("live_trade")
     if isinstance(live_trade, dict):
@@ -425,7 +526,7 @@ def _record_position_flat(
             "metadata": live_trade,
         }
         counters["live_trades_closed"] += 1
-        _record_closed_trade(synthetic, live_trade, pnl_by_engine, pnl_by_exit_reason, counters)
+        _record_closed_trade(synthetic, live_trade, pnl_by_engine, pnl_by_exit_reason, counters, config)
         if exit_order_id:
             recorded_exit_order_ids.add(exit_order_id)
         return
@@ -436,7 +537,7 @@ def _record_position_flat(
         if record.get("symbol") != payload.get("symbol") or record.get("direction") != payload.get("direction"):
             continue
         filled_exit_records.pop(index)
-        _record_closed_trade(record, record["metadata"], pnl_by_engine, pnl_by_exit_reason, counters)
+        _record_closed_trade(record, record["metadata"], pnl_by_engine, pnl_by_exit_reason, counters, config)
         counters["live_trades_closed"] += 1
         recorded_exit_order_ids.add(str(record["metadata"].get("exit_order_id")))
         return
@@ -445,24 +546,55 @@ def _record_position_flat(
 def _micro_entry_funnel(counters: dict[str, Any]) -> dict[str, object]:
     submitted = int(counters["live_entry_orders_submitted"])
     detected = int(counters["live_positions_detected"])
+    submitted_by_engine = dict(counters["live_entry_orders_submitted_by_engine"])
+    tradeable_by_engine = dict(counters["live_tradeable_signals_by_engine"])
+    micro_tradeable = int(tradeable_by_engine.get("micro_book", 0))
+    micro_submitted = int(submitted_by_engine.get("micro_book", 0))
     return {
         "signal_eval": {
             "decisions": dict(counters["signal_eval_decisions"]),
             "engines": dict(counters["signal_eval_engines"]),
             "reject_reasons_top": counters["signal_eval_reject_reasons"].most_common(12),
             "failed_checks_top": counters["signal_eval_failed_checks"].most_common(12),
+            "jump_reasons": dict(counters["signal_eval_jump_reasons"]),
+            "near_miss_count": int(counters["near_miss_from_signal_eval"]),
+            "near_miss_missing_checks": counters["near_miss_missing_checks"].most_common(12),
+            "near_miss_directions": dict(counters["near_miss_directions"]),
+            "non_tradeable_jump_reasons": {
+                key: value
+                for key, value in counters["signal_eval_jump_reasons"].items()
+                if key in {"spread_wide", "mid_move_jump", "latency_high", "event_gap_high"}
+            },
+        },
+        "micro_candidates": {
+            "events": int(counters["micro_candidate_events"]),
+            "candidate_count": int(counters["micro_candidate_count"]),
+            "missing_checks": counters["micro_candidate_missing_checks"].most_common(12),
+            "directions": dict(counters["micro_candidate_directions"]),
+        },
+        "signals": {
+            "by_engine": dict(counters["live_signals_by_engine"]),
+            "tradeable_by_engine": tradeable_by_engine,
         },
         "live_execution": {
             "entry_orders_submitted": submitted,
+            "entry_orders_submitted_by_engine": submitted_by_engine,
+            "micro_tradeable_signals_without_entry_submission": max(0, micro_tradeable - micro_submitted),
+            "entry_orders_cancelled": int(counters["live_entry_orders_cancelled"]),
             "entry_orders_expired": int(counters["live_entry_orders_expired"]),
             "entry_order_errors": int(counters["live_entry_order_errors"]),
             "positions_detected": detected,
             "entry_fill_rate": round(detected / submitted, 4) if submitted else 0.0,
             "exit_orders_submitted": int(counters["live_exit_orders_submitted"]),
+            "exit_orders_cancelled": int(counters["live_exit_orders_cancelled"]),
             "trades_closed": int(counters["live_trades_closed"]),
             "execution_rejects": dict(counters["execution_rejects"]),
             "execution_reject_blocked_by": dict(counters["execution_reject_blocked_by"]),
+            "position_sync_blocked_rejects": int(counters["position_sync_blocked_rejects"]),
             "live_unsupported_minute_signals": int(counters["live_unsupported_minute_signals"]),
+            "api_error_categories": dict(counters["api_error_categories"]),
+            "loss_hold_guard_events": int(counters["loss_hold_guard_events"]),
+            "kill_switch_events": int(counters["kill_switch_events"]),
         },
     }
 
@@ -473,9 +605,22 @@ def _diagnosis_notes(counters: dict[str, Any]) -> list[str]:
         notes.append("startup_missing_current_live_safety_fields_or_old_policy_detected")
     if counters["live_unsupported_minute_signals"]:
         notes.append("minute_signals_were_blocked_by_live_supported_engines")
+    api_categories = counters["api_error_categories"]
+    if api_categories.get("auth_error") or api_categories.get("auth_recovery_failed"):
+        notes.append("kabu_auth_errors_blocked_live_entry")
+    if api_categories.get("kabu_station_wrong_instance"):
+        notes.append("kabu_station_wrong_instance_detected_switch_to_orderable_instance")
+    if counters["position_sync_blocked_rejects"]:
+        notes.append("position_sync_blocked_prevented_live_entry")
+    if counters["loss_hold_guard_events"]:
+        notes.append("loss_hold_guard_requires_manual_review_no_auto_loss_close")
+    if counters["kill_switch_events"]:
+        notes.append("kill_switch_was_active")
     failed_checks = counters["signal_eval_failed_checks"]
     for reason, _ in failed_checks.most_common(3):
         notes.append(f"micro_front_gate_top_blocker:{reason}")
+    for missing, count in counters["near_miss_missing_checks"].most_common(3):
+        notes.append(f"micro_near_miss_one_check:{missing}:{count}")
     return notes
 
 
@@ -506,6 +651,7 @@ def _record_closed_trade(
     pnl_by_engine: dict[str, dict[str, float]],
     pnl_by_exit_reason: dict[str, dict[str, float]],
     counters: dict[str, Any],
+    config: StrategyConfig,
 ) -> None:
     pnl_ticks = _to_float(payload.get("pnl_ticks"))
     if pnl_ticks is None:
@@ -517,8 +663,12 @@ def _record_closed_trade(
         pnl_yen = _to_float(metadata.get("pnl_yen")) or 0.0
     engine = str(metadata.get("engine") or _nested(metadata, "signal", "engine") or "unknown")
     exit_reason = str(metadata.get("exit_reason") or payload.get("reason") or "unknown")
-    _add_trade(pnl_by_engine[engine], pnl_ticks, pnl_yen)
-    _add_trade(pnl_by_exit_reason[exit_reason], pnl_ticks, pnl_yen)
+    symbol = str(payload.get("symbol") or metadata.get("symbol") or "")
+    qty = _to_float(payload.get("qty") or metadata.get("qty")) or 1.0
+    tick_value = config.tick_value_yen_for(symbol) if symbol else config.micro225_tick_value
+    cost_yen = _round_trip_cost_yen(config, tick_value, qty)
+    _add_trade(pnl_by_engine[engine], pnl_ticks, pnl_yen, cost_yen)
+    _add_trade(pnl_by_exit_reason[exit_reason], pnl_ticks, pnl_yen, cost_yen)
     if pnl_ticks >= 0:
         return
     counters["losses_total"] += 1
@@ -534,18 +684,22 @@ def _record_closed_trade(
             "direction": payload.get("direction"),
             "pnl_ticks": round(pnl_ticks, 4),
             "pnl_yen": round(pnl_yen, 2),
+            "net_pnl_yen": round(pnl_yen - cost_yen, 2),
+            "estimated_cost_yen": round(cost_yen, 2),
         }
     )
 
 
 def _pnl_bucket() -> dict[str, float]:
-    return {"trades": 0.0, "wins": 0.0, "losses": 0.0, "pnl_ticks": 0.0, "pnl_yen": 0.0}
+    return {"trades": 0.0, "wins": 0.0, "losses": 0.0, "pnl_ticks": 0.0, "pnl_yen": 0.0, "cost_yen": 0.0, "net_pnl_yen": 0.0}
 
 
-def _add_trade(bucket: dict[str, float], pnl_ticks: float, pnl_yen: float) -> None:
+def _add_trade(bucket: dict[str, float], pnl_ticks: float, pnl_yen: float, cost_yen: float = 0.0) -> None:
     bucket["trades"] += 1
     bucket["pnl_ticks"] += pnl_ticks
     bucket["pnl_yen"] += pnl_yen
+    bucket["cost_yen"] += cost_yen
+    bucket["net_pnl_yen"] += pnl_yen - cost_yen
     if pnl_ticks > 0:
         bucket["wins"] += 1
     elif pnl_ticks < 0:
@@ -563,8 +717,16 @@ def _round_pnl_map(values: dict[str, dict[str, float]]) -> dict[str, dict[str, f
             "win_rate": round(bucket["wins"] / trades, 4) if trades else 0.0,
             "pnl_ticks": round(bucket["pnl_ticks"], 4),
             "pnl_yen": round(bucket["pnl_yen"], 2),
+            "estimated_cost_yen": round(bucket["cost_yen"], 2),
+            "net_pnl_yen": round(bucket["net_pnl_yen"], 2),
         }
     return result
+
+
+def _round_trip_cost_yen(config: StrategyConfig, tick_value: float, qty: float) -> float:
+    commission = float(config.live_execution.commission_yen_per_order) * 2.0
+    slippage = float(config.live_execution.assumed_slippage_ticks_per_trade) * tick_value * qty
+    return max(0.0, commission + slippage)
 
 
 def _nested(mapping: dict[str, Any], *keys: str) -> Any:
@@ -621,6 +783,27 @@ def _pnl_ticks(direction: str, entry_price: float, exit_price: float, tick_size:
     if direction == "short":
         return (entry_price - exit_price) / tick_size
     return 0.0
+
+
+def _latency_summary(values: dict[str, list[float]]) -> dict[str, dict[str, float]]:
+    return {key: _latency_bucket(samples) for key, samples in values.items() if samples}
+
+
+def _latency_bucket(values: list[float]) -> dict[str, float]:
+    ordered = sorted(values)
+    return {
+        "count": float(len(ordered)),
+        "p50": round(_percentile(ordered, 0.50), 4),
+        "p95": round(_percentile(ordered, 0.95), 4),
+        "max": round(ordered[-1], 4) if ordered else 0.0,
+    }
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    index = min(len(values) - 1, max(0, int(round((len(values) - 1) * pct))))
+    return values[index]
 
 
 def _to_float(value: Any) -> float | None:

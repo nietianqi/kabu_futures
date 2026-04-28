@@ -10,7 +10,44 @@ from .config import ApiConfig
 
 
 class KabuApiError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        details: str | None = None,
+        category: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.details = details
+        self.category = category or classify_kabu_api_error(message)
+
+
+WRONG_INSTANCE_MESSAGE = "別のPCでkabuステーションが起動"
+
+
+def classify_kabu_api_error(error: object) -> str:
+    if isinstance(error, KabuApiError) and error.category:
+        return error.category
+    text = str(error)
+    if WRONG_INSTANCE_MESSAGE in text:
+        return "kabu_station_wrong_instance"
+    if "auth_recovery_failed" in text:
+        return "auth_recovery_failed"
+    if "HTTP 401" in text or '"Code":4001007' in text or "ログイン認証エラー" in text:
+        return "auth_error"
+    if "HTTP 400" in text:
+        return "bad_request"
+    if "HTTP 403" in text:
+        return "forbidden"
+    if "HTTP 429" in text or '"Code":4001006' in text:
+        return "rate_limit"
+    if "HTTP 503" in text:
+        return "service_unavailable"
+    if "HTTP 500" in text:
+        return "server_error"
+    return "kabu_api"
 
 
 class KabuStationClient:
@@ -33,6 +70,7 @@ class KabuStationClient:
             "GET",
             f"/symbolname/future?{urlencode({'FutureCode': future_code, 'DerivMonth': deriv_month})}",
             None,
+            retry_auth=True,
         )
 
     def register(self, symbols: list[dict[str, Any]]) -> dict[str, Any]:
@@ -45,19 +83,19 @@ class KabuStationClient:
         return self._request("PUT", "/unregister/all", None)
 
     def board(self, symbol_at_exchange: str) -> dict[str, Any]:
-        return self._request("GET", f"/board/{symbol_at_exchange}", None)
+        return self._request("GET", f"/board/{symbol_at_exchange}", None, retry_auth=True)
 
     def wallet_future(self, symbol_at_exchange: str | None = None) -> dict[str, Any]:
         endpoint = "/wallet/future" if symbol_at_exchange is None else f"/wallet/future/{symbol_at_exchange}"
-        return self._request("GET", endpoint, None)
+        return self._request("GET", endpoint, None, retry_auth=True)
 
     def positions(self, **query: Any) -> dict[str, Any]:
         suffix = f"?{urlencode(query)}" if query else ""
-        return self._request("GET", f"/positions{suffix}", None)
+        return self._request("GET", f"/positions{suffix}", None, retry_auth=True)
 
     def orders(self, **query: Any) -> dict[str, Any]:
         suffix = f"?{urlencode(query)}" if query else ""
-        return self._request("GET", f"/orders{suffix}", None)
+        return self._request("GET", f"/orders{suffix}", None, retry_auth=True)
 
     def sendorder_future(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/sendorder/future", payload)
@@ -66,7 +104,7 @@ class KabuStationClient:
         return self._request("PUT", "/cancelorder", {"OrderID": order_id, "Password": password or self.password})
 
     def apisoftlimit(self) -> dict[str, Any]:
-        return self._request("GET", "/apisoftlimit", None)
+        return self._request("GET", "/apisoftlimit", None, retry_auth=True)
 
     def websocket_url(self) -> str:
         return self.base_url.replace("http://", "ws://").replace("https://", "wss://") + "/websocket"
@@ -75,11 +113,18 @@ class KabuStationClient:
         root = self.base_url.removesuffix("/kabusapi")
         return root.replace("http://", "ws://").replace("https://", "wss://") + "/kabusapi/websocket"
 
-    def _request(self, method: str, endpoint: str, body: dict[str, Any] | None, auth: bool = True) -> dict[str, Any]:
+    def _request(
+        self,
+        method: str,
+        endpoint: str,
+        body: dict[str, Any] | None,
+        auth: bool = True,
+        retry_auth: bool = False,
+    ) -> dict[str, Any]:
         headers = {"Content-Type": "application/json"}
         if auth:
             if not self.token:
-                raise KabuApiError("Client is not authenticated")
+                raise KabuApiError("Client is not authenticated", category="auth_error")
             headers["X-API-KEY"] = self.token
         data = json.dumps(body).encode("utf-8") if body is not None else None
         request = Request(self.base_url + endpoint, data=data, headers=headers, method=method)
@@ -88,7 +133,25 @@ class KabuStationClient:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             details = exc.read().decode("utf-8", errors="replace")
-            raise KabuApiError(f"kabu API HTTP {exc.code}: {details}") from exc
+            if auth and retry_auth and exc.code == 401:
+                try:
+                    self.authenticate()
+                    return self._request(method, endpoint, body, auth=auth, retry_auth=False)
+                except KabuApiError as retry_exc:
+                    if classify_kabu_api_error(retry_exc) == "auth_error":
+                        raise KabuApiError(
+                            f"auth_recovery_failed after kabu API HTTP 401: {details}",
+                            status_code=401,
+                            details=details,
+                            category="auth_recovery_failed",
+                        ) from retry_exc
+                    raise
+            raise KabuApiError(
+                f"kabu API HTTP {exc.code}: {details}",
+                status_code=exc.code,
+                details=details,
+                category=classify_kabu_api_error(f"kabu API HTTP {exc.code}: {details}"),
+            ) from exc
         if not raw:
             return {}
         parsed = json.loads(raw)

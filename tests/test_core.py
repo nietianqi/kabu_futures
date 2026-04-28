@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 import json
 import pathlib
 import sys
 import unittest
+from urllib.error import HTTPError
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
@@ -18,13 +20,13 @@ from kabu_futures.alpha import (
     USJapanLeadLagScorer,
     compute_micro225_per_topix_mini,
 )
-from kabu_futures.api import KabuApiError, build_future_registration_symbols, extract_symbol_code
+from kabu_futures.api import KabuApiError, KabuStationClient, build_future_registration_symbols, extract_symbol_code
 from kabu_futures.analysis_utils import iter_books, max_drawdown
 from kabu_futures.config import default_config, load_json_config
 from kabu_futures.engine import DualStrategyEngine
 from kabu_futures.evolution import analyze_micro_log, calculate_markout_ticks
 from kabu_futures.indicators import BarBuilder
-from kabu_futures.live import _should_print_tick, tick_to_dict, signal_to_dict
+from kabu_futures.live import MicroCandidateEmitter, _should_print_tick, tick_to_dict, signal_to_dict
 from kabu_futures.live_execution import LiveExecutionController
 from kabu_futures.live_safety import LiveSafetyState
 from kabu_futures.log_diagnostics import diagnose_log
@@ -97,6 +99,20 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.tick_size_for("NK225micro"), 5.0)
         self.assertEqual(cfg.tick_size_for("TOPIXmini"), 0.25)
         self.assertEqual(cfg.tick_value_yen_for("TOPIXmini"), 250.0)
+
+    def test_default_live_safety_limits_one_position_without_changing_paper_risk(self) -> None:
+        cfg = default_config()
+
+        self.assertEqual(cfg.live_execution.max_positions_per_symbol, 1)
+        self.assertEqual(cfg.live_execution.loss_hold_guard_ticks, 15.0)
+        self.assertEqual(cfg.live_execution.daily_loss_limit_yen, 5000.0)
+        self.assertEqual(cfg.risk.max_positions_per_symbol, 5)
+
+    def test_micro_ofi_percentile_config_validates(self) -> None:
+        cfg = default_config()
+        self.assertEqual(cfg.micro_engine.ofi_percentile, 70.0)
+        with self.assertRaisesRegex(ValueError, "ofi_percentile"):
+            replace(cfg, micro_engine=replace(cfg.micro_engine, ofi_percentile=120.0)).validate()
 
     def test_load_json_config_validates_inconsistent_micro_thresholds(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -202,6 +218,7 @@ class MicrostructureTests(unittest.TestCase):
         self.assertEqual(features.latency_ms, 0.0)
         self.assertEqual(features.event_gap_ms, 50.0)
         self.assertFalse(features.jump_detected)
+        self.assertIsNone(features.jump_reason)
 
     def test_book_features_ignore_live_push_gap_without_price_jump(self) -> None:
         cfg = default_config().micro_engine
@@ -216,6 +233,7 @@ class MicrostructureTests(unittest.TestCase):
         self.assertGreater(features.event_gap_ms, cfg.websocket_latency_stop_ms)
         self.assertEqual(features.latency_ms, 0.0)
         self.assertFalse(features.jump_detected)
+        self.assertIsNone(features.jump_reason)
 
     def test_book_features_keep_hard_jump_guards(self) -> None:
         cfg = default_config().micro_engine
@@ -225,11 +243,13 @@ class MicrostructureTests(unittest.TestCase):
         spread_engine.update(replace(book(ts), received_at=ts), now=ts)
         spread_jump = spread_engine.update(replace(book(ts + timedelta(milliseconds=50), ask=50015), received_at=ts + timedelta(milliseconds=50)))
         self.assertTrue(spread_jump.jump_detected)
+        self.assertEqual(spread_jump.jump_reason, "spread_wide")
 
         latency_engine = BookFeatureEngine(cfg)
         latency_engine.update(book(ts), now=ts)
         latency_jump = latency_engine.update(book(ts + timedelta(milliseconds=50)), now=ts + timedelta(seconds=2))
         self.assertTrue(latency_jump.jump_detected)
+        self.assertEqual(latency_jump.jump_reason, "latency_high")
 
         mid_engine = BookFeatureEngine(cfg)
         mid_engine.update(replace(book(ts), received_at=ts), now=ts)
@@ -241,6 +261,7 @@ class MicrostructureTests(unittest.TestCase):
             now=ts + timedelta(milliseconds=50),
         )
         self.assertTrue(mid_jump.jump_detected)
+        self.assertEqual(mid_jump.jump_reason, "mid_move_jump")
 
     def test_micro_strategy_signal_survives_live_push_gap_without_price_jump(self) -> None:
         cfg = default_config().micro_engine
@@ -259,6 +280,7 @@ class MicrostructureTests(unittest.TestCase):
         self.assertEqual(evaluation.decision, "allow")
         self.assertEqual(evaluation.reason, "micro_book_long")
         self.assertEqual(evaluation.metadata["jump_detected"], False)
+        self.assertIsNone(evaluation.metadata["jump_reason"])
 
     def test_micro_strategy_reuses_precomputed_book_features(self) -> None:
         cfg = default_config().micro_engine
@@ -370,6 +392,57 @@ class MicrostructureTests(unittest.TestCase):
         self.assertEqual(evaluation.decision, "reject")
         self.assertEqual(evaluation.reason, "spread_not_required_width")
         self.assertEqual(evaluation.metadata["spread_ok"], False)
+
+    def test_micro_strategy_marks_clean_one_check_reject_as_near_miss(self) -> None:
+        cfg = default_config()
+        engine = MicroStrategyEngine(cfg.micro_engine, tick_size=cfg.tick_size)
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        features = BookFeatures(
+            timestamp=ts,
+            symbol="NK225micro",
+            spread_ticks=1.0,
+            imbalance=0.20,
+            ofi=10.0,
+            ofi_ewma=10.0,
+            ofi_threshold=1.0,
+            microprice=50005,
+            microprice_edge_ticks=0.20,
+            total_depth=100.0,
+            jump_detected=False,
+        )
+
+        signal, evaluation = engine.evaluate_book(book(ts), features=features)
+
+        self.assertIsNone(signal)
+        self.assertEqual(evaluation.reason, "imbalance_not_met")
+        self.assertTrue(evaluation.metadata["near_miss"])
+        self.assertEqual(evaluation.metadata["near_miss_direction"], "long")
+        self.assertEqual(evaluation.metadata["near_miss_missing"], "imbalance")
+
+    def test_micro_strategy_does_not_mark_jump_as_near_miss(self) -> None:
+        cfg = default_config()
+        engine = MicroStrategyEngine(cfg.micro_engine, tick_size=cfg.tick_size)
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        features = BookFeatures(
+            timestamp=ts,
+            symbol="NK225micro",
+            spread_ticks=1.0,
+            imbalance=0.20,
+            ofi=10.0,
+            ofi_ewma=10.0,
+            ofi_threshold=1.0,
+            microprice=50005,
+            microprice_edge_ticks=0.20,
+            total_depth=100.0,
+            jump_detected=True,
+            jump_reason="mid_move_jump",
+        )
+
+        signal, evaluation = engine.evaluate_book(book(ts), features=features)
+
+        self.assertIsNone(signal)
+        self.assertEqual(evaluation.reason, "jump_detected")
+        self.assertFalse(evaluation.metadata["near_miss"])
 
 
 class IndicatorTests(unittest.TestCase):
@@ -669,6 +742,38 @@ class MarketDataAndExecutionTests(unittest.TestCase):
             self.assertEqual(books[0].symbol, "NK225micro")
             self.assertEqual(max_drawdown([1.0, -2.0, 0.5]), -2.0)
 
+    def test_micro_candidate_emitter_records_near_miss_without_signal(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "market.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=1, flush_interval_seconds=60.0)
+            emitter = MicroCandidateEmitter(recorder, min_interval_seconds=0)
+            evaluation = SignalEvaluation(
+                "micro_book",
+                "NK225micro",
+                datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc),
+                "reject",
+                "imbalance_not_met",
+                "long",
+                {
+                    "near_miss": True,
+                    "near_miss_direction": "long",
+                    "near_miss_missing": "imbalance",
+                    "spread_ok": True,
+                    "jump_detected": False,
+                    "long_failed_checks": ["imbalance"],
+                },
+            )
+
+            emitter.write(evaluation)
+            recorder.close()
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(rows[0]["kind"], "micro_candidate")
+        self.assertEqual(rows[0]["payload"]["near_miss_missing"], "imbalance")
+        self.assertEqual(rows[0]["payload"]["candidate_count"], 1)
+        self.assertEqual(emitter.total_candidates, 1)
+        self.assertEqual(emitter.emitted_candidates, 1)
+
     def test_live_startup_self_check_exposes_fingerprints_and_filters(self) -> None:
         payload = live_startup_self_check(default_config())
 
@@ -691,7 +796,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
                         "decision": "reject",
                         "reason": "jump_detected",
                         "count": 3,
-                        "last_metadata": {"jump_detected": True, "spread_ok": True},
+                        "last_metadata": {"jump_detected": True, "jump_reason": "spread_wide", "spread_ok": True},
                     },
                 },
                 {
@@ -700,7 +805,36 @@ class MarketDataAndExecutionTests(unittest.TestCase):
                         "engine": "micro_book",
                         "decision": "reject",
                         "reason": "imbalance_not_met",
-                        "metadata": {"imbalance_long_ok": False, "imbalance_short_ok": False},
+                        "metadata": {
+                            "imbalance_long_ok": False,
+                            "imbalance_short_ok": False,
+                            "near_miss": True,
+                            "near_miss_direction": "long",
+                            "near_miss_missing": "imbalance",
+                        },
+                    },
+                },
+                {
+                    "kind": "micro_candidate",
+                    "payload": {
+                        "engine": "micro_book",
+                        "symbol": "NK225micro",
+                        "candidate_direction": "long",
+                        "near_miss_direction": "long",
+                        "near_miss_missing": "imbalance",
+                        "candidate_count": 3,
+                        "timestamp": "2026-04-28T10:00:00+09:00",
+                        "metadata": {"spread_ok": True, "jump_detected": False},
+                    },
+                },
+                {
+                    "kind": "signal",
+                    "payload": {
+                        "event": "signal",
+                        "engine": "micro_book",
+                        "symbol": "NK225micro",
+                        "direction": "long",
+                        "confidence": 0.8,
                     },
                 },
                 {
@@ -737,6 +871,24 @@ class MarketDataAndExecutionTests(unittest.TestCase):
                     },
                 },
                 {
+                    "kind": "execution_reject",
+                    "payload": {
+                        "event": "execution_reject",
+                        "reason": "position_sync_blocked",
+                        "metadata": {"blocked_by": "position_state", "signal": {"engine": "micro_book"}},
+                    },
+                },
+                {
+                    "kind": "live_sync_error",
+                    "payload": {
+                        "event": "live_sync_error",
+                        "reason": "positions_api_error",
+                        "metadata": {
+                            "error": 'kabu API HTTP 401: {"Code":4001007,"Message":"ログイン認証エラー"}'
+                        },
+                    },
+                },
+                {
                     "kind": "live_order_error",
                     "payload": {
                         "event": "live_order_error",
@@ -744,6 +896,17 @@ class MarketDataAndExecutionTests(unittest.TestCase):
                         "metadata": {
                             "error": "Symbol not found",
                             "order_payload": {"TradeType": 2, "Symbol": "NK225micro"},
+                        },
+                    },
+                },
+                {
+                    "kind": "live_order_error",
+                    "payload": {
+                        "event": "live_order_error",
+                        "reason": "kabu_station_wrong_instance",
+                        "metadata": {
+                            "error": "kabu API HTTP 500: 別のPCでkabuステーションが起動されました。",
+                            "order_payload": {"TradeType": 1, "Symbol": "161060023"},
                         },
                     },
                 },
@@ -775,10 +938,24 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertEqual(funnel["signal_eval"]["decisions"]["reject"], 4)
         self.assertEqual(dict(funnel["signal_eval"]["failed_checks_top"])["jump_detected"], 3)
         self.assertEqual(dict(funnel["signal_eval"]["failed_checks_top"])["imbalance_not_met"], 1)
+        self.assertEqual(funnel["signal_eval"]["jump_reasons"]["spread_wide"], 3)
+        self.assertEqual(funnel["signal_eval"]["near_miss_count"], 1)
+        self.assertEqual(dict(funnel["signal_eval"]["near_miss_missing_checks"])["imbalance"], 1)
+        self.assertEqual(funnel["micro_candidates"]["candidate_count"], 3)
+        self.assertEqual(dict(funnel["micro_candidates"]["missing_checks"])["imbalance"], 3)
+        self.assertEqual(funnel["signals"]["tradeable_by_engine"]["micro_book"], 1)
         self.assertEqual(funnel["live_execution"]["entry_orders_submitted"], 1)
+        self.assertEqual(funnel["live_execution"]["entry_orders_submitted_by_engine"]["minute_vwap"], 1)
+        self.assertEqual(funnel["live_execution"]["micro_tradeable_signals_without_entry_submission"], 1)
         self.assertEqual(funnel["live_execution"]["entry_orders_expired"], 1)
+        self.assertEqual(funnel["live_execution"]["entry_order_errors"], 1)
+        self.assertEqual(funnel["live_execution"]["position_sync_blocked_rejects"], 1)
         self.assertEqual(funnel["live_execution"]["live_unsupported_minute_signals"], 1)
+        self.assertEqual(funnel["live_execution"]["api_error_categories"]["auth_error"], 1)
+        self.assertEqual(funnel["live_execution"]["api_error_categories"]["kabu_station_wrong_instance"], 1)
         self.assertIn("startup_missing_current_live_safety_fields_or_old_policy_detected", diagnostics["diagnosis_notes"])
+        self.assertIn("position_sync_blocked_prevented_live_entry", diagnostics["diagnosis_notes"])
+        self.assertIn("kabu_station_wrong_instance_detected_switch_to_orderable_instance", diagnostics["diagnosis_notes"])
 
     def test_diagnose_log_reconstructs_old_live_position_flat_pnl(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -872,6 +1049,91 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertEqual(diagnostics["exit_reason_pnl"]["imbalance_neutral"]["losses"], 1)
         self.assertEqual(diagnostics["loss_samples"][0]["signal_reason"], "micro_book_short")
         self.assertEqual(diagnostics["micro_entry_funnel"]["live_execution"]["trades_closed"], 1)
+
+    def test_diagnose_log_scores_live_readiness_and_cost_adjusted_pnl(self) -> None:
+        base = default_config()
+        cfg = replace(
+            base,
+            live_execution=replace(
+                base.live_execution,
+                commission_yen_per_order=10.0,
+                assumed_slippage_ticks_per_trade=1.0,
+            ),
+        )
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "scored_live.jsonl"
+            rows = [
+                {
+                    "kind": "startup",
+                    "payload": {
+                        "mode": "production",
+                        "code_fingerprint": "abc",
+                        "config_fingerprint": "def",
+                        "live_minute_atr_filter": True,
+                        "live_supported_engines": ["micro_book", "minute_vwap"],
+                    },
+                },
+                {
+                    "kind": "live_order_submitted",
+                    "payload": {
+                        "event": "live_order_submitted",
+                        "reason": "entry_limit_fak_submitted",
+                        "metadata": {
+                            "signal": {"engine": "micro_book", "symbol": "NK225micro"},
+                            "signal_to_order_send_ms": 2.5,
+                            "order_send_to_api_response_ms": 7.5,
+                        },
+                    },
+                },
+                {
+                    "kind": "live_order_cancelled",
+                    "payload": {
+                        "event": "live_order_cancelled",
+                        "symbol": "NK225micro",
+                        "direction": "long",
+                        "reason": "pending_entry_timeout_cancel",
+                        "metadata": {"is_entry": True, "order_id": "O1"},
+                    },
+                },
+                {
+                    "kind": "live_sync_error",
+                    "payload": {
+                        "event": "live_sync_error",
+                        "symbol": "NK225micro",
+                        "direction": "flat",
+                        "reason": "loss_hold_guard_active",
+                        "metadata": {"auto_loss_close_disabled": True, "manual_review_required": True},
+                    },
+                },
+                {
+                    "kind": "live_trade_closed",
+                    "payload": {
+                        "event": "live_trade_closed",
+                        "symbol": "NK225micro",
+                        "direction": "long",
+                        "qty": 1,
+                        "reason": "take_profit",
+                        "pnl_ticks": 2.0,
+                        "pnl_yen": 100.0,
+                        "metadata": {"engine": "micro_book", "exit_reason": "take_profit"},
+                    },
+                },
+            ]
+            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+
+            diagnostics = diagnose_log(path, cfg)
+
+        readiness = diagnostics["live_readiness_score"]
+        self.assertGreaterEqual(readiness["total"], 60)
+        self.assertEqual(readiness["modules"]["risk_controls"]["score"], 14)
+        self.assertTrue(readiness["assumptions"]["auto_loss_close_disabled"])
+        self.assertTrue(readiness["assumptions"]["loss_hold_guard_blocks_entries_only"])
+        self.assertEqual(diagnostics["strategy_pnl"]["micro_book"]["estimated_cost_yen"], 70.0)
+        self.assertEqual(diagnostics["strategy_pnl"]["micro_book"]["net_pnl_yen"], 30.0)
+        self.assertEqual(diagnostics["execution_latency_ms"]["signal_to_order_send_ms"]["p50"], 2.5)
+        self.assertEqual(diagnostics["micro_entry_funnel"]["live_execution"]["entry_orders_cancelled"], 1)
+        self.assertEqual(diagnostics["micro_entry_funnel"]["live_execution"]["loss_hold_guard_events"], 1)
+        self.assertIn("loss_hold_guard_requires_manual_review_no_auto_loss_close", diagnostics["diagnosis_notes"])
 
     def test_micro_trade_manager_exits_on_take_profit(self) -> None:
         cfg = default_config()
@@ -1200,6 +1462,86 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertEqual(heartbeat["live_entry_orders_submitted"], 1)
         self.assertEqual(heartbeat["live_exit_orders_submitted"], 0)
         self.assertEqual(heartbeat["live_entry_fill_rate"], 0.0)
+
+    def test_live_position_sync_auth_failure_blocks_then_recovers(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+                self.fail_positions = True
+                self.position_calls = 0
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                return {"Result": 0, "OrderId": f"O{len(self.sent)}"}
+
+            def positions(self, **query: object) -> dict[str, object]:
+                self.position_calls += 1
+                if self.fail_positions:
+                    raise KabuApiError(
+                        'auth_recovery_failed after kabu API HTTP 401: {"Code":4001007}',
+                        status_code=401,
+                        category="auth_recovery_failed",
+                    )
+                return {"data": []}
+
+        cfg = default_config()
+        cfg = replace(cfg, live_execution=replace(cfg.live_execution, max_positions_per_symbol=2))
+        client = FakeClient()
+        controller = LiveExecutionController(client, cfg, {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+        signal = Signal("micro_book", "NK225micro", "long", 0.8, 50005)
+
+        blocked = controller.on_signal(signal, book(ts), exchange=24)
+
+        self.assertEqual(blocked[-1].event_type, "execution_reject")
+        self.assertEqual(blocked[-1].reason, "position_sync_blocked")
+        self.assertEqual(blocked[0].reason, "auth_recovery_failed")
+        self.assertEqual(blocked[0].metadata["api_error_category"], "auth_recovery_failed")
+        self.assertEqual(client.sent, [])
+        self.assertTrue(controller.heartbeat_metadata()["live_api_health"]["auth_failed"])
+
+        client.fail_positions = False
+        recovered = controller.on_signal(signal, book(ts + timedelta(seconds=2)), exchange=24)
+
+        self.assertEqual(recovered[-1].event_type, "live_order_submitted")
+        self.assertEqual(client.sent[0]["Symbol"], "161060023")
+        self.assertFalse(controller.heartbeat_metadata()["live_position_sync_blocked"])
+        self.assertFalse(controller.heartbeat_metadata()["live_api_health"]["auth_failed"])
+
+    def test_live_wrong_kabu_station_instance_enters_cooldown(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                raise KabuApiError(
+                    "kabu API HTTP 500: 別のPCでkabuステーションが起動されました。",
+                    status_code=500,
+                    category="kabu_station_wrong_instance",
+                )
+
+            def positions(self, **query: object) -> dict[str, object]:
+                return {"data": []}
+
+        cfg = default_config()
+        cfg = replace(cfg, live_execution=replace(cfg.live_execution, max_positions_per_symbol=2))
+        client = FakeClient()
+        controller = LiveExecutionController(client, cfg, {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+        signal = Signal("micro_book", "NK225micro", "long", 0.8, 50005)
+
+        failed = controller.on_signal(signal, book(ts), exchange=24)
+        cooled = controller.on_signal(signal, book(ts + timedelta(seconds=1)), exchange=24)
+
+        self.assertEqual(failed[0].event_type, "live_order_error")
+        self.assertEqual(failed[0].reason, "kabu_station_wrong_instance")
+        self.assertEqual(failed[0].metadata["blocked_by"], "kabu_station_instance")
+        self.assertEqual(failed[0].metadata["api_error_category"], "kabu_station_wrong_instance")
+        self.assertTrue(failed[0].metadata["live_api_health"]["wrong_instance_cooldown_active"])
+        self.assertEqual(cooled[0].event_type, "execution_reject")
+        self.assertEqual(cooled[0].reason, "kabu_station_wrong_instance_cooldown")
+        self.assertEqual(len(client.sent), 1)
 
     def test_live_topix_micro_signal_uses_topix_symbol_code_and_tick_size(self) -> None:
         class FakeClient:
@@ -2204,8 +2546,10 @@ class MarketDataAndExecutionTests(unittest.TestCase):
                     ]
                 }
 
+        cfg = default_config()
+        cfg = replace(cfg, live_execution=replace(cfg.live_execution, max_positions_per_symbol=2))
         client = FakeClient()
-        controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        controller = LiveExecutionController(client, cfg, {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
         controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
         controller.on_book(book(ts + timedelta(seconds=2), bid=50000, ask=50005), None, exchange=24)
@@ -2257,8 +2601,10 @@ class MarketDataAndExecutionTests(unittest.TestCase):
                     ]
                 }
 
+        cfg = default_config()
+        cfg = replace(cfg, live_execution=replace(cfg.live_execution, max_positions_per_symbol=2))
         client = FakeClient()
-        controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        controller = LiveExecutionController(client, cfg, {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
         controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
         controller.on_book(book(ts + timedelta(seconds=2), bid=50000, ask=50005), None, exchange=24)
@@ -2266,6 +2612,203 @@ class MarketDataAndExecutionTests(unittest.TestCase):
 
         self.assertEqual(events[0].event_type, "live_order_submitted")
         self.assertEqual(events[0].reason, "entry_limit_fak_submitted")
+
+    def test_live_rate_limit_error_enters_api_backoff(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent = 0
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent += 1
+                raise KabuApiError("kabu API HTTP 429: too many requests", status_code=429, category="rate_limit")
+
+            def positions(self, **query: object) -> dict[str, object]:
+                return {"data": []}
+
+        cfg = replace(default_config(), live_execution=replace(default_config().live_execution, api_error_cooldown_seconds=30))
+        client = FakeClient()
+        controller = LiveExecutionController(client, cfg, {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+        signal = Signal("micro_book", "NK225micro", "long", 0.8, 50005)
+
+        error_events = controller.on_signal(signal, book(ts), exchange=24)
+        blocked_events = controller.on_signal(signal, book(ts + timedelta(seconds=1)), exchange=24)
+        health = controller._live_api_health(ts + timedelta(seconds=1))
+
+        self.assertEqual(error_events[-1].event_type, "live_order_error")
+        self.assertEqual(error_events[-1].reason, "kabu_api_rate_limit")
+        self.assertEqual(blocked_events[0].reason, "live_api_backoff_active")
+        self.assertEqual(client.sent, 1)
+        self.assertTrue(health["api_backoff_active"])
+        self.assertEqual(health["error_counts"]["rate_limit"], 1)
+
+    def test_loss_hold_guard_blocks_new_entries_and_does_not_submit_close_order(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+                self.position_open = False
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                if payload["TradeType"] == 1:
+                    self.position_open = True
+                return {"Result": 0, "OrderId": f"O{len(self.sent)}"}
+
+            def positions(self, **query: object) -> dict[str, object]:
+                if not self.position_open:
+                    return {"data": []}
+                return {
+                    "data": [
+                        {
+                            "ExecutionID": "E1",
+                            "Symbol": "161060023",
+                            "Exchange": 24,
+                            "Price": 50005,
+                            "LeavesQty": 1,
+                            "Side": "2",
+                            "HoldID": "H1",
+                        }
+                    ]
+                }
+
+            def orders(self, **query: object) -> dict[str, object]:
+                return {
+                    "data": [
+                        {
+                            "ID": query.get("id", "O1"),
+                            "State": 5,
+                            "OrderState": 5,
+                            "OrderQty": 1,
+                            "CumQty": 1,
+                            "Details": [{"RecType": 8, "State": 0, "Qty": 1, "Price": 50005, "ExecutionID": "E1"}],
+                        }
+                    ]
+                }
+
+        client = FakeClient()
+        controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+        signal = Signal("micro_book", "NK225micro", "long", 0.8, 50005)
+
+        controller.on_signal(signal, book(ts), exchange=24)
+        guard_events = controller.on_book(book(ts + timedelta(seconds=2), bid=49925, ask=49930), None, exchange=24)
+        blocked_events = controller.on_signal(signal, book(ts + timedelta(seconds=3), bid=49925, ask=49930), exchange=24)
+        heartbeat = controller.heartbeat_metadata()
+
+        self.assertIn("loss_hold_guard_active", [event.reason for event in guard_events])
+        self.assertEqual(blocked_events[0].reason, "loss_hold_guard_active")
+        self.assertTrue(heartbeat["live_guard_state"]["loss_hold_guard_active"])
+        self.assertTrue(heartbeat["live_guard_state"]["auto_loss_close_disabled"])
+        self.assertEqual(len([payload for payload in client.sent if payload["TradeType"] == 2]), 0)
+
+    def test_loss_hold_guard_after_position_sync_rejects_without_submitting_close_order(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                return {"Result": 0, "OrderId": f"O{len(self.sent)}"}
+
+            def positions(self, **query: object) -> dict[str, object]:
+                return {
+                    "data": [
+                        {
+                            "ExecutionID": "E1",
+                            "Symbol": "161060023",
+                            "Exchange": 24,
+                            "Price": 50005,
+                            "LeavesQty": 1,
+                            "Side": "2",
+                            "HoldID": "H1",
+                        }
+                    ]
+                }
+
+        client = FakeClient()
+        controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+
+        events = controller.on_signal(
+            Signal("micro_book", "NK225micro", "long", 0.8, 49930),
+            book(ts, bid=49925, ask=49930),
+            exchange=24,
+        )
+
+        self.assertIn("position_sync", [event.reason for event in events])
+        self.assertIn("loss_hold_guard_active", [event.reason for event in events])
+        self.assertEqual(events[-1].event_type, "execution_reject")
+        self.assertEqual(events[-1].reason, "loss_hold_guard_active")
+        self.assertEqual(client.sent, [])
+
+    def test_pending_entry_timeout_cancels_active_order_before_blocking(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.cancelled: list[str] = []
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                return {"Result": 0, "OrderId": "O1"}
+
+            def positions(self, **query: object) -> dict[str, object]:
+                return {"data": []}
+
+            def orders(self, **query: object) -> dict[str, object]:
+                return {
+                    "data": [
+                        {
+                            "ID": "O1",
+                            "State": 1,
+                            "OrderState": 1,
+                            "OrderQty": 1,
+                            "CumQty": 0,
+                            "Details": [],
+                        }
+                    ]
+                }
+
+            def cancelorder(self, order_id: str) -> dict[str, object]:
+                self.cancelled.append(order_id)
+                return {"Result": 0, "OrderId": order_id}
+
+        base = default_config()
+        cfg = replace(
+            base,
+            live_execution=replace(
+                base.live_execution,
+                max_pending_entry_seconds=1,
+                pending_entry_grace_seconds=2,
+                cancel_pending_entry_on_timeout=True,
+            ),
+        )
+        client = FakeClient()
+        controller = LiveExecutionController(client, cfg, {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+
+        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+        events = controller.on_book(book(ts + timedelta(seconds=3)), None, exchange=24)
+        heartbeat = controller.heartbeat_metadata()
+
+        self.assertEqual(client.cancelled, ["O1"])
+        self.assertIn("pending_entry_timeout_cancel", [event.reason for event in events])
+        self.assertIn("pending_entry_timeout_after_grace", [event.reason for event in events])
+        self.assertEqual(heartbeat["live_entry_orders_cancelled"], 1)
+        self.assertIsNone(heartbeat["live_pending_entry"])
+
+    def test_contract_rollover_window_blocks_live_entry(self) -> None:
+        class FakeClient:
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                raise AssertionError("rollover gate should reject before sending orders")
+
+        base = default_config()
+        cfg = replace(base, symbols=replace(base.symbols, deriv_month=202604, rollover_business_days_before_last_trade=3))
+        controller = LiveExecutionController(FakeClient(), cfg, {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 8, 9, 0, tzinfo=JST)
+
+        events = controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+
+        self.assertEqual(events[0].event_type, "execution_reject")
+        self.assertEqual(events[0].reason, "contract_rollover_window")
+        self.assertEqual(events[0].metadata["blocked_by"], "contract_rollover")
 
     def test_live_order_status_marks_unfilled_fak_as_expired(self) -> None:
         class FakeClient:
@@ -3465,9 +4008,58 @@ class EvolutionAndTuningTests(unittest.TestCase):
         self.assertEqual(len(report["candidates"]), 8)
         self.assertEqual(report["baseline"]["parameters"]["imbalance_entry"], default_config().micro_engine.imbalance_entry)
         self.assertEqual(report["baseline"]["parameters"]["microprice_entry_ticks"], default_config().micro_engine.microprice_entry_ticks)
+        self.assertEqual(report["baseline"]["parameters"]["ofi_percentile"], default_config().micro_engine.ofi_percentile)
         self.assertEqual(report["baseline"]["parameters"]["spread_ticks_required"], default_config().micro_engine.spread_ticks_required)
         self.assertEqual(report["grid"]["microprice_entry_ticks"], [0.1, 0.15])
+        self.assertEqual(report["grid"]["ofi_percentile"], [default_config().micro_engine.ofi_percentile])
         self.assertEqual(report["grid"]["spread_ticks_required"], [1, 2])
+
+    def test_tune_micro_params_includes_ofi_grid_and_fill_rate_gate(self) -> None:
+        def fake_evaluate(
+            books: object,
+            config: object,
+            parameters: dict[str, object],
+            paper_fill_model: object = "immediate",
+        ) -> dict[str, object]:
+            is_baseline = parameters["ofi_percentile"] == default_config().micro_engine.ofi_percentile
+            trades = 5 if is_baseline else 12
+            return {
+                "parameters": dict(parameters),
+                "books": 1,
+                "evaluations": {},
+                "reject_reasons_top": [],
+                "signals": {},
+                "paper_events": {},
+                "exit_reasons": {},
+                "tradeable_micro_signals": trades,
+                "paper_entries": trades,
+                "simulated_fill_rate": 1.0 if is_baseline else 0.5,
+                "trades": trades,
+                "win_rate": 0.6,
+                "net_pnl_ticks": 10.0 if is_baseline else 20.0,
+                "avg_pnl_ticks": 2.0 if is_baseline else 1.6667,
+                "max_drawdown_ticks": -2.0,
+            }
+
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "tiny.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            recorder.write_book(book(datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)))
+            recorder.close()
+            with patch("kabu_futures.tuning.evaluate_micro_config", side_effect=fake_evaluate):
+                report = tune_micro_params(
+                    path,
+                    default_config(),
+                    imbalance_grid=(0.28,),
+                    microprice_grid=(0.12,),
+                    ofi_percentile_grid=(65.0,),
+                    min_trades=1,
+                    min_fill_rate=0.70,
+                )
+
+        self.assertEqual(report["grid"]["ofi_percentile"], [65.0])
+        self.assertEqual(report["decision"], "no_change")
+        self.assertFalse(report["recommendation"]["checks"]["simulated_fill_rate_ok"])
 
     def test_tune_micro_params_marks_weaker_trade_increase_as_diagnostic_only(self) -> None:
         def fake_evaluate(
@@ -3551,8 +4143,86 @@ class EvolutionAndTuningTests(unittest.TestCase):
 
 
 class ApiRegistrationTests(unittest.TestCase):
+    class _FakeHttpResponse:
+        def __init__(self, payload: dict[str, object] | list[object] | None) -> None:
+            self.raw = json.dumps(payload).encode("utf-8") if payload is not None else b""
+
+        def __enter__(self) -> "ApiRegistrationTests._FakeHttpResponse":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return self.raw
+
+    def _http_error(self, code: int, body: str) -> HTTPError:
+        return HTTPError("http://localhost/kabusapi/test", code, "error", {}, BytesIO(body.encode("utf-8")))
+
     def test_extract_symbol_code_requires_symbol(self) -> None:
         self.assertEqual(extract_symbol_code({"Symbol": "165120019"}, "NK225micro"), "165120019")
+
+    def test_query_endpoints_reauthenticate_once_after_401(self) -> None:
+        client = KabuStationClient("pw", default_config().api)
+        client.token = "OLD"
+
+        with patch(
+            "kabu_futures.api.urlopen",
+            side_effect=[
+                self._http_error(401, '{"Code":4001007,"Message":"ログイン認証エラー"}'),
+                self._FakeHttpResponse({"Token": "NEW"}),
+                self._FakeHttpResponse({"data": []}),
+            ],
+        ) as mocked:
+            result = client.positions(product=3)
+
+        self.assertEqual(result, {"data": []})
+        self.assertEqual(client.token, "NEW")
+        self.assertEqual(mocked.call_count, 3)
+
+    def test_query_endpoints_do_not_retry_non_auth_errors(self) -> None:
+        client = KabuStationClient("pw", default_config().api)
+        client.token = "OLD"
+
+        with patch("kabu_futures.api.urlopen", side_effect=[self._http_error(500, '{"Code":999}')]) as mocked:
+            with self.assertRaises(KabuApiError) as raised:
+                client.orders(product=3)
+
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertEqual(raised.exception.category, "server_error")
+        self.assertEqual(mocked.call_count, 1)
+
+    def test_api_errors_are_classified_for_live_backoff(self) -> None:
+        cases = {
+            400: "bad_request",
+            403: "forbidden",
+            429: "rate_limit",
+            500: "server_error",
+            503: "service_unavailable",
+        }
+        for status_code, category in cases.items():
+            client = KabuStationClient("pw", default_config().api)
+            client.token = "OLD"
+            with self.subTest(status_code=status_code):
+                with patch("kabu_futures.api.urlopen", side_effect=[self._http_error(status_code, '{"Code":999}')]):
+                    with self.assertRaises(KabuApiError) as raised:
+                        client.orders(product=3)
+
+                self.assertEqual(raised.exception.category, category)
+
+    def test_sendorder_does_not_retry_401_forever(self) -> None:
+        client = KabuStationClient("pw", default_config().api)
+        client.token = "OLD"
+
+        with patch(
+            "kabu_futures.api.urlopen",
+            side_effect=[self._http_error(401, '{"Code":4001007,"Message":"ログイン認証エラー"}')],
+        ) as mocked:
+            with self.assertRaises(KabuApiError) as raised:
+                client.sendorder_future({"Symbol": "161060023"})
+
+        self.assertEqual(raised.exception.category, "auth_error")
+        self.assertEqual(mocked.call_count, 1)
 
     def test_build_future_registration_symbols_resolves_each_exchange(self) -> None:
         class FakeClient:

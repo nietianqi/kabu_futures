@@ -6,6 +6,7 @@ from datetime import datetime, time, timedelta
 
 from .config import MinuteEngineConfig, MicroEngineConfig, SymbolsConfig
 from .indicators import EMA, OpeningRange, RollingATR, SessionVWAP
+from .micro_candidates import failed_directional_checks, is_near_miss
 from .microstructure import BookFeatureEngine
 from .models import Bar, BookFeatures, Direction, OrderBook, Signal, SignalEvaluation
 
@@ -395,6 +396,21 @@ class MicroStrategyEngine:
         else:
             candidate_direction = "flat"
 
+        # Per-direction failed checks (only the directional micro filters; quality
+        # gates such as spread/jump/too_soon are tracked separately).
+        long_failed_checks = failed_directional_checks(
+            imbalance_long_ok, ofi_long_ok, microprice_long_ok, minute_long_ok, topix_long_ok
+        )
+        short_failed_checks = failed_directional_checks(
+            imbalance_short_ok, ofi_short_ok, microprice_short_ok, minute_short_ok, topix_short_ok
+        )
+        # Near-miss: book quality is fine (spread=required, no jump, not throttled)
+        # and only ONE soft directional check is missing (imbalance / ofi /
+        # microprice). Bias conflicts do NOT count as near-miss because flipping
+        # bias is not a parameter-level fix.
+        long_near_miss = is_near_miss(spread_ok, features.jump_detected, too_soon, long_failed_checks)
+        short_near_miss = is_near_miss(spread_ok, features.jump_detected, too_soon, short_failed_checks)
+
         metadata = {
             "mode": self.config.mode,
             "invert_direction": self.config.invert_direction,
@@ -407,6 +423,7 @@ class MicroStrategyEngine:
             "imbalance_short_ok": imbalance_short_ok,
             "ofi_ewma": features.ofi_ewma,
             "ofi_threshold": features.ofi_threshold,
+            "ofi_percentile": self.config.ofi_percentile,
             "ofi_long_ok": ofi_long_ok,
             "ofi_short_ok": ofi_short_ok,
             "microprice_edge_ticks": features.microprice_edge_ticks,
@@ -420,12 +437,29 @@ class MicroStrategyEngine:
             "topix_long_ok": topix_long_ok,
             "topix_short_ok": topix_short_ok,
             "jump_detected": features.jump_detected,
+            "jump_reason": features.jump_reason,
             "too_soon": too_soon,
             "min_order_interval_seconds": self.config.min_order_interval_seconds,
             "latency_ms": features.latency_ms,
             "candidate_direction": candidate_direction,
             "long_edge_score": long_edge_score,
             "short_edge_score": short_edge_score,
+            "long_failed_checks": list(long_failed_checks),
+            "short_failed_checks": list(short_failed_checks),
+            "long_near_miss": long_near_miss,
+            "short_near_miss": short_near_miss,
+            "near_miss": long_near_miss or short_near_miss,
+            "near_miss_direction": (
+                "long" if long_near_miss and not short_near_miss
+                else "short" if short_near_miss and not long_near_miss
+                else "both" if long_near_miss and short_near_miss
+                else None
+            ),
+            "near_miss_missing": (
+                long_failed_checks[0] if long_near_miss and not short_near_miss
+                else short_failed_checks[0] if short_near_miss and not long_near_miss
+                else None
+            ),
         }
 
         if features.jump_detected:
