@@ -13,7 +13,7 @@ from pathlib import Path
 from statistics import median
 from typing import Iterator
 
-from .config import StrategyConfig
+from .config import MICRO_ENTRY_PROFILE_DEFAULT, StrategyConfig
 from .models import OrderBook
 from .replay import read_recorded_books
 from .tuning import DEFAULT_IMBALANCE_GRID, evaluate_micro_config, _rank_key
@@ -113,7 +113,11 @@ def _tune_from_books(
     """Run grid search over *pre-loaded* books (no path I/O)."""
     from dataclasses import replace
 
-    baseline_params = {"imbalance_entry": config.micro_engine.imbalance_entry}
+    effective_micro = config.effective_micro_engine()
+    baseline_params = {
+        "entry_profile": config.micro_engine.entry_profile,
+        "imbalance_entry": effective_micro.imbalance_entry,
+    }
     baseline = evaluate_micro_config(books, config, baseline_params)
 
     candidates: list[dict[str, object]] = []
@@ -123,7 +127,13 @@ def _tune_from_books(
         try:
             candidate_config = replace(
                 config,
-                micro_engine=replace(config.micro_engine, imbalance_entry=float(imbalance_entry)),
+                micro_engine=replace(
+                    config.micro_engine,
+                    entry_profile=MICRO_ENTRY_PROFILE_DEFAULT,
+                    imbalance_entry=float(imbalance_entry),
+                    microprice_entry_ticks=effective_micro.microprice_entry_ticks,
+                    ofi_percentile=effective_micro.ofi_percentile,
+                ),
             )
             candidate_config.validate()
         except ValueError as exc:
@@ -178,7 +188,11 @@ def walk_forward_micro(
     days = sorted(grouped.keys())
     windows = make_windows(days, train_size=train_size, test_size=test_size, step=step)
 
-    baseline_params = {"imbalance_entry": config.micro_engine.imbalance_entry}
+    effective_micro = config.effective_micro_engine()
+    baseline_params = {
+        "entry_profile": config.micro_engine.entry_profile,
+        "imbalance_entry": effective_micro.imbalance_entry,
+    }
 
     evaluations: list[dict[str, object]] = []
     pass_count = 0
@@ -228,7 +242,13 @@ def walk_forward_micro(
             try:
                 candidate_config = dc_replace(
                     config,
-                    micro_engine=dc_replace(config.micro_engine, imbalance_entry=rec_imbalance),
+                    micro_engine=dc_replace(
+                        config.micro_engine,
+                        entry_profile=MICRO_ENTRY_PROFILE_DEFAULT,
+                        imbalance_entry=rec_imbalance,
+                        microprice_entry_ticks=effective_micro.microprice_entry_ticks,
+                        ofi_percentile=effective_micro.ofi_percentile,
+                    ),
                 )
                 candidate_config.validate()
                 candidate_test = evaluate_micro_config(

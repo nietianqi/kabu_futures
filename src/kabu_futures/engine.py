@@ -38,20 +38,21 @@ class DualStrategyEngine:
             self.config.symbols,
             tick_size=self.config.tick_size,
         )
+        self.micro_config = self.config.effective_micro_engine()
         self.micro_engines = {
-            symbol: MicroStrategyEngine(self.config.micro_engine, tick_size=self.config.tick_size_for(symbol))
+            symbol: MicroStrategyEngine(self.micro_config, tick_size=self.config.tick_size_for(symbol))
             for symbol in self.config.trade_symbols()
         }
         self.micro_engine = self.micro_engines.get(self.config.symbols.primary) or next(iter(self.micro_engines.values()))
         self.book_features_by_symbol = {
-            symbol: BookFeatureEngine(self.config.micro_engine, tick_size=self.config.tick_size_for(symbol))
+            symbol: BookFeatureEngine(self.micro_config, tick_size=self.config.tick_size_for(symbol))
             for symbol in self.config.trade_symbols()
         }
         self.multi_timeframe = MultiTimeframeScorer(self.config.multi_timeframe)
-        self.risk = RiskManager(self.config.risk, self.config.micro_engine)
+        self.risk = RiskManager(self.config.risk, self.micro_config)
         self.throttle = OrderThrottle(
-            self.config.micro_engine.min_order_interval_seconds,
-            self.config.micro_engine.max_new_entries_per_minute,
+            self.micro_config.min_order_interval_seconds,
+            self.micro_config.max_new_entries_per_minute,
         )
         self.entry_policy = StrategyEntryPolicy(self.config, self.risk, self.throttle)
         self.bar_builder_1m = BarBuilder(60)

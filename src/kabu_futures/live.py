@@ -436,6 +436,8 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                 "live_orders": options.live_orders,
                 "code_fingerprint": startup_self_check["code_fingerprint"],
                 "config_fingerprint": startup_self_check["config_fingerprint"],
+                "micro_entry_profile": startup_self_check["micro_entry_profile"],
+                "micro_effective_thresholds": startup_self_check["micro_effective_thresholds"],
                 "live_minute_atr_filter": startup_self_check["live_minute_atr_filter"],
                 "min_execution_score_to_chase": startup_self_check["min_execution_score_to_chase"],
                 **_session_state_to_dict(startup_session),

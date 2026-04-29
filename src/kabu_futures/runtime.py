@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .config import StrategyConfig
+from .config import StrategyConfig, micro_entry_profile_metadata
 
 
 FINGERPRINT_SOURCE_FILES = (
@@ -39,6 +39,7 @@ def live_startup_self_check(config: StrategyConfig) -> dict[str, object]:
     return {
         "code_fingerprint": code_fingerprint(),
         "config_fingerprint": config_fingerprint(config),
+        **micro_entry_profile_metadata(config),
         "live_minute_atr_filter": True,
         "live_minute_execution_score_filter": True,
         "min_execution_score_to_chase": config.multi_timeframe.min_execution_score_to_chase,

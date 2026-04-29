@@ -22,6 +22,7 @@
     "directional_intraday_long_observe_only": false
   },
   "micro_engine": {
+    "entry_profile": "default",
     "mode": "observe_only",
     "qty": 1,
     "depth_levels": 5,
@@ -29,6 +30,7 @@
     "imbalance_entry": 0.3,
     "imbalance_exit": 0.1,
     "microprice_entry_ticks": 0.15,
+    "ofi_percentile": 70.0,
     "spread_ticks_required": 1,
     "take_profit_ticks": 1,
     "stop_loss_ticks": 3,

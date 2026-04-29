@@ -5,7 +5,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from math import exp
 
-from .config import MicroEngineConfig
+from .config import MicroEngineConfig, effective_micro_engine_config
 from .models import BookFeatures, Level, OrderBook, TradeTick
 
 
@@ -96,7 +96,7 @@ def order_flow_imbalance(previous: OrderBook | None, current: OrderBook) -> floa
 
 class BookFeatureEngine:
     def __init__(self, config: MicroEngineConfig, tick_size: float = 5.0) -> None:
-        self.config = config
+        self.config = effective_micro_engine_config(config)
         self.tick_size = tick_size
         self.previous: OrderBook | None = None
         self.ofi_ewma = 0.0

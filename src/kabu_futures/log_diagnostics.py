@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .api import classify_kabu_api_error
-from .config import StrategyConfig, default_config
+from .config import StrategyConfig, default_config, micro_entry_profile_metadata
 from .diagnostics_scoring import live_readiness_score
 from .micro_candidates import near_miss_key
 
@@ -28,6 +28,8 @@ def diagnose_log(source: str | Path, config: StrategyConfig | None = None, max_r
         "symbol_mapping_issues": Counter(),
         "minute_live_filter_violations": 0,
         "startup_checks": [],
+        "micro_entry_profiles": Counter(),
+        "micro_effective_thresholds": {},
         "loss_samples": [],
         "loss_sample_limit": LOSS_SAMPLE_LIMIT,
         "losses_total": 0,
@@ -166,6 +168,7 @@ def diagnose_log(source: str | Path, config: StrategyConfig | None = None, max_r
         "execution_latency_ms": _latency_summary(counters["order_latency_ms"]),
         "live_readiness_score": live_readiness_score(counters, cfg),
         "startup_checks": counters["startup_checks"],
+        "micro_entry_profile": _micro_entry_profile_summary(counters, cfg),
         "diagnosis_notes": _diagnosis_notes(counters),
         "suspected_old_live_policy": bool(counters["suspected_old_live_policy"]),
     }
@@ -204,13 +207,34 @@ def _record_startup(payload: dict[str, Any], counters: dict[str, Any]) -> None:
     check = {
         "code_fingerprint": payload.get("code_fingerprint"),
         "config_fingerprint": payload.get("config_fingerprint"),
+        "micro_entry_profile": payload.get("micro_entry_profile"),
+        "micro_effective_thresholds": payload.get("micro_effective_thresholds"),
         "live_minute_atr_filter": payload.get("live_minute_atr_filter"),
         "min_execution_score_to_chase": payload.get("min_execution_score_to_chase"),
         "live_supported_engines": payload.get("live_supported_engines"),
     }
     counters["startup_checks"].append(check)
+    profile = payload.get("micro_entry_profile")
+    if profile:
+        counters["micro_entry_profiles"][str(profile)] += 1
+    thresholds = payload.get("micro_effective_thresholds")
+    if isinstance(thresholds, dict):
+        counters["micro_effective_thresholds"] = thresholds
     if payload.get("live_minute_atr_filter") is not True:
         counters["suspected_old_live_policy"] = True
+
+
+def _micro_entry_profile_summary(counters: dict[str, Any], config: StrategyConfig) -> dict[str, object]:
+    configured = micro_entry_profile_metadata(config)
+    observed_profiles = dict(counters["micro_entry_profiles"])
+    observed_thresholds = counters["micro_effective_thresholds"]
+    return {
+        "configured_profile": configured["micro_entry_profile"],
+        "configured_effective_thresholds": configured["micro_effective_thresholds"],
+        "observed_profiles": observed_profiles,
+        "observed_effective_thresholds": observed_thresholds if isinstance(observed_thresholds, dict) else {},
+        "startup_profile_seen": bool(observed_profiles),
+    }
 
 
 def _record_error(payload: dict[str, Any], metadata: dict[str, Any], counters: dict[str, Any]) -> None:

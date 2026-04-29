@@ -34,7 +34,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from kabu_futures.config import default_config, load_json_config
+from kabu_futures.config import MICRO_ENTRY_PROFILE_DEFAULT, default_config, load_json_config
 from kabu_futures.evolution import analyze_micro_log
 from kabu_futures.promotion import PromotionThresholds, evaluate_challenger
 from kabu_futures.tuning import DEFAULT_IMBALANCE_GRID, tune_micro_params
@@ -167,6 +167,7 @@ def main() -> int:
 
             all_books = list(_iter_books_from_source(args.path))
             regime_books = split_books_by_regime(all_books)
+            effective_micro = config.effective_micro_engine()
             for regime_name, r_books in regime_books.items():
                 if regime_name == "warmup" or len(r_books) < 500:
                     continue
@@ -176,7 +177,13 @@ def main() -> int:
                     try:
                         r_cfg = replace(
                             config,
-                            micro_engine=replace(config.micro_engine, imbalance_entry=float(imbalance)),
+                            micro_engine=replace(
+                                config.micro_engine,
+                                entry_profile=MICRO_ENTRY_PROFILE_DEFAULT,
+                                imbalance_entry=float(imbalance),
+                                microprice_entry_ticks=effective_micro.microprice_entry_ticks,
+                                ofi_percentile=effective_micro.ofi_percentile,
+                            ),
                         )
                         r_cfg.validate()
                     except ValueError:
