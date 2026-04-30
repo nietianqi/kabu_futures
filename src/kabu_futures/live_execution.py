@@ -161,7 +161,7 @@ class LiveExecutionController:
             ]
         if self.last_position_poll_at is None or (self.position_sync_blocked and self._should_poll_positions(event_time)):
             events.extend(self._sync_position(book, exchange))
-            events.extend(self._evaluate_live_guards(book, event_time))
+            events.extend(self._evaluate_live_guards(book, None, event_time))
             events.extend(self._submit_take_profit_orders(book, exchange, event_time))
         if self.loss_hold_guard_active:
             return events + [
@@ -364,7 +364,7 @@ class LiveExecutionController:
         if self._should_poll_positions(event_time):
             events.extend(self._sync_order_status(book))
             events.extend(self._sync_position(book, exchange))
-        events.extend(self._evaluate_live_guards(book, event_time))
+        events.extend(self._evaluate_live_guards(book, features, event_time))
         if self.config.live_execution.kill_switch_enabled:
             events.extend(self._cancel_all_pending_orders(book, event_time, "kill_switch_cancel_pending_order"))
         elif self.loss_hold_guard_active:
@@ -680,6 +680,9 @@ class LiveExecutionController:
             self.exit_failure_counts.pop(position_key, None)
             self.exit_blocked.discard(position_key)
             closed_trade = self.closed_trade_by_position_key.pop(position_key, None)
+            guard_clear_metadata: dict[str, object] = {}
+            if not self.live_positions:
+                guard_clear_metadata = self._clear_loss_hold_guard(event_time, "positions_flat_confirmed")
             events.append(
                 ExecutionEvent(
                     "live_position_flat",
@@ -693,6 +696,7 @@ class LiveExecutionController:
                         "position_key": position_key,
                         "hold_id": slot.position.hold_id,
                         "live_trade": closed_trade,
+                        **guard_clear_metadata,
                     },
                 )
             )
@@ -1292,13 +1296,44 @@ class LiveExecutionController:
             last_position_poll_at=self.last_position_poll_at,
         )
 
-    def _evaluate_live_guards(self, book: OrderBook, event_time: datetime) -> list[ExecutionEvent]:
+    def _evaluate_live_guards(self, book: OrderBook, features: BookFeatures | None, event_time: datetime) -> list[ExecutionEvent]:
         if self.loss_hold_guard_active:
+            if not self.live_positions:
+                self._clear_loss_hold_guard(event_time, "no_live_positions")
             return []
         snapshot = self._loss_hold_snapshot(book)
         reason = _loss_hold_reason(snapshot, self.config.live_execution.loss_hold_guard_ticks, self.config.live_execution.daily_loss_limit_yen)
         if reason is None:
             return []
+        suspect_reason = self._loss_hold_mark_suspect_reason(book, features, snapshot)
+        if suspect_reason is not None:
+            return [
+                ExecutionEvent(
+                    "live_guard_status",
+                    book.symbol,
+                    "flat",
+                    reason="loss_hold_guard_mark_price_suspect",
+                    timestamp=event_time,
+                    metadata={
+                        **event_trace_metadata(
+                            "position_lifecycle",
+                            "status",
+                            "loss_hold_guard_mark_price_suspect",
+                            "mark_price_quality",
+                            {
+                                "loss_hold_guard_reason": reason,
+                                "loss_hold_guard_snapshot": snapshot,
+                                "mark_price_suspect_reason": suspect_reason,
+                                "spread_ticks": _features_spread_ticks(book, features, self.config.tick_size_for(book.symbol)),
+                                "jump_detected": bool(features.jump_detected) if features is not None else False,
+                                "jump_reason": features.jump_reason if features is not None else None,
+                            },
+                        ),
+                        "manual_review_required": False,
+                        "auto_loss_close_disabled": True,
+                    },
+                )
+            ]
         self.loss_hold_guard_active = True
         self.loss_hold_guard_since = event_time
         self.loss_hold_guard_reason = reason
@@ -1324,6 +1359,46 @@ class LiveExecutionController:
                 },
             )
         ]
+
+    def _loss_hold_mark_suspect_reason(
+        self,
+        book: OrderBook,
+        features: BookFeatures | None,
+        snapshot: dict[str, object],
+    ) -> str | None:
+        if not snapshot.get("positions"):
+            return None
+        tick_size = self.config.tick_size_for(book.symbol)
+        spread_ticks = _features_spread_ticks(book, features, tick_size)
+        if features is not None and features.symbol == book.symbol and features.jump_detected:
+            return str(features.jump_reason or "jump_detected")
+        if spread_ticks > 2.0:
+            return "spread_wide"
+        worst_ticks = abs(_optional_float(snapshot.get("worst_unrealized_ticks")) or 0.0)
+        max_loss_ticks = float(self.config.live_execution.loss_hold_guard_ticks)
+        if max_loss_ticks > 0 and worst_ticks > max_loss_ticks * 5.0:
+            return "unrealized_ticks_outlier"
+        return None
+
+    def _clear_loss_hold_guard(self, event_time: datetime, reason: str) -> dict[str, object]:
+        if not self.loss_hold_guard_active:
+            return {}
+        previous_since = self.loss_hold_guard_since
+        previous_reason = self.loss_hold_guard_reason
+        previous_snapshot = dict(self.loss_hold_guard_snapshot)
+        self.loss_hold_guard_active = False
+        self.loss_hold_guard_since = None
+        self.loss_hold_guard_reason = None
+        self.loss_hold_guard_snapshot = {}
+        self.loss_hold_guard_reported = False
+        return {
+            "loss_hold_guard_cleared": True,
+            "loss_hold_guard_clear_reason": reason,
+            "previous_loss_hold_guard_since": previous_since.isoformat() if previous_since else None,
+            "previous_loss_hold_guard_reason": previous_reason,
+            "previous_loss_hold_guard_snapshot": previous_snapshot,
+            "loss_hold_guard_cleared_at": event_time.isoformat(),
+        }
 
     def _loss_hold_snapshot(self, book: OrderBook) -> dict[str, object]:
         positions: list[dict[str, object]] = []
@@ -1525,6 +1600,14 @@ def _loss_hold_reason(snapshot: dict[str, object], max_loss_ticks: float, daily_
     if daily_loss_yen > 0 and total_pnl_yen <= -float(daily_loss_yen):
         return "daily_realized_or_unrealized_loss_limit"
     return None
+
+
+def _features_spread_ticks(book: OrderBook, features: BookFeatures | None, tick_size: float) -> float:
+    if features is not None and features.symbol == book.symbol:
+        return float(features.spread_ticks)
+    if tick_size <= 0:
+        return 0.0
+    return float(book.spread / tick_size)
 
 
 def _order_snapshot_active(snapshot: dict[str, Any] | None) -> bool:

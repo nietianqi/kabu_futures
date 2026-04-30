@@ -66,6 +66,7 @@ def diagnose_log(source: str | Path, config: StrategyConfig | None = None, max_r
         "loss_hold_guard_events": 0,
         "kill_switch_events": 0,
         "order_latency_ms": defaultdict(list),
+        "heartbeat_process_ms": defaultdict(list),
         "suspected_old_live_policy": False,
     }
     pnl_by_engine: dict[str, dict[str, float]] = defaultdict(_pnl_bucket)
@@ -100,6 +101,8 @@ def diagnose_log(source: str | Path, config: StrategyConfig | None = None, max_r
             _record_execution_reject(payload, metadata, counters)
         if event in {"live_order_error", "live_sync_error", "market_data_error", "live_error"}:
             _record_error(payload, metadata, counters)
+        if event == "heartbeat":
+            _record_heartbeat_process_metrics(payload, metadata, counters)
         _record_order_timing(payload, metadata, counters)
         if event == "live_order_expired":
             counters["expired_orders"][str(payload.get("reason") or metadata.get("reason") or "unknown")] += 1
@@ -176,6 +179,7 @@ def diagnose_log(source: str | Path, config: StrategyConfig | None = None, max_r
         "live_readiness_score": live_readiness_score(counters, cfg),
         "startup_checks": counters["startup_checks"],
         "micro_entry_profile": _micro_entry_profile_summary(counters, cfg),
+        "process_time_metrics": _process_time_metrics(counters),
         "diagnosis_notes": diagnosis_notes(counters),
         "suspected_old_live_policy": bool(counters["suspected_old_live_policy"]),
     }
@@ -252,10 +256,46 @@ def _record_error(payload: dict[str, Any], metadata: dict[str, Any], counters: d
     if reason.startswith("entry_order_") or trade_type == 1:
         counters["live_entry_order_errors"] += 1
     error = metadata.get("error") or payload.get("error")
-    category = str(metadata.get("api_error_category") or metadata.get("category") or classify_kabu_api_error(error or reason))
+    category = str(
+        metadata.get("api_error_category")
+        or metadata.get("category")
+        or payload.get("category")
+        or classify_kabu_api_error(error or reason)
+    )
     counters["api_error_categories"][category] += 1
     if error:
         counters["api_errors"][f"error:{str(error)[:120]}"] += 1
+
+
+def _record_heartbeat_process_metrics(payload: dict[str, Any], metadata: dict[str, Any], counters: dict[str, Any]) -> None:
+    metrics = counters["heartbeat_process_ms"]
+    avg_process_ms = _to_float(payload.get("avg_process_ms") if payload.get("avg_process_ms") is not None else metadata.get("avg_process_ms"))
+    cumulative = _to_float(
+        payload.get("avg_process_ms_cumulative")
+        if payload.get("avg_process_ms_cumulative") is not None
+        else metadata.get("avg_process_ms_cumulative")
+    )
+    if cumulative is None:
+        cumulative = avg_process_ms
+    if cumulative is not None:
+        metrics["avg_process_ms_cumulative"].append(cumulative)
+    for key in ("recent_avg_process_ms", "process_ms_p95", "process_ms_max_recent"):
+        value = _to_float(payload.get(key) if payload.get(key) is not None else metadata.get(key))
+        if value is not None:
+            metrics[key].append(value)
+
+
+def _process_time_metrics(counters: dict[str, Any]) -> dict[str, object]:
+    return {
+        "field_semantics": {
+            "avg_process_ms": "cumulative_session_average",
+            "avg_process_ms_cumulative": "cumulative_session_average",
+            "recent_avg_process_ms": "rolling_window_average",
+            "process_ms_p95": "rolling_window_p95",
+            "process_ms_max_recent": "rolling_window_max",
+        },
+        "summary": latency_summary(counters["heartbeat_process_ms"]),
+    }
 
 
 def _record_order_timing(payload: dict[str, Any], metadata: dict[str, Any], counters: dict[str, Any]) -> None:

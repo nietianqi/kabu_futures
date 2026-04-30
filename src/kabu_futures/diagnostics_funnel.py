@@ -70,6 +70,8 @@ def diagnosis_notes(counters: dict[str, Any]) -> list[str]:
         notes.append("kabu_auth_errors_blocked_live_entry")
     if api_categories.get("kabu_station_wrong_instance"):
         notes.append("kabu_station_wrong_instance_detected_switch_to_orderable_instance")
+    if api_categories.get("websocket_remote_closed"):
+        notes.append("websocket_remote_closed_reconnects_detected")
     if counters["position_sync_blocked_rejects"]:
         notes.append("position_sync_blocked_prevented_live_entry")
     if counters["loss_hold_guard_events"]:
