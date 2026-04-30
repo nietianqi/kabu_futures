@@ -147,6 +147,19 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(effective.spread_ticks_required, cfg.micro_engine.spread_ticks_required)
         self.assertEqual(effective.qty, cfg.micro_engine.qty)
 
+    def test_conservative_ofi_profile_overrides_only_ofi_threshold(self) -> None:
+        cfg = replace(
+            default_config(),
+            micro_engine=replace(default_config().micro_engine, entry_profile="conservative_ofi_v1"),
+        )
+        effective = cfg.effective_micro_engine()
+
+        self.assertEqual(effective.imbalance_entry, cfg.micro_engine.imbalance_entry)
+        self.assertEqual(effective.microprice_entry_ticks, cfg.micro_engine.microprice_entry_ticks)
+        self.assertEqual(effective.ofi_percentile, 65.0)
+        self.assertEqual(effective.spread_ticks_required, cfg.micro_engine.spread_ticks_required)
+        self.assertEqual(effective.qty, cfg.micro_engine.qty)
+
     def test_unknown_micro_entry_profile_is_rejected(self) -> None:
         cfg = replace(default_config(), micro_engine=replace(default_config().micro_engine, entry_profile="aggressive"))
 
@@ -162,6 +175,19 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(cfg.micro_engine.entry_profile, "conservative_candidate_v1")
         self.assertEqual(effective_micro_engine_config(cfg.micro_engine).imbalance_entry, 0.28)
+
+    def test_load_json_config_accepts_conservative_ofi_profile(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = pathlib.Path(temp_dir) / "ofi.json"
+            path.write_text('{"micro_engine":{"entry_profile":"conservative_ofi_v1"}}', encoding="utf-8")
+
+            cfg = load_json_config(path)
+
+        effective = effective_micro_engine_config(cfg.micro_engine)
+        self.assertEqual(cfg.micro_engine.entry_profile, "conservative_ofi_v1")
+        self.assertEqual(effective.imbalance_entry, 0.30)
+        self.assertEqual(effective.microprice_entry_ticks, 0.15)
+        self.assertEqual(effective.ofi_percentile, 65.0)
 
     def test_load_json_config_validates_inconsistent_micro_thresholds(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1029,6 +1055,20 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertEqual(payload["micro_effective_thresholds"]["microprice_entry_ticks"], 0.12)
         self.assertEqual(payload["micro_effective_thresholds"]["ofi_percentile"], 65.0)
 
+    def test_live_startup_self_check_exposes_ofi_only_profile_thresholds(self) -> None:
+        cfg = replace(
+            default_config(),
+            micro_engine=replace(default_config().micro_engine, entry_profile="conservative_ofi_v1"),
+        )
+
+        payload = live_startup_self_check(cfg)
+
+        self.assertEqual(payload["micro_entry_profile"], "conservative_ofi_v1")
+        self.assertTrue(payload["micro_entry_profile_active"])
+        self.assertEqual(payload["micro_effective_thresholds"]["imbalance_entry"], 0.3)
+        self.assertEqual(payload["micro_effective_thresholds"]["microprice_entry_ticks"], 0.15)
+        self.assertEqual(payload["micro_effective_thresholds"]["ofi_percentile"], 65.0)
+
     def test_diagnose_log_reports_micro_entry_profile(self) -> None:
         cfg = replace(
             default_config(),
@@ -1364,7 +1404,31 @@ class MarketDataAndExecutionTests(unittest.TestCase):
                         "symbol": "NK225micro",
                         "direction": "flat",
                         "reason": "loss_hold_guard_active",
-                        "metadata": {"auto_loss_close_disabled": True, "manual_review_required": True},
+                        "timestamp": "2026-04-30T10:58:01+00:00",
+                        "metadata": {
+                            "auto_loss_close_disabled": True,
+                            "manual_review_required": True,
+                            "blocked_by": "loss_hold_guard",
+                            "decision_trace": {
+                                "checks": {
+                                    "loss_hold_guard_reason": "unrealized_loss_ticks_limit",
+                                    "loss_hold_guard_snapshot": {
+                                        "positions": [
+                                            {
+                                                "symbol": "NK225micro",
+                                                "direction": "long",
+                                                "entry_price": 50000.0,
+                                                "mark_price": 49900.0,
+                                                "unrealized_ticks": -20.0,
+                                                "unrealized_yen": -1000.0,
+                                            }
+                                        ],
+                                        "worst_unrealized_ticks": -20.0,
+                                        "loss_hold_guard_ticks": 15.0,
+                                    },
+                                }
+                            },
+                        },
                     },
                 },
                 {
@@ -1396,6 +1460,10 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertEqual(diagnostics["micro_entry_funnel"]["live_execution"]["entry_orders_cancelled"], 1)
         self.assertEqual(diagnostics["micro_entry_funnel"]["live_execution"]["loss_hold_guard_events"], 1)
         self.assertIn("loss_hold_guard_requires_manual_review_no_auto_loss_close", diagnostics["diagnosis_notes"])
+        self.assertEqual(diagnostics["loss_hold_guard_samples"][0]["loss_hold_guard_reason"], "unrealized_loss_ticks_limit")
+        self.assertEqual(diagnostics["loss_hold_guard_samples"][0]["snapshot"]["worst_unrealized_ticks"], -20.0)
+        self.assertEqual(diagnostics["loss_hold_guard_samples"][0]["later_exit_reason"], "take_profit")
+        self.assertEqual(diagnostics["loss_hold_guard_samples"][0]["later_pnl_ticks"], 2.0)
 
     def test_micro_trade_manager_exits_on_take_profit(self) -> None:
         cfg = default_config()
@@ -4582,9 +4650,12 @@ class CandidateReviewTests(unittest.TestCase):
             report = cli.jump_markout_report(path, default_config(), horizons=(1.0, 5.0))
 
         self.assertFalse(report["live_behavior_changed"])
+        self.assertEqual(report["required_spread_ticks"], 1)
         self.assertIn("mid_move_jump", report["by_jump_reason"])
         self.assertIn("spread_wide", report["by_jump_reason"])
         self.assertEqual(report["by_jump_reason"]["spread_wide"]["events"], 2)
+        self.assertEqual(report["by_jump_reason"]["spread_wide"]["symbols"]["NK225micro"], 2)
+        self.assertEqual(report["by_jump_reason"]["spread_wide"]["future_tradeable_quotes"]["1.0"]["tradeable_rate"], 1.0)
         self.assertGreater(report["by_jump_reason"]["mid_move_jump"]["directional_markout_ticks"]["1.0"]["avg_ticks"], 0)
 
     def test_candidate_review_cli_writes_no_change_report(self) -> None:
@@ -4617,7 +4688,7 @@ class CandidateReviewTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             config_path = pathlib.Path(tmp) / "config.json"
-            config_path.write_text('{"micro_engine":{"entry_profile":"conservative_candidate_v1"}}', encoding="utf-8")
+            config_path.write_text('{"micro_engine":{"entry_profile":"conservative_ofi_v1"}}', encoding="utf-8")
             args = cli.build_parser().parse_args(
                 [
                     str(pathlib.Path(tmp) / "missing_logs"),
@@ -4633,8 +4704,10 @@ class CandidateReviewTests(unittest.TestCase):
                             with patch.object(cli, "evaluate_challenger", return_value=PromotionDecision(decision="reject")):
                                 report = cli.build_report(args)
 
-        self.assertEqual(report["live_rules_unchanged"]["micro_entry_profile"], "conservative_candidate_v1")
-        self.assertEqual(report["live_rules_unchanged"]["micro_effective_thresholds"]["imbalance_entry"], 0.28)
+        self.assertEqual(report["live_rules_unchanged"]["micro_entry_profile"], "conservative_ofi_v1")
+        self.assertEqual(report["live_rules_unchanged"]["micro_effective_thresholds"]["imbalance_entry"], 0.30)
+        self.assertEqual(report["live_rules_unchanged"]["micro_effective_thresholds"]["microprice_entry_ticks"], 0.15)
+        self.assertEqual(report["live_rules_unchanged"]["micro_effective_thresholds"]["ofi_percentile"], 65.0)
         self.assertFalse(report["live_config_changed"])
 
 

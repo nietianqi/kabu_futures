@@ -34,6 +34,8 @@ def diagnose_log(source: str | Path, config: StrategyConfig | None = None, max_r
         "loss_samples": [],
         "loss_sample_limit": LOSS_SAMPLE_LIMIT,
         "losses_total": 0,
+        "loss_hold_guard_samples": [],
+        "loss_hold_guard_sample_limit": LOSS_SAMPLE_LIMIT,
         "signal_eval_decisions": Counter(),
         "signal_eval_engines": Counter(),
         "signal_eval_reject_reasons": Counter(),
@@ -110,6 +112,7 @@ def diagnose_log(source: str | Path, config: StrategyConfig | None = None, max_r
                 counters["live_entry_orders_cancelled"] += 1
         if str(payload.get("reason") or "") == "loss_hold_guard_active":
             counters["loss_hold_guard_events"] += 1
+            _record_loss_hold_guard(payload, metadata, counters)
         if str(payload.get("reason") or "") == "kill_switch_active":
             counters["kill_switch_events"] += 1
 
@@ -146,6 +149,7 @@ def diagnose_log(source: str | Path, config: StrategyConfig | None = None, max_r
         if event == "live_trade_closed":
             counters["live_trades_closed"] += 1
             _record_closed_trade(payload, metadata, pnl_by_engine, pnl_by_exit_reason, counters, cfg)
+            _mark_loss_hold_guard_closed(payload, metadata, counters)
             exit_order_id = str(metadata.get("exit_order_id") or "")
             if exit_order_id:
                 recorded_exit_order_ids.add(exit_order_id)
@@ -159,6 +163,8 @@ def diagnose_log(source: str | Path, config: StrategyConfig | None = None, max_r
         "losses_total": counters["losses_total"],
         "loss_samples": counters["loss_samples"],
         "loss_sample_limit": counters["loss_sample_limit"],
+        "loss_hold_guard_samples": counters["loss_hold_guard_samples"],
+        "loss_hold_guard_sample_limit": counters["loss_hold_guard_sample_limit"],
         "api_errors": dict(counters["api_errors"]),
         "api_error_categories": dict(counters["api_error_categories"]),
         "expired_orders": dict(counters["expired_orders"]),
@@ -323,6 +329,52 @@ def _record_execution_reject(payload: dict[str, Any], metadata: dict[str, Any], 
     engine = signal.get("engine") if isinstance(signal, dict) else metadata.get("engine")
     if reason == "live_unsupported_signal_engine" and engine in MINUTE_SIGNAL_ENGINES:
         counters["live_unsupported_minute_signals"] += 1
+
+
+def _record_loss_hold_guard(payload: dict[str, Any], metadata: dict[str, Any], counters: dict[str, Any]) -> None:
+    if len(counters["loss_hold_guard_samples"]) >= counters["loss_hold_guard_sample_limit"]:
+        return
+    trace = metadata.get("decision_trace") if isinstance(metadata.get("decision_trace"), dict) else {}
+    assert isinstance(trace, dict)
+    checks = trace.get("checks") if isinstance(trace.get("checks"), dict) else {}
+    assert isinstance(checks, dict)
+    snapshot = checks.get("loss_hold_guard_snapshot") if isinstance(checks.get("loss_hold_guard_snapshot"), dict) else {}
+    assert isinstance(snapshot, dict)
+    sample = {
+        "timestamp": payload.get("timestamp"),
+        "event": payload.get("event") or payload.get("event_type"),
+        "symbol": payload.get("symbol"),
+        "direction": payload.get("direction"),
+        "blocked_by": metadata.get("blocked_by"),
+        "loss_hold_guard_reason": checks.get("loss_hold_guard_reason"),
+        "manual_review_required": metadata.get("manual_review_required") is True
+        or checks.get("manual_review_required") is True,
+        "auto_loss_close_disabled": metadata.get("auto_loss_close_disabled") is True
+        or checks.get("auto_loss_close_disabled") is True,
+        "snapshot": snapshot,
+        "later_exit_reason": None,
+        "later_pnl_ticks": None,
+        "later_pnl_yen": None,
+    }
+    counters["loss_hold_guard_samples"].append(sample)
+
+
+def _mark_loss_hold_guard_closed(payload: dict[str, Any], metadata: dict[str, Any], counters: dict[str, Any]) -> None:
+    symbol = payload.get("symbol")
+    direction = payload.get("direction")
+    exit_reason = metadata.get("exit_reason") or payload.get("reason")
+    pnl_ticks = metadata.get("pnl_ticks") if metadata.get("pnl_ticks") is not None else payload.get("pnl_ticks")
+    pnl_yen = metadata.get("pnl_yen") if metadata.get("pnl_yen") is not None else payload.get("pnl_yen")
+    for sample in reversed(counters["loss_hold_guard_samples"]):
+        if sample.get("later_exit_reason") is not None:
+            continue
+        if sample.get("symbol") not in {symbol, None}:
+            continue
+        if sample.get("direction") not in {direction, "flat", None}:
+            continue
+        sample["later_exit_reason"] = exit_reason
+        sample["later_pnl_ticks"] = pnl_ticks
+        sample["later_pnl_yen"] = pnl_yen
 
 
 def _event_count(payload: dict[str, Any]) -> int:

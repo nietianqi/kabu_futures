@@ -401,12 +401,13 @@ def _observation_days(diagnostics: dict[str, object], walk_forward_report: dict[
 
 
 class _Quote:
-    __slots__ = ("timestamp", "symbol", "mid")
+    __slots__ = ("timestamp", "symbol", "mid", "spread_ticks")
 
-    def __init__(self, timestamp: datetime, symbol: str, mid: float) -> None:
+    def __init__(self, timestamp: datetime, symbol: str, mid: float, spread_ticks: float) -> None:
         self.timestamp = timestamp
         self.symbol = symbol
         self.mid = mid
+        self.spread_ticks = spread_ticks
 
 
 def jump_markout_report(
@@ -418,7 +419,8 @@ def jump_markout_report(
     max_rows: int | None = None,
 ) -> dict[str, object]:
     horizon_values = tuple(float(value) for value in horizons)
-    quotes_by_symbol, times_by_symbol, books_loaded = _load_quote_index(source, max_books=max_books)
+    required_spread_ticks = config.effective_micro_engine().spread_ticks_required
+    quotes_by_symbol, times_by_symbol, books_loaded = _load_quote_index(source, config, max_books=max_books)
     by_reason: dict[str, dict[str, Any]] = defaultdict(_jump_bucket)
     rows_read = 0
     for row in _iter_jsonl_rows(source):
@@ -440,6 +442,7 @@ def jump_markout_report(
         bucket = by_reason[reason]
         bucket["events"] += count
         bucket["directions"][direction] += count
+        bucket["symbols"][symbol] += count
         if timestamp is None or symbol == "unknown":
             bucket["missing_quote_samples"] += 1
             continue
@@ -452,6 +455,10 @@ def jump_markout_report(
             future = _future_quote(symbol, timestamp + timedelta(seconds=horizon), 0.0, quotes_by_symbol, times_by_symbol)
             if future is None:
                 continue
+            future_tradeable = bucket["future_tradeable_quotes"][str(horizon)]
+            future_tradeable["samples"] += count
+            if round(future.spread_ticks) == required_spread_ticks:
+                future_tradeable["tradeable_quotes"] += count
             tick_size = config.tick_size_for(symbol)
             abs_move = abs(future.mid - quote.mid) / tick_size
             bucket["absolute_move"][str(horizon)].append(abs_move)
@@ -463,6 +470,7 @@ def jump_markout_report(
         "books_loaded": books_loaded,
         "rows_read": rows_read,
         "horizons_seconds": list(horizon_values),
+        "required_spread_ticks": required_spread_ticks,
         "live_behavior_changed": False,
         "by_jump_reason": {
             reason: {
@@ -470,6 +478,8 @@ def jump_markout_report(
                 "samples": int(bucket["samples"]),
                 "missing_quote_samples": int(bucket["missing_quote_samples"]),
                 "directions": dict(bucket["directions"]),
+                "symbols": dict(bucket["symbols"]),
+                "future_tradeable_quotes": _future_tradeability_summary(bucket["future_tradeable_quotes"]),
                 "absolute_move_ticks": markout_summary(bucket["absolute_move"]),
                 "directional_markout_ticks": markout_summary(bucket["directional_markout"]),
             }
@@ -485,13 +495,29 @@ def _jump_bucket() -> dict[str, Any]:
         "samples": 0,
         "missing_quote_samples": 0,
         "directions": Counter(),
+        "symbols": Counter(),
+        "future_tradeable_quotes": defaultdict(lambda: {"samples": 0, "tradeable_quotes": 0}),
         "absolute_move": defaultdict(list),
         "directional_markout": defaultdict(list),
     }
 
 
+def _future_tradeability_summary(raw: dict[str, dict[str, int]]) -> dict[str, dict[str, float]]:
+    summary: dict[str, dict[str, float]] = {}
+    for horizon, values in sorted(raw.items(), key=lambda item: float(item[0])):
+        samples = int(values.get("samples", 0))
+        tradeable = int(values.get("tradeable_quotes", 0))
+        summary[horizon] = {
+            "samples": float(samples),
+            "tradeable_quotes": float(tradeable),
+            "tradeable_rate": round(tradeable / samples, 4) if samples else 0.0,
+        }
+    return summary
+
+
 def _load_quote_index(
     source: str | Path,
+    config: StrategyConfig,
     *,
     max_books: int | None = None,
 ) -> tuple[dict[str, list[_Quote]], dict[str, list[datetime]], int]:
@@ -499,7 +525,7 @@ def _load_quote_index(
     books_loaded = 0
     for book in iter_books(source):
         books_loaded += 1
-        quotes_by_symbol[book.symbol].append(_book_quote(book))
+        quotes_by_symbol[book.symbol].append(_book_quote(book, config))
         if max_books is not None and books_loaded >= max_books:
             break
     times_by_symbol: dict[str, list[datetime]] = {}
@@ -509,9 +535,11 @@ def _load_quote_index(
     return quotes_by_symbol, times_by_symbol, books_loaded
 
 
-def _book_quote(book: OrderBook) -> _Quote:
+def _book_quote(book: OrderBook, config: StrategyConfig) -> _Quote:
     timestamp = book.received_at or book.timestamp
-    return _Quote(timestamp, book.symbol, (book.best_bid_price + book.best_ask_price) / 2.0)
+    tick_size = config.tick_size_for(book.symbol)
+    spread_ticks = (book.best_ask_price - book.best_bid_price) / tick_size if tick_size > 0 else 0.0
+    return _Quote(timestamp, book.symbol, (book.best_bid_price + book.best_ask_price) / 2.0, spread_ticks)
 
 
 def _future_quote(

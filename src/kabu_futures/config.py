@@ -8,10 +8,12 @@ from typing import Any
 
 MICRO_ENTRY_PROFILE_DEFAULT = "default"
 MICRO_ENTRY_PROFILE_CONSERVATIVE_CANDIDATE_V1 = "conservative_candidate_v1"
+MICRO_ENTRY_PROFILE_CONSERVATIVE_OFI_V1 = "conservative_ofi_v1"
 SUPPORTED_MICRO_ENTRY_PROFILES = frozenset(
     (
         MICRO_ENTRY_PROFILE_DEFAULT,
         MICRO_ENTRY_PROFILE_CONSERVATIVE_CANDIDATE_V1,
+        MICRO_ENTRY_PROFILE_CONSERVATIVE_OFI_V1,
     )
 )
 
@@ -380,6 +382,8 @@ def effective_micro_engine_config(config: MicroEngineConfig) -> MicroEngineConfi
             microprice_entry_ticks=0.12,
             ofi_percentile=65.0,
         )
+    if config.entry_profile == MICRO_ENTRY_PROFILE_CONSERVATIVE_OFI_V1:
+        return replace(config, ofi_percentile=65.0)
     raise ValueError(
         "micro_engine.entry_profile must be one of "
         f"{sorted(SUPPORTED_MICRO_ENTRY_PROFILES)}, got {config.entry_profile!r}"
