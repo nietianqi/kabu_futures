@@ -106,8 +106,13 @@ class LiveExecutionConfig:
     assumed_slippage_ticks_per_trade: float = 0.0
 
 
+# Advanced alpha / MTF config blocks. These are consumed by the strategy engine
+# and diagnostics, and must stay JSON-compatible with existing local configs.
+
 @dataclass(frozen=True)
 class NTSpreadConfig:
+    """NK225micro / TOPIXmini statistical-spread alpha module."""
+
     enabled: bool = True
     mode: str = "shadow"
     zscore_windows: tuple[int, int, int] = (20, 60, 250)
@@ -124,6 +129,8 @@ class NTSpreadConfig:
 
 @dataclass(frozen=True)
 class LeadLagConfig:
+    """US/JP futures lead-lag alpha module."""
+
     enabled: bool = True
     optional_external_data: bool = True
     us_open_start: str = "22:30"
@@ -136,6 +143,8 @@ class LeadLagConfig:
 
 @dataclass(frozen=True)
 class AlphaStackConfig:
+    """Multi-signal alpha stacking and conflict-resolution module."""
+
     enabled: bool = True
     block_directional_when_nt_conflicts: bool = True
     reduce_directional_when_nt_active: bool = True
@@ -146,6 +155,8 @@ class AlphaStackConfig:
 
 @dataclass(frozen=True)
 class MultiTimeframeConfig:
+    """Multi-timeframe regime and execution-score module."""
+
     enabled: bool = True
     regime_score_max: int = 30
     bias_score_max: int = 30
