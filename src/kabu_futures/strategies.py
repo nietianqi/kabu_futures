@@ -124,23 +124,21 @@ class MinuteStrategyEngine:
             and trend_bias == "short"
         )
         if bar.close > state.orb.high and bar.close > (state.last_vwap or bar.close) and state.ema20.slope > 0 and topix_long and quality_long:
-            confidence = min(0.82, 0.68 + min(0.08, (range_ratio - 1.0) * 0.10) + min(0.06, (volume_ratio - 1.0) * 0.06))
             return Signal(
                 "minute_orb",
                 bar.symbol,
                 "long",
-                confidence,
+                self._orb_confidence(range_ratio, volume_ratio),
                 bar.close,
                 "orb_breakout_long",
                 self._setup_metadata("orb_breakout_long", state, bar, trend_bias, close_location, range_ratio, volume_ratio),
             )
         if bar.close < state.orb.low and bar.close < (state.last_vwap or bar.close) and state.ema20.slope < 0 and topix_short and quality_short:
-            confidence = min(0.82, 0.68 + min(0.08, (range_ratio - 1.0) * 0.10) + min(0.06, (volume_ratio - 1.0) * 0.06))
             return Signal(
                 "minute_orb",
                 bar.symbol,
                 "short",
-                confidence,
+                self._orb_confidence(range_ratio, volume_ratio),
                 bar.close,
                 "orb_breakout_short",
                 self._setup_metadata("orb_breakout_short", state, bar, trend_bias, close_location, range_ratio, volume_ratio),
@@ -162,23 +160,21 @@ class MinuteStrategyEngine:
         long_pullback = previous.low <= state.last_vwap + vwap_band and bar.is_bullish and close_location >= 0.60
         short_pullback = previous.high >= state.last_vwap - vwap_band and bar.is_bearish and close_location <= 0.40
         if trend_long and long_pullback and volume_ratio >= 0.90 and not self._topix_strong("short"):
-            confidence = min(0.78, 0.60 + min(0.06, range_ratio * 0.04) + min(0.04, volume_ratio * 0.03))
             return Signal(
                 "minute_vwap",
                 bar.symbol,
                 "long",
-                confidence,
+                self._vwap_confidence(range_ratio, volume_ratio),
                 bar.close,
                 "trend_pullback_long",
                 self._setup_metadata("trend_pullback_long", state, bar, trend_bias, close_location, range_ratio, volume_ratio),
             )
         if trend_short and short_pullback and volume_ratio >= 0.90 and not self._topix_strong("long"):
-            confidence = min(0.78, 0.60 + min(0.06, range_ratio * 0.04) + min(0.04, volume_ratio * 0.03))
             return Signal(
                 "minute_vwap",
                 bar.symbol,
                 "short",
-                confidence,
+                self._vwap_confidence(range_ratio, volume_ratio),
                 bar.close,
                 "trend_pullback_short",
                 self._setup_metadata("trend_pullback_short", state, bar, trend_bias, close_location, range_ratio, volume_ratio),
@@ -206,12 +202,11 @@ class MinuteStrategyEngine:
             and volume_ratio >= 0.95
             and self._topix_allows("long")
         ):
-            confidence = min(0.80, 0.61 + min(0.07, (range_ratio - 1.0) * 0.10) + min(0.05, (volume_ratio - 1.0) * 0.05))
             return Signal(
                 "directional_intraday",
                 bar.symbol,
                 "long",
-                confidence,
+                self._trend_confidence(range_ratio, volume_ratio),
                 bar.close,
                 "trend_continuation_long",
                 self._setup_metadata("trend_continuation_long", state, bar, trend_bias, close_location, range_ratio, volume_ratio),
@@ -225,17 +220,28 @@ class MinuteStrategyEngine:
             and volume_ratio >= 0.95
             and self._topix_allows("short")
         ):
-            confidence = min(0.80, 0.61 + min(0.07, (range_ratio - 1.0) * 0.10) + min(0.05, (volume_ratio - 1.0) * 0.05))
             return Signal(
                 "directional_intraday",
                 bar.symbol,
                 "short",
-                confidence,
+                self._trend_confidence(range_ratio, volume_ratio),
                 bar.close,
                 "trend_continuation_short",
                 self._setup_metadata("trend_continuation_short", state, bar, trend_bias, close_location, range_ratio, volume_ratio),
             )
         return None
+
+    @staticmethod
+    def _orb_confidence(range_ratio: float, volume_ratio: float) -> float:
+        return min(0.82, 0.68 + min(0.08, (range_ratio - 1.0) * 0.10) + min(0.06, (volume_ratio - 1.0) * 0.06))
+
+    @staticmethod
+    def _vwap_confidence(range_ratio: float, volume_ratio: float) -> float:
+        return min(0.78, 0.60 + min(0.06, range_ratio * 0.04) + min(0.04, volume_ratio * 0.03))
+
+    @staticmethod
+    def _trend_confidence(range_ratio: float, volume_ratio: float) -> float:
+        return min(0.80, 0.61 + min(0.07, (range_ratio - 1.0) * 0.10) + min(0.05, (volume_ratio - 1.0) * 0.05))
 
     def _topix_allows(self, direction: Direction) -> bool:
         topix_bias = self.trend_bias(self.symbols.filter)

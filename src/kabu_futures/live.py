@@ -95,26 +95,6 @@ def _should_print_tick(
     return last_tick_state.get(book.symbol) != _tick_state(book)
 
 
-def _symbol_aliases(resolved: list[dict[str, Any]]) -> dict[str, str]:
-    aliases: dict[str, str] = {}
-    for item in resolved:
-        raw_symbol = item.get("Symbol")
-        future_code = item.get("FutureCode")
-        if raw_symbol is not None and future_code is not None:
-            aliases[str(raw_symbol)] = str(future_code)
-    return aliases
-
-
-def _symbol_codes(resolved: list[dict[str, Any]]) -> dict[str, str]:
-    codes: dict[str, str] = {}
-    for item in resolved:
-        future_code = item.get("FutureCode")
-        symbol = item.get("Symbol")
-        if future_code is not None and symbol is not None:
-            codes[str(future_code)] = str(symbol)
-    return codes
-
-
 def _execution_exchange(session_phase: str, exchanges: tuple[int, ...]) -> int:
     if session_phase.startswith("night") and 24 in exchanges:
         return 24
@@ -452,11 +432,21 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
         return 0
 
     engine = DualStrategyEngine(config)
+    symbol_codes = {
+        str(item["FutureCode"]): str(item["Symbol"])
+        for item in resolved
+        if item.get("FutureCode") is not None and item.get("Symbol") is not None
+    }
+    symbol_aliases = {
+        str(item["Symbol"]): str(item["FutureCode"])
+        for item in resolved
+        if item.get("Symbol") is not None and item.get("FutureCode") is not None
+    }
     if options.trade_mode == "live":
-        execution = LiveExecutionController(client, config, _symbol_codes(resolved))
+        execution = LiveExecutionController(client, config, symbol_codes)
     else:
         execution = PaperExecutionController(config, options.trade_mode, options.paper_fill_model)
-    normalizer = KabuBoardNormalizer(symbol_aliases=_symbol_aliases(resolved))
+    normalizer = KabuBoardNormalizer(symbol_aliases=symbol_aliases)
     stream = KabuWebSocketStream(client.websocket_base_url(), normalizer)
     signal_eval_logger = SignalEvaluationLogger(recorder, options.signal_eval_log_mode)
     micro_candidate_emitter = MicroCandidateEmitter(recorder)
