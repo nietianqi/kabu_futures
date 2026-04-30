@@ -4,7 +4,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 
-from .config import MinuteEngineConfig, MicroEngineConfig, SymbolsConfig
+from .config import MinuteEngineConfig, MicroEngineConfig, SymbolsConfig, effective_micro_engine_config
 from .indicators import EMA, OpeningRange, RollingATR, SessionVWAP
 from .micro_candidates import failed_directional_checks, is_near_miss
 from .microstructure import BookFeatureEngine
@@ -326,8 +326,8 @@ class MicroStrategyEngine:
     """Tick-level order-book imbalance and OFI scalping signal generator."""
 
     def __init__(self, config: MicroEngineConfig, tick_size: float = 5.0) -> None:
-        self.config = config
-        self.features = BookFeatureEngine(config, tick_size=tick_size)
+        self.config = effective_micro_engine_config(config)
+        self.features = BookFeatureEngine(self.config, tick_size=tick_size)
         self.last_signal_time: datetime | None = None
         self.last_evaluation: SignalEvaluation | None = None
 

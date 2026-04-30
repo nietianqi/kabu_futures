@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .analysis_utils import iter_books, max_drawdown
-from .config import StrategyConfig
+from .config import MICRO_ENTRY_PROFILE_DEFAULT, StrategyConfig
 from .engine import DualStrategyEngine
 from .models import OrderBook
 from .paper_execution import ExecutionEvent, PaperExecutionController, PaperFillModel
@@ -107,14 +107,16 @@ def tune_micro_params(
 ) -> dict[str, object]:
     imbalance_values = tuple(float(value) for value in imbalance_grid)
     microprice_values = tuple(float(value) for value in (microprice_grid or DEFAULT_MICROPRICE_GRID))
-    ofi_percentile_values = tuple(float(value) for value in (ofi_percentile_grid or (config.micro_engine.ofi_percentile,)))
+    effective_micro = config.effective_micro_engine()
+    ofi_percentile_values = tuple(float(value) for value in (ofi_percentile_grid or (effective_micro.ofi_percentile,)))
     spread_values = tuple(int(value) for value in (spread_grid or DEFAULT_SPREAD_GRID))
     books = load_books(path, max_books=max_books)
     baseline_parameters = {
-        "imbalance_entry": config.micro_engine.imbalance_entry,
-        "microprice_entry_ticks": config.micro_engine.microprice_entry_ticks,
-        "ofi_percentile": config.micro_engine.ofi_percentile,
-        "spread_ticks_required": config.micro_engine.spread_ticks_required,
+        "entry_profile": config.micro_engine.entry_profile,
+        "imbalance_entry": effective_micro.imbalance_entry,
+        "microprice_entry_ticks": effective_micro.microprice_entry_ticks,
+        "ofi_percentile": effective_micro.ofi_percentile,
+        "spread_ticks_required": effective_micro.spread_ticks_required,
     }
     baseline = evaluate_micro_config(books, config, baseline_parameters, paper_fill_model=paper_fill_model)
 
@@ -137,6 +139,7 @@ def tune_micro_params(
                 config,
                 micro_engine=replace(
                     config.micro_engine,
+                    entry_profile=MICRO_ENTRY_PROFILE_DEFAULT,
                     imbalance_entry=imbalance_entry,
                     microprice_entry_ticks=microprice_entry_ticks,
                     ofi_percentile=ofi_percentile,

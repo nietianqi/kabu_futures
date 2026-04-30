@@ -183,6 +183,14 @@ python main.py --diagnose-log logs\live_20260428_165430.jsonl
 
 `--diagnose-log` includes a `micro_entry_funnel` section with signal-evaluation allow/reject counts, top failed checks, live entry/expiry/fill counts, and minute signals blocked by stale `live_supported_engines`.
 
+To review sparse micro entries without changing live rules, run the read-only candidate review. It combines `--diagnose-log`, candidate replay, FAK 0/1 tick fill simulation, jump attribution, walk-forward, and promotion gates into one JSON report:
+
+```powershell
+python scripts\candidate_review.py logs --config config\local.json --output reports\candidate_review_latest.json
+```
+
+If the report keeps `final_decision=no_change`, do not loosen live thresholds. If a candidate later passes the gates, use the gray profile only by explicitly setting `micro_engine.entry_profile="conservative_candidate_v1"` in local config. That profile changes only the micro entry thresholds to `imbalance_entry=0.28`, `microprice_entry_ticks=0.12`, and `ofi_percentile=65.0`; it does not change `qty=1`, `spread_ticks_required=1`, `max_positions_per_symbol=1`, jump rejection, minute ATR/execution-score filters, cooldowns, or the no-auto-loss-close rule. A safe example without API secrets is in `config/micro_candidate_gray.example.json`.
+
 Keep live defaults conservative while reviewing this. Only consider manually setting `live_execution.entry_slippage_ticks=1` in `config/local.json` for tiny-size validation if the 1-tick simulation materially improves fill rate and the same log's paper PnL/markout remains acceptable. The analyzer never writes config and never retries/reprices live orders; minute live remains one-lot only and must pass the ATR, execution-score, cooldown, and pause gates.
 
 For real live fills, use `live_trade_diagnostics` in the offline report. It reads `live_trade_closed` when present and can reconstruct older logs from `live_position_detected`, exit `live_order_submitted`, and filled `live_order_status` details. Check `entry_price_mismatches` before trusting PnL from a new venue/API behavior. `jump_diagnostics` breaks logged `jump_detected` rejects down by `symbol`, `session_phase`, and `spread_ticks` so night-open/TOPIXmini spikes can be reviewed without changing the live jump filter.

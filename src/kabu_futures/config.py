@@ -1,9 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 from pathlib import Path
 from typing import Any
+
+
+MICRO_ENTRY_PROFILE_DEFAULT = "default"
+MICRO_ENTRY_PROFILE_CONSERVATIVE_CANDIDATE_V1 = "conservative_candidate_v1"
+SUPPORTED_MICRO_ENTRY_PROFILES = frozenset(
+    (
+        MICRO_ENTRY_PROFILE_DEFAULT,
+        MICRO_ENTRY_PROFILE_CONSERVATIVE_CANDIDATE_V1,
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -33,6 +43,7 @@ class MinuteEngineConfig:
 
 @dataclass(frozen=True)
 class MicroEngineConfig:
+    entry_profile: str = MICRO_ENTRY_PROFILE_DEFAULT
     mode: str = "observe_only"
     qty: int = 1
     depth_levels: int = 5
@@ -221,15 +232,27 @@ class StrategyConfig:
     def tick_value_yen_for(self, symbol: str) -> float:
         return float(self.tick_values_yen.get(symbol, self.micro225_tick_value))
 
+    def effective_micro_engine(self) -> MicroEngineConfig:
+        return effective_micro_engine_config(self.micro_engine)
+
     def validate(self) -> None:
         """Raise ValueError if parameter combinations are inconsistent."""
         m = self.micro_engine
-        if m.imbalance_entry <= m.imbalance_exit:
+        if m.entry_profile not in SUPPORTED_MICRO_ENTRY_PROFILES:
             raise ValueError(
-                f"imbalance_entry ({m.imbalance_entry}) must be greater than imbalance_exit ({m.imbalance_exit})"
+                "micro_engine.entry_profile must be one of "
+                f"{sorted(SUPPORTED_MICRO_ENTRY_PROFILES)}, got {m.entry_profile!r}"
             )
-        if not 0.0 <= m.ofi_percentile <= 100.0:
-            raise ValueError(f"micro_engine.ofi_percentile must be between 0 and 100, got {m.ofi_percentile}")
+        effective_m = self.effective_micro_engine()
+        if effective_m.imbalance_entry <= effective_m.imbalance_exit:
+            raise ValueError(
+                f"imbalance_entry ({effective_m.imbalance_entry}) must be greater than "
+                f"imbalance_exit ({effective_m.imbalance_exit})"
+            )
+        if not 0.0 <= effective_m.ofi_percentile <= 100.0:
+            raise ValueError(
+                f"micro_engine.ofi_percentile must be between 0 and 100, got {effective_m.ofi_percentile}"
+            )
         if m.stop_loss_ticks <= 0:
             raise ValueError(f"stop_loss_ticks must be positive, got {m.stop_loss_ticks}")
         if m.take_profit_ticks <= 0:
@@ -334,6 +357,42 @@ def default_config() -> StrategyConfig:
     config = StrategyConfig()
     config.validate()
     return config
+
+
+def effective_micro_engine_config(config: MicroEngineConfig) -> MicroEngineConfig:
+    if config.entry_profile == MICRO_ENTRY_PROFILE_DEFAULT:
+        return config
+    if config.entry_profile == MICRO_ENTRY_PROFILE_CONSERVATIVE_CANDIDATE_V1:
+        return replace(
+            config,
+            imbalance_entry=0.28,
+            microprice_entry_ticks=0.12,
+            ofi_percentile=65.0,
+        )
+    raise ValueError(
+        "micro_engine.entry_profile must be one of "
+        f"{sorted(SUPPORTED_MICRO_ENTRY_PROFILES)}, got {config.entry_profile!r}"
+    )
+
+
+def micro_entry_profile_metadata(config: StrategyConfig) -> dict[str, object]:
+    effective = config.effective_micro_engine()
+    raw = config.micro_engine
+    return {
+        "micro_entry_profile": raw.entry_profile,
+        "micro_entry_profile_active": raw.entry_profile != MICRO_ENTRY_PROFILE_DEFAULT,
+        "micro_configured_thresholds": {
+            "imbalance_entry": raw.imbalance_entry,
+            "microprice_entry_ticks": raw.microprice_entry_ticks,
+            "ofi_percentile": raw.ofi_percentile,
+        },
+        "micro_effective_thresholds": {
+            "imbalance_entry": effective.imbalance_entry,
+            "microprice_entry_ticks": effective.microprice_entry_ticks,
+            "ofi_percentile": effective.ofi_percentile,
+            "spread_ticks_required": effective.spread_ticks_required,
+        },
+    }
 
 
 def _merge_dataclass(cls: type, values: dict[str, Any]) -> Any:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 import json
@@ -22,13 +23,23 @@ from kabu_futures.alpha import (
 )
 from kabu_futures.api import KabuApiError, KabuStationClient, build_future_registration_symbols, extract_symbol_code
 from kabu_futures.analysis_utils import iter_books, max_drawdown
-from kabu_futures.config import default_config, load_json_config
+from kabu_futures.config import default_config, effective_micro_engine_config, load_json_config
+from kabu_futures.diagnostics_funnel import diagnosis_notes, latency_summary, micro_entry_funnel
 from kabu_futures.engine import DualStrategyEngine
 from kabu_futures.evolution import analyze_micro_log, calculate_markout_ticks
 from kabu_futures.indicators import BarBuilder
 from kabu_futures.live import MicroCandidateEmitter, _should_print_tick, tick_to_dict, signal_to_dict
+from kabu_futures.live_api_health import LiveApiHealth
 from kabu_futures.live_execution import LiveExecutionController
 from kabu_futures.live_safety import LiveSafetyState
+from kabu_futures.live_state import (
+    LivePositionState,
+    PendingLiveOrder,
+    pending_summary,
+    position_key,
+    position_summary,
+    validated_symbol_code,
+)
 from kabu_futures.log_diagnostics import diagnose_log
 from kabu_futures.microstructure import BookFeatureEngine, RollingPercentile, microprice, percentile, weighted_imbalance
 from kabu_futures.marketdata import BufferedJsonlMarketRecorder, KabuBoardNormalizer, MarketDataError, MarketDataSkip, signal_evaluation_to_dict
@@ -113,6 +124,44 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.micro_engine.ofi_percentile, 70.0)
         with self.assertRaisesRegex(ValueError, "ofi_percentile"):
             replace(cfg, micro_engine=replace(cfg.micro_engine, ofi_percentile=120.0)).validate()
+
+    def test_default_micro_entry_profile_keeps_existing_thresholds(self) -> None:
+        cfg = default_config()
+        effective = cfg.effective_micro_engine()
+
+        self.assertEqual(cfg.micro_engine.entry_profile, "default")
+        self.assertEqual(effective.imbalance_entry, cfg.micro_engine.imbalance_entry)
+        self.assertEqual(effective.microprice_entry_ticks, cfg.micro_engine.microprice_entry_ticks)
+        self.assertEqual(effective.ofi_percentile, cfg.micro_engine.ofi_percentile)
+
+    def test_conservative_candidate_profile_overrides_only_entry_thresholds(self) -> None:
+        cfg = replace(
+            default_config(),
+            micro_engine=replace(default_config().micro_engine, entry_profile="conservative_candidate_v1"),
+        )
+        effective = cfg.effective_micro_engine()
+
+        self.assertEqual(effective.imbalance_entry, 0.28)
+        self.assertEqual(effective.microprice_entry_ticks, 0.12)
+        self.assertEqual(effective.ofi_percentile, 65.0)
+        self.assertEqual(effective.spread_ticks_required, cfg.micro_engine.spread_ticks_required)
+        self.assertEqual(effective.qty, cfg.micro_engine.qty)
+
+    def test_unknown_micro_entry_profile_is_rejected(self) -> None:
+        cfg = replace(default_config(), micro_engine=replace(default_config().micro_engine, entry_profile="aggressive"))
+
+        with self.assertRaisesRegex(ValueError, "entry_profile"):
+            cfg.validate()
+
+    def test_load_json_config_accepts_conservative_candidate_profile(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = pathlib.Path(temp_dir) / "candidate.json"
+            path.write_text('{"micro_engine":{"entry_profile":"conservative_candidate_v1"}}', encoding="utf-8")
+
+            cfg = load_json_config(path)
+
+        self.assertEqual(cfg.micro_engine.entry_profile, "conservative_candidate_v1")
+        self.assertEqual(effective_micro_engine_config(cfg.micro_engine).imbalance_entry, 0.28)
 
     def test_load_json_config_validates_inconsistent_micro_thresholds(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -282,6 +331,42 @@ class MicrostructureTests(unittest.TestCase):
         self.assertEqual(evaluation.metadata["jump_detected"], False)
         self.assertIsNone(evaluation.metadata["jump_reason"])
 
+    def test_micro_strategy_uses_conservative_candidate_entry_profile(self) -> None:
+        base_cfg = default_config()
+        ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+        b = book(ts, bid_qty=300, ask_qty=20)
+        features = BookFeatures(
+            timestamp=ts,
+            symbol="NK225micro",
+            spread_ticks=1.0,
+            imbalance=0.285,
+            ofi=1.0,
+            ofi_ewma=1.0,
+            ofi_threshold=0.0,
+            microprice=b.mid_price + 0.65,
+            microprice_edge_ticks=0.13,
+            total_depth=500.0,
+            jump_detected=False,
+            latency_ms=0.0,
+        )
+
+        default_signal, default_eval = MicroStrategyEngine(
+            base_cfg.micro_engine,
+            tick_size=base_cfg.tick_size,
+        ).evaluate_book(b, now=ts, features=features)
+        profile_signal, profile_eval = MicroStrategyEngine(
+            replace(base_cfg.micro_engine, entry_profile="conservative_candidate_v1"),
+            tick_size=base_cfg.tick_size,
+        ).evaluate_book(b, now=ts, features=features)
+
+        self.assertIsNone(default_signal)
+        self.assertEqual(default_eval.decision, "reject")
+        self.assertIsNotNone(profile_signal)
+        self.assertEqual(profile_eval.decision, "allow")
+        self.assertEqual(profile_eval.metadata["imbalance_entry"], 0.28)
+        self.assertEqual(profile_eval.metadata["microprice_entry_ticks"], 0.12)
+        self.assertEqual(profile_eval.metadata["ofi_percentile"], 65.0)
+
     def test_micro_strategy_reuses_precomputed_book_features(self) -> None:
         cfg = default_config().micro_engine
         engine = MicroStrategyEngine(cfg)
@@ -367,6 +452,19 @@ class MicrostructureTests(unittest.TestCase):
         engine.micro_engines["TOPIXmini"].evaluate_book.assert_called_once()
         self.assertEqual(engine.latest_signal_evaluations[-1].decision, "allow")
         self.assertEqual(engine.latest_signal_evaluations[-1].symbol, "TOPIXmini")
+
+    def test_dual_strategy_engine_uses_effective_micro_profile(self) -> None:
+        cfg = replace(
+            default_config(),
+            micro_engine=replace(default_config().micro_engine, entry_profile="conservative_candidate_v1"),
+        )
+
+        engine = DualStrategyEngine(cfg)
+
+        self.assertEqual(engine.micro_config.imbalance_entry, 0.28)
+        self.assertEqual(engine.micro_config.microprice_entry_ticks, 0.12)
+        self.assertEqual(engine.micro_config.ofi_percentile, 65.0)
+        self.assertEqual(engine.micro_engines["NK225micro"].config.imbalance_entry, 0.28)
 
     def test_micro_strategy_evaluation_records_reject_reason(self) -> None:
         cfg = default_config().micro_engine
@@ -544,6 +642,137 @@ class OrderTests(unittest.TestCase):
 
 
 class MarketDataAndExecutionTests(unittest.TestCase):
+    def test_live_state_summary_helpers_keep_heartbeat_shape(self) -> None:
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=timezone.utc)
+        position = LivePositionState("NK225micro", "161060023", 24, "long", 1, 50005.0, ts, "H1")
+        pending = PendingLiveOrder("O1", "NK225micro", "161060023", 24, "long", 1, ts, "entry", position_key="hold:H1")
+
+        self.assertEqual(position_key(position), "hold:H1")
+        self.assertEqual(validated_symbol_code(position), "161060023")
+        self.assertEqual(
+            position_summary(position),
+            {
+                "symbol": "NK225micro",
+                "symbol_code": "161060023",
+                "exchange": 24,
+                "direction": "long",
+                "qty": 1,
+                "entry_price": 50005.0,
+                "hold_id": "H1",
+            },
+        )
+        self.assertEqual(
+            pending_summary(pending),
+            {
+                "order_id": "O1",
+                "symbol": "NK225micro",
+                "symbol_code": "161060023",
+                "exchange": 24,
+                "direction": "long",
+                "qty": 1,
+                "submitted_at": ts.isoformat(),
+                "reason": "entry",
+                "position_key": "hold:H1",
+            },
+        )
+        self.assertIsNone(position_summary(None))
+        self.assertIsNone(pending_summary(None))
+        self.assertIsNone(validated_symbol_code(replace(position, symbol_code="NK225micro")))
+
+    def test_live_api_health_records_backoff_latency_and_summary(self) -> None:
+        base_cfg = default_config()
+        cfg = replace(base_cfg, live_execution=replace(base_cfg.live_execution, api_error_cooldown_seconds=30))
+        health = LiveApiHealth(cfg)
+        ts = datetime(2026, 4, 27, 12, 0, tzinfo=timezone.utc)
+
+        metadata = health.record_error(
+            KabuApiError("kabu API HTTP 429: too many requests", status_code=429, category="rate_limit"),
+            ts,
+            "sendorder",
+        )
+        result = health.call("positions", lambda: {"data": []})
+        summary = health.summary(ts + timedelta(seconds=1), position_sync_blocked=True, last_position_poll_at=ts)
+
+        self.assertEqual(metadata["api_error_category"], "rate_limit")
+        self.assertEqual(result, {"data": []})
+        self.assertTrue(health.api_backoff_active(ts + timedelta(seconds=1)))
+        self.assertEqual(summary["error_counts"]["rate_limit"], 1)
+        self.assertTrue(summary["api_backoff_active"])
+        self.assertIn("positions", summary["last_latency_ms"])
+        self.assertIn("positions", summary["latency_ms"])
+        self.assertEqual(
+            summary["next_position_retry_at"],
+            (ts + timedelta(seconds=cfg.live_execution.position_poll_interval_seconds)).isoformat(),
+        )
+
+        health.record_error(KabuApiError("HTTP 401", status_code=401, category="auth_error"), ts, "positions")
+        self.assertTrue(health.summary(ts)["auth_failed"])
+        health.record_success()
+        self.assertFalse(health.summary(ts)["auth_failed"])
+
+    def test_live_api_health_wrong_instance_cooldown_summary(self) -> None:
+        health = LiveApiHealth(default_config())
+        ts = datetime(2026, 4, 27, 12, 0, tzinfo=timezone.utc)
+
+        metadata = health.record_error(
+            KabuApiError("wrong kabu station instance", status_code=500, category="kabu_station_wrong_instance"),
+            ts,
+            "sendorder",
+        )
+        summary = health.summary(ts + timedelta(seconds=1))
+
+        self.assertEqual(metadata["api_error_category"], "kabu_station_wrong_instance")
+        self.assertEqual(summary["wrong_instance_errors"], 1)
+        self.assertTrue(summary["wrong_instance_cooldown_active"])
+        self.assertTrue(health.wrong_instance_cooldown_active(ts + timedelta(seconds=1)))
+
+    def test_diagnostics_funnel_helpers_preserve_report_shape(self) -> None:
+        counters: dict[str, object] = {
+            "live_entry_orders_submitted": 2,
+            "live_positions_detected": 1,
+            "live_entry_orders_submitted_by_engine": Counter({"micro_book": 1, "minute_vwap": 1}),
+            "live_tradeable_signals_by_engine": Counter({"micro_book": 3}),
+            "signal_eval_decisions": Counter({"reject": 4, "allow": 1}),
+            "signal_eval_engines": Counter({"micro_book": 5}),
+            "signal_eval_reject_reasons": Counter({"imbalance_not_met": 4}),
+            "signal_eval_failed_checks": Counter({"imbalance_not_met": 4}),
+            "signal_eval_jump_reasons": Counter({"spread_wide": 2, "mid_move_jump": 1, "other": 1}),
+            "near_miss_from_signal_eval": 2,
+            "near_miss_missing_checks": Counter({"ofi_not_met": 2}),
+            "near_miss_directions": Counter({"long": 2}),
+            "micro_candidate_events": 1,
+            "micro_candidate_count": 2,
+            "micro_candidate_missing_checks": Counter({"microprice_not_met": 2}),
+            "micro_candidate_directions": Counter({"short": 2}),
+            "live_signals_by_engine": Counter({"micro_book": 2}),
+            "live_entry_orders_cancelled": 1,
+            "live_entry_orders_expired": 1,
+            "live_entry_order_errors": 1,
+            "live_exit_orders_submitted": 1,
+            "live_exit_orders_cancelled": 1,
+            "live_trades_closed": 1,
+            "execution_rejects": Counter({"position_sync_blocked": 1}),
+            "execution_reject_blocked_by": Counter({"position_sync": 1}),
+            "position_sync_blocked_rejects": 1,
+            "live_unsupported_minute_signals": 1,
+            "api_error_categories": Counter({"auth_error": 1, "kabu_station_wrong_instance": 1}),
+            "loss_hold_guard_events": 1,
+            "kill_switch_events": 1,
+            "suspected_old_live_policy": True,
+        }
+        samples: dict[str, list[float]] = defaultdict(list)
+        samples["sendorder"] = [10.0, 20.0, 30.0]
+
+        funnel = micro_entry_funnel(counters)  # type: ignore[arg-type]
+        notes = diagnosis_notes(counters)  # type: ignore[arg-type]
+        latency = latency_summary(samples)
+
+        self.assertEqual(funnel["live_execution"]["entry_fill_rate"], 0.5)
+        self.assertEqual(funnel["live_execution"]["micro_tradeable_signals_without_entry_submission"], 2)
+        self.assertEqual(funnel["signal_eval"]["non_tradeable_jump_reasons"], {"spread_wide": 2, "mid_move_jump": 1})
+        self.assertIn("kabu_auth_errors_blocked_live_entry", notes)
+        self.assertEqual(latency["sendorder"]["p95"], 30.0)
+
     def test_kabu_normalizer_maps_real_symbol_alias_and_keeps_raw_symbol(self) -> None:
         payload = {
             "Symbol": "161050023",
@@ -783,6 +1012,39 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertEqual(payload["min_execution_score_to_chase"], 10)
         self.assertIn("minute_vwap", payload["live_supported_engines"])
         self.assertEqual(payload["live_safety"]["minute_cooldown_seconds"], 180)
+        self.assertEqual(payload["micro_entry_profile"], "default")
+        self.assertEqual(payload["micro_effective_thresholds"]["imbalance_entry"], 0.3)
+
+    def test_live_startup_self_check_exposes_gray_profile_thresholds(self) -> None:
+        cfg = replace(
+            default_config(),
+            micro_engine=replace(default_config().micro_engine, entry_profile="conservative_candidate_v1"),
+        )
+
+        payload = live_startup_self_check(cfg)
+
+        self.assertEqual(payload["micro_entry_profile"], "conservative_candidate_v1")
+        self.assertTrue(payload["micro_entry_profile_active"])
+        self.assertEqual(payload["micro_effective_thresholds"]["imbalance_entry"], 0.28)
+        self.assertEqual(payload["micro_effective_thresholds"]["microprice_entry_ticks"], 0.12)
+        self.assertEqual(payload["micro_effective_thresholds"]["ofi_percentile"], 65.0)
+
+    def test_diagnose_log_reports_micro_entry_profile(self) -> None:
+        cfg = replace(
+            default_config(),
+            micro_engine=replace(default_config().micro_engine, entry_profile="conservative_candidate_v1"),
+        )
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "profile.jsonl"
+            payload = live_startup_self_check(cfg)
+            path.write_text(json.dumps({"kind": "startup", "payload": payload}) + "\n", encoding="utf-8")
+
+            diagnostics = diagnose_log(path, cfg)
+
+        profile = diagnostics["micro_entry_profile"]
+        self.assertEqual(profile["configured_profile"], "conservative_candidate_v1")
+        self.assertEqual(profile["observed_profiles"]["conservative_candidate_v1"], 1)
+        self.assertEqual(profile["observed_effective_thresholds"]["imbalance_entry"], 0.28)
 
     def test_diagnose_log_flags_old_policy_and_bad_close_symbol(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -4014,6 +4276,52 @@ class EvolutionAndTuningTests(unittest.TestCase):
         self.assertEqual(report["grid"]["ofi_percentile"], [default_config().micro_engine.ofi_percentile])
         self.assertEqual(report["grid"]["spread_ticks_required"], [1, 2])
 
+    def test_tune_micro_params_uses_effective_profile_baseline(self) -> None:
+        captured: list[tuple[dict[str, object], str]] = []
+
+        def fake_evaluate(
+            books: object,
+            config: object,
+            parameters: dict[str, object],
+            paper_fill_model: object = "immediate",
+        ) -> dict[str, object]:
+            captured.append((dict(parameters), config.micro_engine.entry_profile))
+            return {
+                "parameters": dict(parameters),
+                "books": 1,
+                "evaluations": {},
+                "reject_reasons_top": [],
+                "signals": {},
+                "paper_events": {},
+                "exit_reasons": {},
+                "tradeable_micro_signals": 1,
+                "paper_entries": 1,
+                "simulated_fill_rate": 1.0,
+                "trades": 1,
+                "win_rate": 1.0,
+                "net_pnl_ticks": 1.0,
+                "avg_pnl_ticks": 1.0,
+                "max_drawdown_ticks": 0.0,
+            }
+
+        cfg = replace(
+            default_config(),
+            micro_engine=replace(default_config().micro_engine, entry_profile="conservative_candidate_v1"),
+        )
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "tiny.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            recorder.write_book(book(datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)))
+            recorder.close()
+            with patch("kabu_futures.tuning.evaluate_micro_config", side_effect=fake_evaluate):
+                report = tune_micro_params(path, cfg, imbalance_grid=(0.26,), microprice_grid=(0.10,), min_trades=1)
+
+        self.assertEqual(report["baseline"]["parameters"]["entry_profile"], "conservative_candidate_v1")
+        self.assertEqual(report["baseline"]["parameters"]["imbalance_entry"], 0.28)
+        self.assertEqual(report["baseline"]["parameters"]["microprice_entry_ticks"], 0.12)
+        self.assertEqual(report["baseline"]["parameters"]["ofi_percentile"], 65.0)
+        self.assertEqual(captured[1][1], "default")
+
     def test_tune_micro_params_includes_ofi_grid_and_fill_rate_gate(self) -> None:
         def fake_evaluate(
             books: object,
@@ -4140,6 +4448,194 @@ class EvolutionAndTuningTests(unittest.TestCase):
         self.assertEqual(report["recommendation"]["decision"], "recommended")
         self.assertEqual(report["recommendation"]["trade_delta"], 5)
         self.assertEqual(report["best_safe_candidate"]["parameters"]["imbalance_entry"], 0.20)
+
+
+class CandidateReviewTests(unittest.TestCase):
+    def _fake_tune_report(self, decision: str = "no_change") -> dict[str, object]:
+        checks = {
+            "trade_opportunity_2x": False,
+            "net_pnl_not_worse": True,
+            "drawdown_not_materially_worse": True,
+            "simulated_fill_rate_ok": True,
+        }
+        return {
+            "decision": decision,
+            "baseline": {
+                "parameters": {
+                    "imbalance_entry": 0.3,
+                    "microprice_entry_ticks": 0.15,
+                    "ofi_percentile": 70.0,
+                    "spread_ticks_required": 1,
+                },
+                "trades": 2,
+                "net_pnl_ticks": 2.0,
+                "avg_pnl_ticks": 1.0,
+                "max_drawdown_ticks": 0.0,
+            },
+            "best": {
+                "parameters": {
+                    "imbalance_entry": 0.28,
+                    "microprice_entry_ticks": 0.12,
+                    "ofi_percentile": 65.0,
+                    "spread_ticks_required": 1,
+                },
+                "trades": 3,
+                "net_pnl_ticks": 1.5,
+                "avg_pnl_ticks": 0.5,
+                "max_drawdown_ticks": -1.0,
+                "simulated_fill_rate": 0.9,
+            },
+            "candidates": [],
+            "grid": {"imbalance_entry": [0.28, 0.26, 0.24]},
+            "recommendation": {"decision": "diagnostic_only", "checks": checks},
+        }
+
+    def test_candidate_review_uses_temporary_champion_and_champion_first_promotion(self) -> None:
+        from kabu_futures.promotion import PromotionDecision
+        from scripts import candidate_review as cli
+
+        captured: dict[str, object] = {}
+        tune_report = self._fake_tune_report()
+
+        def fake_evaluate(
+            champion: dict[str, object],
+            challenger: dict[str, object],
+            **kwargs: object,
+        ) -> PromotionDecision:
+            captured["champion"] = champion
+            captured["challenger"] = challenger
+            captured["kwargs"] = kwargs
+            return PromotionDecision(decision="reject", failed_gates=["walk_forward"])
+
+        with TemporaryDirectory() as tmp:
+            args = cli.build_parser().parse_args(
+                [
+                    str(pathlib.Path(tmp) / "missing_logs"),
+                    "--baseline",
+                    str(pathlib.Path(tmp) / "missing_baseline.json"),
+                    "--skip-walk-forward",
+                ]
+            )
+            with patch.object(cli, "diagnose_log", return_value={"files": ["a.jsonl"], "micro_entry_funnel": {}}):
+                with patch.object(cli, "tune_micro_params", return_value=tune_report):
+                    with patch.object(cli, "analyze_micro_log", return_value={"entry_fill_diagnostics": {}}):
+                        with patch.object(cli, "jump_markout_report", return_value={"by_jump_reason": {}, "live_behavior_changed": False}):
+                            with patch.object(cli, "evaluate_challenger", side_effect=fake_evaluate):
+                                report = cli.build_report(args)
+
+        self.assertEqual(captured["champion"]["source"], "temporary_champion_from_current_tune_baseline")
+        self.assertIs(captured["challenger"], tune_report)
+        self.assertEqual(report["promotion"]["promotion_order"], ["champion", "challenger"])
+        self.assertEqual(report["final_decision"], "no_change")
+        self.assertTrue(report["read_only"])
+        self.assertFalse(report["live_config_changed"])
+
+    def test_candidate_review_jump_report_separates_reasons_without_live_change(self) -> None:
+        from scripts import candidate_review as cli
+
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "jump.jsonl"
+            recorder = BufferedJsonlMarketRecorder(path, batch_size=10, flush_interval_seconds=60.0)
+            base_ts = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+            recorder.write_book(book(base_ts, bid=50000, ask=50005))
+            recorder.write_book(book(base_ts + timedelta(seconds=1), bid=50005, ask=50010))
+            recorder.write_book(book(base_ts + timedelta(seconds=5), bid=50010, ask=50015))
+            recorder.close()
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "kind": "signal_eval_summary",
+                            "payload": {
+                                "engine": "micro_book",
+                                "symbol": "NK225micro",
+                                "decision": "reject",
+                                "reason": "jump_detected",
+                                "candidate_direction": "long",
+                                "count": 1,
+                                "start_timestamp": base_ts.isoformat(),
+                                "first_metadata": {"jump_detected": True, "jump_reason": "mid_move_jump"},
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+                handle.write(
+                    json.dumps(
+                        {
+                            "kind": "signal_eval_summary",
+                            "payload": {
+                                "engine": "micro_book",
+                                "symbol": "NK225micro",
+                                "decision": "reject",
+                                "reason": "jump_detected",
+                                "candidate_direction": "flat",
+                                "count": 2,
+                                "start_timestamp": base_ts.isoformat(),
+                                "first_metadata": {"jump_detected": True, "jump_reason": "spread_wide"},
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+
+            report = cli.jump_markout_report(path, default_config(), horizons=(1.0, 5.0))
+
+        self.assertFalse(report["live_behavior_changed"])
+        self.assertIn("mid_move_jump", report["by_jump_reason"])
+        self.assertIn("spread_wide", report["by_jump_reason"])
+        self.assertEqual(report["by_jump_reason"]["spread_wide"]["events"], 2)
+        self.assertGreater(report["by_jump_reason"]["mid_move_jump"]["directional_markout_ticks"]["1.0"]["avg_ticks"], 0)
+
+    def test_candidate_review_cli_writes_no_change_report(self) -> None:
+        from scripts import candidate_review as cli
+
+        with TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "candidate_review.json"
+            report = {
+                "final_decision": "no_change",
+                "promotion": {"decision": "reject"},
+                "read_only": True,
+                "live_config_changed": False,
+            }
+            with patch.object(cli, "build_report", return_value=report):
+                import io
+
+                with patch("sys.stdout", io.StringIO()):
+                    with patch("sys.stderr", io.StringIO()):
+                        self.assertEqual(cli.main(["logs", "--output", str(output)]), 0)
+
+            written = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(written["final_decision"], "no_change")
+        self.assertTrue(written["read_only"])
+        self.assertFalse(written["live_config_changed"])
+
+    def test_candidate_review_reports_effective_gray_profile(self) -> None:
+        from kabu_futures.promotion import PromotionDecision
+        from scripts import candidate_review as cli
+
+        with TemporaryDirectory() as tmp:
+            config_path = pathlib.Path(tmp) / "config.json"
+            config_path.write_text('{"micro_engine":{"entry_profile":"conservative_candidate_v1"}}', encoding="utf-8")
+            args = cli.build_parser().parse_args(
+                [
+                    str(pathlib.Path(tmp) / "missing_logs"),
+                    "--config",
+                    str(config_path),
+                    "--skip-walk-forward",
+                ]
+            )
+            with patch.object(cli, "diagnose_log", return_value={"files": ["a.jsonl"], "micro_entry_funnel": {}}):
+                with patch.object(cli, "tune_micro_params", return_value=self._fake_tune_report()):
+                    with patch.object(cli, "analyze_micro_log", return_value={"entry_fill_diagnostics": {}}):
+                        with patch.object(cli, "jump_markout_report", return_value={"by_jump_reason": {}, "live_behavior_changed": False}):
+                            with patch.object(cli, "evaluate_challenger", return_value=PromotionDecision(decision="reject")):
+                                report = cli.build_report(args)
+
+        self.assertEqual(report["live_rules_unchanged"]["micro_entry_profile"], "conservative_candidate_v1")
+        self.assertEqual(report["live_rules_unchanged"]["micro_effective_thresholds"]["imbalance_entry"], 0.28)
+        self.assertFalse(report["live_config_changed"])
 
 
 class ApiRegistrationTests(unittest.TestCase):

@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict, deque
-from dataclasses import dataclass
+from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
-import time
 from typing import Any, Callable, TypeVar
 
-from .api import KabuApiError, KabuStationClient, classify_kabu_api_error
+from .api import KabuApiError, KabuStationClient
 from .config import StrategyConfig, default_config
 from .execution import ExitDecision, MicroTradeManager, MinuteTradeManager, pnl_ticks as calculate_pnl_ticks
 from .models import BookFeatures, Direction, OrderBook, Signal
@@ -14,48 +12,21 @@ from .orders import KabuConstants, KabuFutureOrderBuilder
 from .paper_execution import ExecutionEvent
 from .policy import LiveEntryPolicy, event_trace_metadata
 from .serialization import event_time as book_event_time, signal_snapshot
+from .live_api_health import LiveApiHealth
 from .live_safety import LiveSafetyState
+from .live_state import (
+    LivePositionSlot,
+    LivePositionState,
+    PendingLiveOrder,
+    pending_summary,
+    position_key as live_position_key,
+    position_summary,
+    trade_engine,
+    validated_symbol_code,
+)
 
 
 T = TypeVar("T")
-
-
-@dataclass(frozen=True)
-class PendingLiveOrder:
-    order_id: str
-    symbol: str
-    symbol_code: str
-    exchange: int
-    direction: Direction
-    qty: int
-    submitted_at: datetime
-    reason: str
-    signal: Signal | None = None
-    position_key: str | None = None
-
-
-@dataclass(frozen=True)
-class LivePositionState:
-    symbol: str
-    symbol_code: str
-    exchange: int
-    direction: Direction
-    qty: int
-    entry_price: float
-    entry_time: datetime
-    hold_id: str | None
-
-
-@dataclass
-class LivePositionSlot:
-    position: LivePositionState
-    trade: Any
-    entry_signal: Signal
-    entry_order_id: str | None = None
-    entry_execution_price: float | None = None
-    entry_execution_id: str | None = None
-    entry_execution_day: str | None = None
-    entry_price_mismatch: bool = False
 
 
 class LiveExecutionController:
@@ -123,14 +94,7 @@ class LiveExecutionController:
         self.live_losses = 0
         self.live_pnl_ticks = 0.0
         self.live_pnl_yen = 0.0
-        self.api_error_counts: Counter[str] = Counter()
-        self.last_api_error: dict[str, object] | None = None
-        self.api_auth_failed = False
-        self.api_backoff_until: datetime | None = None
-        self.api_latency_samples: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=100))
-        self.last_api_latency_ms: dict[str, float] = {}
-        self.wrong_instance_cooldown_until: datetime | None = None
-        self.wrong_instance_errors = 0
+        self.api_health = LiveApiHealth(self.config)
         self.loss_hold_guard_active = False
         self.loss_hold_guard_since: datetime | None = None
         self.loss_hold_guard_reason: str | None = None
@@ -412,9 +376,9 @@ class LiveExecutionController:
         return events
 
     def heartbeat_metadata(self) -> dict[str, object]:
-        positions = [_position_summary(slot.position) for slot in self.live_positions.values()]
-        pending_exits = [_pending_summary(order) for order in self.pending_exits.values()]
-        active_engines = [_trade_engine(slot.trade) for slot in self.live_positions.values()]
+        positions = [position_summary(slot.position) for slot in self.live_positions.values()]
+        pending_exits = [pending_summary(order) for order in self.pending_exits.values()]
+        active_engines = [trade_engine(slot.trade) for slot in self.live_positions.values()]
         return {
             "paper_position": None,
             "paper_pending_order": None,
@@ -428,13 +392,13 @@ class LiveExecutionController:
             "paper_minute_trades": 0,
             "paper_micro_pnl_ticks": 0.0,
             "paper_minute_pnl_ticks": 0.0,
-            "live_position": _position_summary(self.live_position),
+            "live_position": position_summary(self.live_position),
             "live_positions": positions,
             "live_position_count": len(self.live_positions),
-            "live_pending_entry": _pending_summary(self.pending_entry),
-            "live_pending_exit": _pending_summary(self.pending_exit),
+            "live_pending_entry": pending_summary(self.pending_entry),
+            "live_pending_exit": pending_summary(self.pending_exit),
             "live_pending_exits": pending_exits,
-            "live_active_engine": _trade_engine(self._active_trade()),
+            "live_active_engine": trade_engine(self._active_trade()),
             "live_active_engines": active_engines,
             "live_last_order_statuses": dict(self.last_order_snapshot_by_id),
             "live_orders_submitted": self.orders_submitted,
@@ -704,7 +668,7 @@ class LiveExecutionController:
             )
             active = [position for position in active if position.symbol not in missing_hold_id_symbols or position.hold_id is not None]
 
-        current_positions = {_position_key(position): position for position in active}
+        current_positions = {live_position_key(position): position for position in active}
         for position_key, slot in tuple(self.live_positions.items()):
             if position_key in current_positions:
                 slot.position = current_positions[position_key]
@@ -853,7 +817,7 @@ class LiveExecutionController:
             self.live_losses += 1
         self.live_pnl_ticks += pnl_ticks
         self.live_pnl_yen += pnl_yen
-        engine = _trade_engine(slot.trade) or slot.entry_signal.engine
+        engine = trade_engine(slot.trade) or slot.entry_signal.engine
         self.live_safety.record_exit(engine, slot.position.direction, slot.entry_signal.reason, pending.reason, pnl_ticks, event_time)
 
         trade_record: dict[str, object] = {
@@ -897,7 +861,7 @@ class LiveExecutionController:
             pnl_yen=round(pnl_yen, 2),
             timestamp=event_time,
             metadata={
-                **event_trace_metadata("position_lifecycle", "exit", pending.reason, checks={"engine": _trade_engine(slot.trade)}),
+                **event_trace_metadata("position_lifecycle", "exit", pending.reason, checks={"engine": trade_engine(slot.trade)}),
                 **trade_record,
                 "order_status": order_status,
             },
@@ -1038,7 +1002,7 @@ class LiveExecutionController:
         if decision.price is None:
             return None
         trade = slot.trade
-        symbol_code = _validated_symbol_code(slot.position)
+        symbol_code = validated_symbol_code(slot.position)
         if symbol_code is None:
             return None
         return self.orders.close_aggressive_limit(
@@ -1304,89 +1268,29 @@ class LiveExecutionController:
         return True
 
     def _wrong_instance_cooldown_active(self, event_time: datetime) -> bool:
-        if self.wrong_instance_cooldown_until is None:
-            return False
-        if event_time >= self.wrong_instance_cooldown_until:
-            self.wrong_instance_cooldown_until = None
-            return False
-        return True
+        return self.api_health.wrong_instance_cooldown_active(event_time)
 
     def _record_api_error(self, exc: KabuApiError, event_time: datetime, operation: str) -> dict[str, object]:
-        category = classify_kabu_api_error(exc)
-        self.api_error_counts[category] += 1
-        if category in {"auth_error", "auth_recovery_failed"}:
-            self.api_auth_failed = True
-            if category == "auth_recovery_failed":
-                self.position_sync_blocked = True
-        if category in {"rate_limit", "service_unavailable"}:
-            backoff_seconds = self._api_backoff_seconds(category)
-            self.api_backoff_until = event_time + timedelta(seconds=backoff_seconds)
-        if category == "kabu_station_wrong_instance":
-            self.wrong_instance_errors += 1
-            cooldown_seconds = max(30.0, float(self.config.live_execution.entry_failure_cooldown_seconds))
-            self.wrong_instance_cooldown_until = event_time + timedelta(seconds=cooldown_seconds)
-        self.last_api_error = {
-            "category": category,
-            "operation": operation,
-            "error": str(exc),
-            "timestamp": event_time.isoformat(),
-            "status_code": getattr(exc, "status_code", None),
-        }
-        return {
-            "api_error_category": category,
-            "category": category,
-            "api_operation": operation,
-            "api_status_code": getattr(exc, "status_code", None),
-        }
+        metadata = self.api_health.record_error(exc, event_time, operation)
+        if metadata.get("category") == "auth_recovery_failed":
+            self.position_sync_blocked = True
+        return metadata
 
     def _record_api_success(self) -> None:
-        self.api_auth_failed = False
+        self.api_health.record_success()
 
     def _api_call(self, operation: str, func: Callable[..., T], *args: object, **kwargs: object) -> T:
-        started = time.perf_counter()
-        try:
-            return func(*args, **kwargs)
-        finally:
-            latency_ms = (time.perf_counter() - started) * 1000.0
-            self.last_api_latency_ms[operation] = round(latency_ms, 4)
-            self.api_latency_samples[operation].append(latency_ms)
-
-    def _api_backoff_seconds(self, category: str) -> float:
-        base = max(1.0, float(self.config.live_execution.api_error_cooldown_seconds))
-        count = max(1, self.api_error_counts.get(category, 1))
-        return min(120.0, base * (2 ** min(count - 1, 3)))
+        return self.api_health.call(operation, func, *args, **kwargs)
 
     def _api_backoff_active(self, event_time: datetime) -> bool:
-        if self.api_backoff_until is None:
-            return False
-        if event_time >= self.api_backoff_until:
-            self.api_backoff_until = None
-            return False
-        return True
+        return self.api_health.api_backoff_active(event_time)
 
     def _live_api_health(self, event_time: datetime | None = None) -> dict[str, object]:
-        now = event_time or datetime.now(timezone.utc)
-        return {
-            "last_error": self.last_api_error,
-            "error_counts": dict(self.api_error_counts),
-            "latency_ms": _latency_summary(self.api_latency_samples),
-            "last_latency_ms": dict(self.last_api_latency_ms),
-            "auth_failed": self.api_auth_failed,
-            "api_backoff_until": self.api_backoff_until.isoformat() if self.api_backoff_until is not None else None,
-            "api_backoff_active": self.api_backoff_until is not None and now < self.api_backoff_until,
-            "position_sync_blocked": self.position_sync_blocked,
-            "wrong_instance_errors": self.wrong_instance_errors,
-            "wrong_instance_cooldown_until": self.wrong_instance_cooldown_until.isoformat()
-            if self.wrong_instance_cooldown_until is not None
-            else None,
-            "wrong_instance_cooldown_active": self.wrong_instance_cooldown_until is not None
-            and now < self.wrong_instance_cooldown_until,
-            "next_position_retry_at": (
-                self.last_position_poll_at + timedelta(seconds=self.config.live_execution.position_poll_interval_seconds)
-            ).isoformat()
-            if self.position_sync_blocked and self.last_position_poll_at is not None
-            else None,
-        }
+        return self.api_health.summary(
+            event_time,
+            position_sync_blocked=self.position_sync_blocked,
+            last_position_poll_at=self.last_position_poll_at,
+        )
 
     def _evaluate_live_guards(self, book: OrderBook, event_time: datetime) -> list[ExecutionEvent]:
         if self.loss_hold_guard_active:
@@ -1561,25 +1465,6 @@ def _position_entry_signal(source_signal: Signal | None, position: LivePositionS
     )
 
 
-def _position_key(position: LivePositionState) -> str:
-    if position.hold_id:
-        return f"hold:{position.hold_id}"
-    return f"single_position_without_hold_id:{position.symbol_code}"
-
-
-def _trade_engine(trade: Any | None) -> str | None:
-    if trade is None:
-        return None
-    return str(getattr(trade, "engine", "micro_book"))
-
-
-def _validated_symbol_code(position: LivePositionState) -> str | None:
-    symbol_code = str(position.symbol_code or "")
-    if symbol_code and symbol_code != position.symbol and symbol_code.isdigit():
-        return symbol_code
-    return None
-
-
 def _event(
     event_type: str,
     signal: Signal,
@@ -1630,27 +1515,6 @@ def _elapsed_ms(start: datetime | None, end: datetime | None) -> float | None:
     if start is None or end is None:
         return None
     return round((end - start).total_seconds() * 1000.0, 4)
-
-
-def _latency_summary(samples: dict[str, deque[float]]) -> dict[str, dict[str, float]]:
-    return {operation: _latency_bucket(values) for operation, values in samples.items() if values}
-
-
-def _latency_bucket(values: deque[float]) -> dict[str, float]:
-    ordered = sorted(values)
-    if not ordered:
-        return {"count": 0.0, "last": 0.0, "p50": 0.0, "p95": 0.0}
-    return {
-        "count": float(len(ordered)),
-        "last": round(values[-1], 4),
-        "p50": round(_percentile_sorted(ordered, 0.50), 4),
-        "p95": round(_percentile_sorted(ordered, 0.95), 4),
-    }
-
-
-def _percentile_sorted(values: list[float], pct: float) -> float:
-    idx = min(len(values) - 1, max(0, int(round((len(values) - 1) * pct))))
-    return values[idx]
 
 
 def _loss_hold_reason(snapshot: dict[str, object], max_loss_ticks: float, daily_loss_yen: float) -> str | None:
@@ -1971,33 +1835,3 @@ def _with_tif(intent: Any, tif: int) -> Any:
     from dataclasses import replace
 
     return replace(intent, time_in_force=tif)
-
-
-def _position_summary(position: LivePositionState | None) -> dict[str, object] | None:
-    if position is None:
-        return None
-    return {
-        "symbol": position.symbol,
-        "symbol_code": position.symbol_code,
-        "exchange": position.exchange,
-        "direction": position.direction,
-        "qty": position.qty,
-        "entry_price": position.entry_price,
-        "hold_id": position.hold_id,
-    }
-
-
-def _pending_summary(order: PendingLiveOrder | None) -> dict[str, object] | None:
-    if order is None:
-        return None
-    return {
-        "order_id": order.order_id,
-        "symbol": order.symbol,
-        "symbol_code": order.symbol_code,
-        "exchange": order.exchange,
-        "direction": order.direction,
-        "qty": order.qty,
-        "submitted_at": order.submitted_at.isoformat(),
-        "reason": order.reason,
-        "position_key": order.position_key,
-    }
