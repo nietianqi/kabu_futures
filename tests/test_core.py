@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 import json
@@ -23,12 +24,22 @@ from kabu_futures.alpha import (
 from kabu_futures.api import KabuApiError, KabuStationClient, build_future_registration_symbols, extract_symbol_code
 from kabu_futures.analysis_utils import iter_books, max_drawdown
 from kabu_futures.config import default_config, effective_micro_engine_config, load_json_config
+from kabu_futures.diagnostics_funnel import diagnosis_notes, latency_summary, micro_entry_funnel
 from kabu_futures.engine import DualStrategyEngine
 from kabu_futures.evolution import analyze_micro_log, calculate_markout_ticks
 from kabu_futures.indicators import BarBuilder
 from kabu_futures.live import MicroCandidateEmitter, _should_print_tick, tick_to_dict, signal_to_dict
+from kabu_futures.live_api_health import LiveApiHealth
 from kabu_futures.live_execution import LiveExecutionController
 from kabu_futures.live_safety import LiveSafetyState
+from kabu_futures.live_state import (
+    LivePositionState,
+    PendingLiveOrder,
+    pending_summary,
+    position_key,
+    position_summary,
+    validated_symbol_code,
+)
 from kabu_futures.log_diagnostics import diagnose_log
 from kabu_futures.microstructure import BookFeatureEngine, RollingPercentile, microprice, percentile, weighted_imbalance
 from kabu_futures.marketdata import BufferedJsonlMarketRecorder, KabuBoardNormalizer, MarketDataError, MarketDataSkip, signal_evaluation_to_dict
@@ -631,6 +642,137 @@ class OrderTests(unittest.TestCase):
 
 
 class MarketDataAndExecutionTests(unittest.TestCase):
+    def test_live_state_summary_helpers_keep_heartbeat_shape(self) -> None:
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=timezone.utc)
+        position = LivePositionState("NK225micro", "161060023", 24, "long", 1, 50005.0, ts, "H1")
+        pending = PendingLiveOrder("O1", "NK225micro", "161060023", 24, "long", 1, ts, "entry", position_key="hold:H1")
+
+        self.assertEqual(position_key(position), "hold:H1")
+        self.assertEqual(validated_symbol_code(position), "161060023")
+        self.assertEqual(
+            position_summary(position),
+            {
+                "symbol": "NK225micro",
+                "symbol_code": "161060023",
+                "exchange": 24,
+                "direction": "long",
+                "qty": 1,
+                "entry_price": 50005.0,
+                "hold_id": "H1",
+            },
+        )
+        self.assertEqual(
+            pending_summary(pending),
+            {
+                "order_id": "O1",
+                "symbol": "NK225micro",
+                "symbol_code": "161060023",
+                "exchange": 24,
+                "direction": "long",
+                "qty": 1,
+                "submitted_at": ts.isoformat(),
+                "reason": "entry",
+                "position_key": "hold:H1",
+            },
+        )
+        self.assertIsNone(position_summary(None))
+        self.assertIsNone(pending_summary(None))
+        self.assertIsNone(validated_symbol_code(replace(position, symbol_code="NK225micro")))
+
+    def test_live_api_health_records_backoff_latency_and_summary(self) -> None:
+        base_cfg = default_config()
+        cfg = replace(base_cfg, live_execution=replace(base_cfg.live_execution, api_error_cooldown_seconds=30))
+        health = LiveApiHealth(cfg)
+        ts = datetime(2026, 4, 27, 12, 0, tzinfo=timezone.utc)
+
+        metadata = health.record_error(
+            KabuApiError("kabu API HTTP 429: too many requests", status_code=429, category="rate_limit"),
+            ts,
+            "sendorder",
+        )
+        result = health.call("positions", lambda: {"data": []})
+        summary = health.summary(ts + timedelta(seconds=1), position_sync_blocked=True, last_position_poll_at=ts)
+
+        self.assertEqual(metadata["api_error_category"], "rate_limit")
+        self.assertEqual(result, {"data": []})
+        self.assertTrue(health.api_backoff_active(ts + timedelta(seconds=1)))
+        self.assertEqual(summary["error_counts"]["rate_limit"], 1)
+        self.assertTrue(summary["api_backoff_active"])
+        self.assertIn("positions", summary["last_latency_ms"])
+        self.assertIn("positions", summary["latency_ms"])
+        self.assertEqual(
+            summary["next_position_retry_at"],
+            (ts + timedelta(seconds=cfg.live_execution.position_poll_interval_seconds)).isoformat(),
+        )
+
+        health.record_error(KabuApiError("HTTP 401", status_code=401, category="auth_error"), ts, "positions")
+        self.assertTrue(health.summary(ts)["auth_failed"])
+        health.record_success()
+        self.assertFalse(health.summary(ts)["auth_failed"])
+
+    def test_live_api_health_wrong_instance_cooldown_summary(self) -> None:
+        health = LiveApiHealth(default_config())
+        ts = datetime(2026, 4, 27, 12, 0, tzinfo=timezone.utc)
+
+        metadata = health.record_error(
+            KabuApiError("wrong kabu station instance", status_code=500, category="kabu_station_wrong_instance"),
+            ts,
+            "sendorder",
+        )
+        summary = health.summary(ts + timedelta(seconds=1))
+
+        self.assertEqual(metadata["api_error_category"], "kabu_station_wrong_instance")
+        self.assertEqual(summary["wrong_instance_errors"], 1)
+        self.assertTrue(summary["wrong_instance_cooldown_active"])
+        self.assertTrue(health.wrong_instance_cooldown_active(ts + timedelta(seconds=1)))
+
+    def test_diagnostics_funnel_helpers_preserve_report_shape(self) -> None:
+        counters: dict[str, object] = {
+            "live_entry_orders_submitted": 2,
+            "live_positions_detected": 1,
+            "live_entry_orders_submitted_by_engine": Counter({"micro_book": 1, "minute_vwap": 1}),
+            "live_tradeable_signals_by_engine": Counter({"micro_book": 3}),
+            "signal_eval_decisions": Counter({"reject": 4, "allow": 1}),
+            "signal_eval_engines": Counter({"micro_book": 5}),
+            "signal_eval_reject_reasons": Counter({"imbalance_not_met": 4}),
+            "signal_eval_failed_checks": Counter({"imbalance_not_met": 4}),
+            "signal_eval_jump_reasons": Counter({"spread_wide": 2, "mid_move_jump": 1, "other": 1}),
+            "near_miss_from_signal_eval": 2,
+            "near_miss_missing_checks": Counter({"ofi_not_met": 2}),
+            "near_miss_directions": Counter({"long": 2}),
+            "micro_candidate_events": 1,
+            "micro_candidate_count": 2,
+            "micro_candidate_missing_checks": Counter({"microprice_not_met": 2}),
+            "micro_candidate_directions": Counter({"short": 2}),
+            "live_signals_by_engine": Counter({"micro_book": 2}),
+            "live_entry_orders_cancelled": 1,
+            "live_entry_orders_expired": 1,
+            "live_entry_order_errors": 1,
+            "live_exit_orders_submitted": 1,
+            "live_exit_orders_cancelled": 1,
+            "live_trades_closed": 1,
+            "execution_rejects": Counter({"position_sync_blocked": 1}),
+            "execution_reject_blocked_by": Counter({"position_sync": 1}),
+            "position_sync_blocked_rejects": 1,
+            "live_unsupported_minute_signals": 1,
+            "api_error_categories": Counter({"auth_error": 1, "kabu_station_wrong_instance": 1}),
+            "loss_hold_guard_events": 1,
+            "kill_switch_events": 1,
+            "suspected_old_live_policy": True,
+        }
+        samples: dict[str, list[float]] = defaultdict(list)
+        samples["sendorder"] = [10.0, 20.0, 30.0]
+
+        funnel = micro_entry_funnel(counters)  # type: ignore[arg-type]
+        notes = diagnosis_notes(counters)  # type: ignore[arg-type]
+        latency = latency_summary(samples)
+
+        self.assertEqual(funnel["live_execution"]["entry_fill_rate"], 0.5)
+        self.assertEqual(funnel["live_execution"]["micro_tradeable_signals_without_entry_submission"], 2)
+        self.assertEqual(funnel["signal_eval"]["non_tradeable_jump_reasons"], {"spread_wide": 2, "mid_move_jump": 1})
+        self.assertIn("kabu_auth_errors_blocked_live_entry", notes)
+        self.assertEqual(latency["sendorder"]["p95"], 30.0)
+
     def test_kabu_normalizer_maps_real_symbol_alias_and_keeps_raw_symbol(self) -> None:
         payload = {
             "Symbol": "161050023",
