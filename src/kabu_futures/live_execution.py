@@ -11,8 +11,9 @@ from .execution import ExitDecision, MicroTradeManager, MinuteTradeManager, pnl_
 from .models import BookFeatures, Direction, OrderBook, Signal
 from .orders import KabuConstants, KabuFutureOrderBuilder
 from .paper_execution import ExecutionEvent
-from .policy import LiveEntryPolicy, event_trace_metadata
+from .policy import LiveEntryPolicy, event_trace_metadata, session_metadata
 from .serialization import event_time as book_event_time, signal_snapshot
+from .sessions import classify_jst_session
 from .live_api_health import LiveApiHealth
 from .live_safety import LiveSafetyState
 from .live_state import (
@@ -109,6 +110,9 @@ class LiveExecutionController:
         decision = self.entry_policy.evaluate_signal(signal)
         if not decision.allowed:
             return [_event("execution_reject", signal, book, decision.reason, decision.merged_metadata)]
+        session_reject_metadata = _live_session_reject_metadata(event_time, self.config)
+        if session_reject_metadata is not None:
+            return [_event("execution_reject", signal, book, "session_not_tradeable", session_reject_metadata)]
         safety_decision = self.live_safety.evaluate_entry(signal, event_time)
         if not safety_decision.allowed:
             return [_event("execution_reject", signal, book, safety_decision.reason, safety_decision.metadata)]
@@ -1517,6 +1521,19 @@ def _live_reject_metadata(
     checks: dict[str, object] | None = None,
 ) -> dict[str, object]:
     return event_trace_metadata("execution_order", "reject", reason, blocked_by, checks or {})
+
+
+def _live_session_reject_metadata(event_time: datetime, config: StrategyConfig) -> dict[str, object] | None:
+    session_state = classify_jst_session(event_time, config.session_schedule)
+    if session_state.new_entries_allowed and session_state.api_window_status == "available":
+        return None
+    metadata = session_metadata(session_state)
+    if not session_state.new_entries_allowed:
+        metadata["session_block_reason"] = "new_entries_not_allowed"
+    if session_state.api_window_status != "available":
+        metadata["session_block_reason"] = "api_window_unavailable"
+    metadata.update(_live_reject_metadata("session_not_tradeable", "session_gate", dict(metadata)))
+    return metadata
 
 
 def _position_entry_signal(source_signal: Signal | None, position: LivePositionState, fallback_symbol: str) -> Signal:

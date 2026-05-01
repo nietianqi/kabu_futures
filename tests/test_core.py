@@ -60,6 +60,7 @@ from kabu_futures.multitimeframe import MultiTimeframeScorer
 from kabu_futures.execution import MicroTradeManager
 from kabu_futures.orders import KabuFutureOrderBuilder
 from kabu_futures.paper_execution import PaperExecutionController
+from kabu_futures.policy import LiveEntryPolicy
 from kabu_futures.replay import read_recorded_books, replay_jsonl
 from kabu_futures.risk import OrderThrottle
 from kabu_futures.serialization import signal_snapshot
@@ -102,6 +103,24 @@ def topix_book(
         buy_levels=(Level(bid, bid_qty), Level(bid - 0.25, 80), Level(bid - 0.5, 60)),
         sell_levels=(Level(ask, ask_qty), Level(ask + 0.25, 40), Level(ask + 0.5, 30)),
     )
+
+
+def live_micro_signal(
+    direction: str = "long",
+    price: float = 50005,
+    *,
+    symbol: str = "NK225micro",
+    confidence: float = 0.8,
+    reason: str | None = None,
+    minute_bias: str | None = None,
+    topix_bias: str = "flat",
+    metadata: dict[str, object] | None = None,
+) -> Signal:
+    signal_metadata = dict(metadata or {})
+    signal_metadata.setdefault("minute_bias", minute_bias or direction)
+    signal_metadata.setdefault("topix_bias", topix_bias)
+    signal_metadata.setdefault("multi_timeframe_bias", direction)
+    return Signal("micro_book", symbol, direction, confidence, price, reason or f"micro_book_{direction}", signal_metadata)
 
 
 class ConfigTests(unittest.TestCase):
@@ -795,6 +814,64 @@ class MarketDataAndExecutionTests(unittest.TestCase):
 
     def test_winerror_10054_is_classified_as_websocket_remote_closed(self) -> None:
         self.assertEqual(classify_kabu_api_error("[WinError 10054] remote host closed"), "websocket_remote_closed")
+
+    def test_live_micro_trend_confirmation_requires_same_direction_bias(self) -> None:
+        policy = LiveEntryPolicy(default_config())
+
+        missing = policy.evaluate_signal(
+            Signal("micro_book", "NK225micro", "long", 0.8, 50005, metadata={"minute_bias": "flat", "topix_bias": "flat"})
+        )
+        confirmed = policy.evaluate_signal(
+            Signal("micro_book", "NK225micro", "long", 0.8, 50005, metadata={"minute_bias": "long", "topix_bias": "flat"})
+        )
+        conflict = policy.evaluate_signal(
+            Signal("micro_book", "NK225micro", "long", 0.8, 50005, metadata={"minute_bias": "long", "topix_bias": "short"})
+        )
+
+        self.assertFalse(missing.allowed)
+        self.assertEqual(missing.reason, "live_micro_trend_confirmation_missing")
+        self.assertEqual(missing.trace.blocked_by, "live_micro_trend_filter")
+        self.assertTrue(confirmed.allowed)
+        self.assertFalse(conflict.allowed)
+        self.assertEqual(conflict.reason, "live_micro_trend_conflict")
+
+    def test_live_micro_trend_confirmation_applies_symmetrically_to_short(self) -> None:
+        policy = LiveEntryPolicy(default_config())
+
+        missing = policy.evaluate_signal(
+            Signal("micro_book", "NK225micro", "short", 0.8, 50000, metadata={"minute_bias": "flat", "topix_bias": "flat"})
+        )
+        confirmed = policy.evaluate_signal(
+            Signal("micro_book", "NK225micro", "short", 0.8, 50000, metadata={"minute_bias": "flat", "topix_bias": "short"})
+        )
+        conflict = policy.evaluate_signal(
+            Signal("micro_book", "NK225micro", "short", 0.8, 50000, metadata={"minute_bias": "long", "topix_bias": "short"})
+        )
+
+        self.assertFalse(missing.allowed)
+        self.assertEqual(missing.reason, "live_micro_trend_confirmation_missing")
+        self.assertTrue(confirmed.allowed)
+        self.assertFalse(conflict.allowed)
+        self.assertEqual(conflict.reason, "live_micro_trend_conflict")
+
+    def test_live_policy_rejects_nt_spread_even_if_engine_is_enabled(self) -> None:
+        base = default_config()
+        cfg = replace(
+            base,
+            live_execution=replace(
+                base.live_execution,
+                supported_engines=base.live_execution.supported_engines + ("nt_ratio_spread",),
+            ),
+        )
+        policy = LiveEntryPolicy(cfg)
+
+        decision = policy.evaluate_signal(
+            Signal("nt_ratio_spread", "NK225micro", "short", 0.8, 50005, "nt_ratio_expensive_short_nikkei_long_topix")
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "live_nt_spread_shadow_only")
+        self.assertEqual(decision.trace.blocked_by, "nt_spread_live_disabled")
 
     def test_live_error_context_marks_remote_close_and_recent_processing(self) -> None:
         last_received_at = datetime(2026, 5, 1, 3, 56, 6, tzinfo=timezone.utc)
@@ -1895,7 +1972,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         )
         controller = LiveExecutionController(client, config, {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
-        events = controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+        events = controller.on_signal(live_micro_signal("long", 50005), book(ts), exchange=24)
         self.assertEqual(events[0].event_type, "live_order_submitted")
         self.assertEqual(events[0].qty, 1)
         self.assertEqual(client.sent[0]["Symbol"], "161060023")
@@ -1934,7 +2011,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         client = FakeClient()
         controller = LiveExecutionController(client, cfg, {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
-        signal = Signal("micro_book", "NK225micro", "long", 0.8, 50005)
+        signal = live_micro_signal("long", 50005)
 
         blocked = controller.on_signal(signal, book(ts), exchange=24)
 
@@ -1974,7 +2051,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         client = FakeClient()
         controller = LiveExecutionController(client, cfg, {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
-        signal = Signal("micro_book", "NK225micro", "long", 0.8, 50005)
+        signal = live_micro_signal("long", 50005)
 
         failed = controller.on_signal(signal, book(ts), exchange=24)
         cooled = controller.on_signal(signal, book(ts + timedelta(seconds=1)), exchange=24)
@@ -2009,7 +2086,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
             {"NK225micro": "161060023", "TOPIXmini": "161060006"},
         )  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
-        signal = Signal("micro_book", "TOPIXmini", "long", 0.8, 3770.75)
+        signal = live_micro_signal("long", 3770.75, symbol="TOPIXmini")
         events = controller.on_signal(signal, topix_book(ts), exchange=24)
 
         self.assertEqual(events[0].event_type, "live_order_submitted")
@@ -2306,6 +2383,38 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertEqual(events[0].metadata["blocked_by"], "live_supported_engines")
         self.assertEqual(client.sent, [])
 
+    def test_live_rejects_new_entry_outside_allowed_session_without_api_calls(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+                self.position_calls = 0
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                raise AssertionError("session gate should reject before sending orders")
+
+            def positions(self, **query: object) -> dict[str, object]:
+                self.position_calls += 1
+                raise AssertionError("session gate should reject before syncing positions")
+
+        cases = (
+            (datetime(2026, 4, 28, 15, 42, tzinfo=JST), "day_closing_call", "available"),
+            (datetime(2026, 4, 28, 6, 20, tzinfo=JST), "api_maintenance", "maintenance"),
+        )
+        for ts, expected_phase, expected_api_status in cases:
+            client = FakeClient()
+            controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
+
+            events = controller.on_signal(live_micro_signal("long", 50005), book(ts), exchange=23)
+
+            self.assertEqual(events[0].event_type, "execution_reject")
+            self.assertEqual(events[0].reason, "session_not_tradeable")
+            self.assertEqual(events[0].metadata["blocked_by"], "session_gate")
+            self.assertEqual(events[0].metadata["session_phase"], expected_phase)
+            self.assertEqual(events[0].metadata["api_window_status"], expected_api_status)
+            self.assertEqual(client.sent, [])
+            self.assertEqual(client.position_calls, 0)
+
     def test_live_entry_slippage_ticks_adjusts_fak_limit_price(self) -> None:
         class FakeClient:
             def __init__(self) -> None:
@@ -2324,7 +2433,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         controller = LiveExecutionController(client, config, {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
 
-        long_events = controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+        long_events = controller.on_signal(live_micro_signal("long", 50005), book(ts), exchange=24)
 
         self.assertEqual(long_events[0].event_type, "live_order_submitted")
         self.assertEqual(client.sent[0]["Price"], 50010.0)
@@ -2333,7 +2442,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
 
         controller.pending_entry = None
         controller.entry_signal = None
-        short_events = controller.on_signal(Signal("micro_book", "NK225micro", "short", 0.8, 50000), book(ts), exchange=24)
+        short_events = controller.on_signal(live_micro_signal("short", 50000), book(ts), exchange=24)
 
         self.assertEqual(short_events[0].event_type, "live_order_submitted")
         self.assertEqual(client.sent[1]["Price"], 49995.0)
@@ -2368,7 +2477,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         controller.pending_entry = None
         controller.entry_signal = None
         long_events = controller.on_signal(
-            Signal("micro_book", "TOPIXmini", "long", 0.8, 3770.875),
+            live_micro_signal("long", 3770.875, symbol="TOPIXmini"),
             topix_book(ts),
             exchange=23,
         )
@@ -2424,7 +2533,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         controller = LiveExecutionController(client, config, {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
 
-        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+        controller.on_signal(live_micro_signal("long", 50005), book(ts), exchange=24)
         events = controller.on_book(book(ts + timedelta(seconds=2), bid=50005, ask=50010), None, exchange=24)
         tp_event = [
             event
@@ -2488,7 +2597,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         )
         controller = LiveExecutionController(client, config, {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
-        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+        controller.on_signal(live_micro_signal("long", 50005), book(ts), exchange=24)
         sync_events = controller.on_book(book(ts + timedelta(seconds=2), bid=50000, ask=50005), None, exchange=24)
         self.assertTrue(any(event.event_type == "live_position_detected" for event in sync_events))
         tp_events = [
@@ -2569,7 +2678,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         controller = LiveExecutionController(client, cfg, {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 28, 17, 0, tzinfo=JST)
 
-        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 60095), book(ts, bid=60090, ask=60095), exchange=24)
+        controller.on_signal(live_micro_signal("long", 60095), book(ts, bid=60090, ask=60095), exchange=24)
         events = controller.on_book(book(ts + timedelta(seconds=1), bid=60095, ask=60100), None, exchange=24)
 
         status = [event for event in events if event.event_type == "live_order_status"][0]
@@ -2625,7 +2734,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         client = FakeClient()
         controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 28, 17, 0, tzinfo=JST)
-        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 60095), book(ts, bid=60090, ask=60095), exchange=24)
+        controller.on_signal(live_micro_signal("long", 60095), book(ts, bid=60090, ask=60095), exchange=24)
         events = controller.on_book(book(ts + timedelta(seconds=1), bid=60095, ask=60100), None, exchange=24)
 
         detected = [event for event in events if event.event_type == "live_position_detected"][0]
@@ -2915,7 +3024,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
 
-        events = controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+        events = controller.on_signal(live_micro_signal("long", 50005), book(ts), exchange=24)
 
         self.assertEqual(client.positions_calls, 1)
         self.assertEqual(events[-1].event_type, "execution_reject")
@@ -3034,9 +3143,9 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         client = FakeClient()
         controller = LiveExecutionController(client, cfg, {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
-        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+        controller.on_signal(live_micro_signal("long", 50005), book(ts), exchange=24)
         controller.on_book(book(ts + timedelta(seconds=2), bid=50000, ask=50005), None, exchange=24)
-        events = controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts + timedelta(seconds=3)), exchange=24)
+        events = controller.on_signal(live_micro_signal("long", 50005), book(ts + timedelta(seconds=3)), exchange=24)
 
         self.assertEqual(controller.heartbeat_metadata()["live_position_count"], 5)
         self.assertEqual(events[0].event_type, "execution_reject")
@@ -3089,9 +3198,9 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         client = FakeClient()
         controller = LiveExecutionController(client, cfg, {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
-        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+        controller.on_signal(live_micro_signal("long", 50005), book(ts), exchange=24)
         controller.on_book(book(ts + timedelta(seconds=2), bid=50000, ask=50005), None, exchange=24)
-        events = controller.on_signal(Signal("micro_book", "NK225micro", "short", 0.8, 50000), book(ts + timedelta(seconds=3)), exchange=24)
+        events = controller.on_signal(live_micro_signal("short", 50000), book(ts + timedelta(seconds=3)), exchange=24)
 
         self.assertEqual(events[0].event_type, "live_order_submitted")
         self.assertEqual(events[0].reason, "entry_limit_fak_submitted")
@@ -3112,7 +3221,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         client = FakeClient()
         controller = LiveExecutionController(client, cfg, {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
-        signal = Signal("micro_book", "NK225micro", "long", 0.8, 50005)
+        signal = live_micro_signal("long", 50005)
 
         error_events = controller.on_signal(signal, book(ts), exchange=24)
         blocked_events = controller.on_signal(signal, book(ts + timedelta(seconds=1)), exchange=24)
@@ -3171,7 +3280,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         client = FakeClient()
         controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
-        signal = Signal("micro_book", "NK225micro", "long", 0.8, 50005)
+        signal = live_micro_signal("long", 50005)
 
         controller.on_signal(signal, book(ts), exchange=24)
         guard_events = controller.on_book(book(ts + timedelta(seconds=2), bid=49925, ask=49930), None, exchange=24)
@@ -3230,7 +3339,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         client = FakeClient()
         controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
-        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+        controller.on_signal(live_micro_signal("long", 50005), book(ts), exchange=24)
         suspect_features = BookFeatures(
             timestamp=ts + timedelta(seconds=2),
             symbol="NK225micro",
@@ -3277,7 +3386,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         controller.live_positions[position_key(position)] = LivePositionSlot(
             position,
             object(),
-            Signal("micro_book", "NK225micro", "long", 0.8, 50005),
+            live_micro_signal("long", 50005),
         )
         controller.loss_hold_guard_active = True
         controller.loss_hold_guard_since = ts
@@ -3287,7 +3396,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         events = controller.on_book(book(ts + timedelta(seconds=1)), None, exchange=24)
         flat_events = [event for event in events if event.event_type == "live_position_flat"]
         next_signal_events = controller.on_signal(
-            Signal("micro_book", "NK225micro", "long", 0.8, 50005),
+            live_micro_signal("long", 50005),
             book(ts + timedelta(seconds=2)),
             exchange=24,
         )
@@ -3327,7 +3436,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
 
         events = controller.on_signal(
-            Signal("micro_book", "NK225micro", "long", 0.8, 49930),
+            live_micro_signal("long", 49930),
             book(ts, bid=49925, ask=49930),
             exchange=24,
         )
@@ -3381,7 +3490,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         controller = LiveExecutionController(client, cfg, {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
 
-        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+        controller.on_signal(live_micro_signal("long", 50005), book(ts), exchange=24)
         events = controller.on_book(book(ts + timedelta(seconds=3)), None, exchange=24)
         heartbeat = controller.heartbeat_metadata()
 
@@ -3401,7 +3510,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         controller = LiveExecutionController(FakeClient(), cfg, {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 8, 9, 0, tzinfo=JST)
 
-        events = controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+        events = controller.on_signal(live_micro_signal("long", 50005), book(ts), exchange=24)
 
         self.assertEqual(events[0].event_type, "execution_reject")
         self.assertEqual(events[0].reason, "contract_rollover_window")
@@ -3436,7 +3545,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         client = FakeClient()
         controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
-        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+        controller.on_signal(live_micro_signal("long", 50005), book(ts), exchange=24)
         events = controller.on_book(book(ts + timedelta(seconds=2), bid=50000, ask=50005), None, exchange=24)
         self.assertTrue(any(event.event_type == "live_order_status" for event in events))
         expired = [event for event in events if event.event_type == "live_order_expired"]
@@ -3581,7 +3690,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertEqual(heartbeat["live_exit_failure_counts"]["hold:E1"], 3)
 
         reject_events = controller.on_signal(
-            Signal("micro_book", "NK225micro", "short", 0.8, 50000),
+            live_micro_signal("short", 50000),
             book(ts + timedelta(seconds=5)),
             exchange=24,
         )
@@ -3681,7 +3790,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         client = FakeClient()
         controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
-        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+        controller.on_signal(live_micro_signal("long", 50005), book(ts), exchange=24)
 
         grace_events = controller.on_book(book(ts + timedelta(seconds=9), bid=50000, ask=50005), None, exchange=24)
         self.assertTrue(any(event.reason == "pending_entry_grace_active" for event in grace_events))
@@ -3722,7 +3831,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
 
         for offset in range(3):
             events = controller.on_signal(
-                Signal("micro_book", "NK225micro", "long", 0.8, 50005),
+                live_micro_signal("long", 50005),
                 book(ts + timedelta(seconds=offset)),
                 exchange=24,
             )
@@ -3732,7 +3841,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertEqual(heartbeat["live_entry_failure_count"], 3)
         self.assertIsNotNone(heartbeat["live_entry_cooldown_until"])
         cooldown_events = controller.on_signal(
-            Signal("micro_book", "NK225micro", "long", 0.8, 50005),
+            live_micro_signal("long", 50005),
             book(ts + timedelta(seconds=3)),
             exchange=24,
         )
@@ -3783,7 +3892,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         client = FakeClient()
         controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
-        signal = Signal("micro_book", "NK225micro", "long", 0.8, 50005, "rich_reason", {"imbalance": 0.7})
+        signal = live_micro_signal("long", 50005, reason="rich_reason", metadata={"imbalance": 0.7})
         controller.on_signal(signal, book(ts), exchange=24)
         controller.on_book(book(ts + timedelta(seconds=21), bid=50000, ask=50005), None, exchange=24)
 
@@ -3832,7 +3941,7 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         client = FakeClient()
         controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
         ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
-        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+        controller.on_signal(live_micro_signal("long", 50005), book(ts), exchange=24)
         events = controller.on_book(book(ts + timedelta(seconds=2), bid=50000, ask=50005), None, exchange=24)
 
         self.assertTrue(any(event.reason == "order_status_missing" for event in events))
@@ -5169,7 +5278,13 @@ class AlphaStackTests(unittest.TestCase):
         self.assertEqual(signal.direction, "short")
         self.assertEqual(signal.veto_reason, "nt_shadow_only")
         self.assertAlmostEqual(compute_micro225_per_topix_mini(43000, 3000), 6.98, places=1)
+        self.assertAlmostEqual(compute_micro225_per_topix_mini(39000, 3300), 8.46, places=1)
         self.assertEqual(signal.metadata["nt_ratio"], 16.0)
+        self.assertEqual(signal.hedge_legs[0].symbol, "NK225micro")
+        self.assertEqual(signal.hedge_legs[0].qty, round(signal.metadata["hedge_ratio"]))
+        self.assertGreater(signal.hedge_legs[0].qty, 1)
+        self.assertEqual(signal.hedge_legs[1].symbol, "TOPIXmini")
+        self.assertEqual(signal.hedge_legs[1].qty, 1)
         self.assertGreater(signal.score, 70)
 
     def test_us_japan_lead_lag_scores_us_open_alignment(self) -> None:

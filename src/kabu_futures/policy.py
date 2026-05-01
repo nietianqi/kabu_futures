@@ -227,18 +227,52 @@ class LiveEntryPolicy:
         }
         if signal.engine not in self.config.live_execution.supported_engines:
             return _live_reject("live_unsupported_signal_engine", "live_supported_engines", checks)
+        if signal.engine == "nt_ratio_spread":
+            checks["nt_spread_mode"] = self.config.nt_spread.mode
+            return _live_reject("live_nt_spread_shadow_only", "nt_spread_live_disabled", checks)
         if not signal.is_tradeable:
             return _live_reject("non_tradeable_signal", "signal_tradeability", checks)
         if signal.price is None:
             return _live_reject("missing_signal_price", "signal_price", checks)
         if not self.config.is_trade_symbol(signal.symbol):
             return _live_reject("unsupported_symbol", "symbol", checks)
+        if signal.engine == "micro_book":
+            micro_decision = self._evaluate_micro_trend_confirmation(signal, checks)
+            if not micro_decision.allowed:
+                return micro_decision
         if signal.engine in MINUTE_SIGNAL_ENGINES:
             minute_decision = self._evaluate_minute_signal(signal, checks)
             if not minute_decision.allowed:
                 return minute_decision
         trace = DecisionTrace("execution_order", "allow", "live_entry_signal_allowed", checks=checks)
         return PolicyDecision(True, "live_entry_signal_allowed", trace)
+
+    def _evaluate_micro_trend_confirmation(self, signal: Signal, checks: dict[str, object]) -> PolicyDecision:
+        minute_bias = _direction_metadata(signal, "minute_bias")
+        topix_bias = _direction_metadata(signal, "topix_bias")
+        mtf_bias = _direction_metadata(signal, "multi_timeframe_bias")
+        checks.update(
+            {
+                "minute_bias": minute_bias,
+                "topix_bias": topix_bias,
+                "multi_timeframe_bias": mtf_bias,
+            }
+        )
+        if signal.direction == "long":
+            if minute_bias == "short" or topix_bias == "short":
+                return _live_reject("live_micro_trend_conflict", "live_micro_trend_filter", checks)
+            if minute_bias != "long" and topix_bias != "long":
+                return _live_reject("live_micro_trend_confirmation_missing", "live_micro_trend_filter", checks)
+        if signal.direction == "short":
+            if minute_bias == "long" or topix_bias == "long":
+                return _live_reject("live_micro_trend_conflict", "live_micro_trend_filter", checks)
+            if minute_bias != "short" and topix_bias != "short":
+                return _live_reject("live_micro_trend_confirmation_missing", "live_micro_trend_filter", checks)
+        return PolicyDecision(
+            True,
+            "live_micro_trend_confirmation_ok",
+            DecisionTrace("execution_order", "allow", "live_micro_trend_confirmation_ok", checks=checks),
+        )
 
     def _evaluate_minute_signal(self, signal: Signal, checks: dict[str, object]) -> PolicyDecision:
         atr = signal.metadata.get("atr")
@@ -287,3 +321,10 @@ def session_metadata(session_state: SessionState, extra_window: str | None = Non
 def _live_reject(reason: str, blocked_by: str, checks: dict[str, object]) -> PolicyDecision:
     trace = DecisionTrace("execution_order", "reject", reason, blocked_by=blocked_by, checks=checks)
     return PolicyDecision(False, reason, trace, reject_stage=blocked_by)
+
+
+def _direction_metadata(signal: Signal, key: str) -> str:
+    value = signal.metadata.get(key)
+    if value in {"long", "short", "flat"}:
+        return str(value)
+    return "flat"
