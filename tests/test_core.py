@@ -28,7 +28,7 @@ from kabu_futures.diagnostics_funnel import diagnosis_notes, latency_summary, mi
 from kabu_futures.engine import DualStrategyEngine
 from kabu_futures.evolution import analyze_micro_log, calculate_markout_ticks
 from kabu_futures.indicators import BarBuilder
-from kabu_futures.live import MicroCandidateEmitter, _live_error_context, _should_print_tick, tick_to_dict, signal_to_dict
+from kabu_futures.live import MicroCandidateEmitter, NTSpreadEmitter, _live_error_context, _should_print_tick, tick_to_dict, signal_to_dict
 from kabu_futures.live_api_health import LiveApiHealth
 from kabu_futures.live_execution import LiveExecutionController
 from kabu_futures.live_safety import LiveSafetyState
@@ -5584,6 +5584,156 @@ class RegimeTests(unittest.TestCase):
         ]
         dist = regime_distribution(books_list)
         self.assertEqual(sum(dist.values()), len(books_list))
+
+
+class NTSpreadMonitorTests(unittest.TestCase):
+    """Tests for NTSpreadEmitter and DualStrategyEngine.nt_spread_snapshot()."""
+
+    def _make_recorder(self, tmp_path: pathlib.Path) -> BufferedJsonlMarketRecorder:
+        return BufferedJsonlMarketRecorder(tmp_path / "test.jsonl", batch_size=1, flush_interval_seconds=60.0)
+
+    def _snapshot(self, composite_z: float) -> dict[str, object]:
+        return {
+            "nt_spread_ready": True,
+            "nt_history_length": 30,
+            "nt_ratio": 172.5,
+            "nt_zscore_20": composite_z,
+            "nt_zscore_60": None,
+            "nt_zscore_250": None,
+            "nt_composite_zscore": composite_z,
+            "nt_direction": "flat",
+            "nt_reason": "nt_ratio_inside_observe_band",
+            "nt_hedge_ratio": 3.45,
+            "nt_mode": "shadow",
+            "nt_structural_bias": "flat",
+            "nt_timestamp": "2026-04-30T10:00:00+00:00",
+        }
+
+    def test_nt_spread_emitter_emits_on_band_change(self) -> None:
+        with TemporaryDirectory() as tmp:
+            recorder = self._make_recorder(pathlib.Path(tmp))
+            emitter = NTSpreadEmitter(recorder, periodic_interval=10000)
+
+            # First check: z=0.5 -> band 0, triggers first-time emit.
+            emitter.check(self._snapshot(0.5), books=100)
+            # Second check: z=1.2 -> band 1, triggers band-change emit.
+            emitter.check(self._snapshot(1.2), books=200)
+            recorder.close()
+
+            rows = [
+                json.loads(line)
+                for line in (pathlib.Path(tmp) / "test.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        kinds = [r["kind"] for r in rows]
+        self.assertEqual(kinds, ["nt_spread_status", "nt_spread_status"])
+        payloads = [r["payload"] for r in rows]
+        # First emit: band=0, band_change=True.
+        self.assertEqual(payloads[0]["band"], 0)
+        self.assertTrue(payloads[0]["band_change"])
+        # Second emit: band=1, band_change=True
+        self.assertEqual(payloads[1]["band"], 1)
+        self.assertTrue(payloads[1]["band_change"])
+        self.assertEqual(payloads[1]["books"], 200)
+
+    def test_nt_spread_emitter_emits_on_sign_change_with_same_band(self) -> None:
+        with TemporaryDirectory() as tmp:
+            recorder = self._make_recorder(pathlib.Path(tmp))
+            emitter = NTSpreadEmitter(recorder, periodic_interval=10000)
+
+            emitter.check(self._snapshot(2.1), books=100)
+            emitter.check(self._snapshot(-2.1), books=101)
+            recorder.close()
+
+            rows = [
+                json.loads(line)
+                for line in (pathlib.Path(tmp) / "test.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        payloads = [row["payload"] for row in rows]
+        self.assertEqual([payload["band"] for payload in payloads], [3, 3])
+        self.assertEqual([payload["zscore_sign"] for payload in payloads], [1, -1])
+        self.assertTrue(payloads[1]["band_change"])
+        self.assertTrue(payloads[1]["state_change"])
+
+    def test_nt_spread_emitter_periodic_emit_without_band_change(self) -> None:
+        with TemporaryDirectory() as tmp:
+            recorder = self._make_recorder(pathlib.Path(tmp))
+            emitter = NTSpreadEmitter(recorder, periodic_interval=500)
+
+            # Prime emitter at band 0
+            emitter.check(self._snapshot(0.3), books=100)
+            # Same state, within interval - should NOT emit.
+            emitter.check(self._snapshot(0.4), books=200)
+            # Same state, past interval - SHOULD emit with band_change=False.
+            emitter.check(self._snapshot(0.5), books=601)
+            recorder.close()
+
+            rows = [
+                json.loads(line)
+                for line in (pathlib.Path(tmp) / "test.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        kinds = [r["kind"] for r in rows]
+        self.assertEqual(kinds, ["nt_spread_status", "nt_spread_status"])
+        payloads = [r["payload"] for r in rows]
+        self.assertFalse(payloads[1]["band_change"])
+        self.assertFalse(payloads[1]["state_change"])
+        self.assertEqual(payloads[1]["books"], 601)
+
+    def test_nt_spread_emitter_skips_when_not_ready(self) -> None:
+        with TemporaryDirectory() as tmp:
+            recorder = self._make_recorder(pathlib.Path(tmp))
+            emitter = NTSpreadEmitter(recorder, periodic_interval=1)
+
+            not_ready = {"nt_spread_ready": False, "nt_history_length": 5}
+            emitter.check(not_ready, books=1)
+            emitter.check(not_ready, books=2)
+            recorder.close()
+
+            content = (pathlib.Path(tmp) / "test.jsonl").read_text(encoding="utf-8").strip()
+
+        self.assertEqual(content, "")  # nothing written
+
+    def test_nt_spread_snapshot_not_ready_before_warmup(self) -> None:
+        engine = DualStrategyEngine()
+        snapshot = engine.nt_spread_snapshot()
+
+        self.assertFalse(snapshot["nt_spread_ready"])
+        self.assertEqual(snapshot["nt_history_length"], 0)
+
+    def test_nt_spread_snapshot_ready_after_both_symbols_seen(self) -> None:
+        engine = DualStrategyEngine()
+        ts = datetime(2026, 4, 30, 10, 0, tzinfo=timezone.utc)
+        # Send enough NK225 + TOPIX books for NT engine to compute a z-score
+        primary = engine.config.symbols.primary    # NK225micro
+        filter_sym = engine.config.symbols.filter  # TOPIXmini
+        for i in range(25):
+            nk_book = OrderBook(
+                symbol=primary,
+                timestamp=ts + timedelta(seconds=i),
+                best_bid_price=38000.0 + i,
+                best_bid_qty=10,
+                best_ask_price=38005.0 + i,
+                best_ask_qty=10,
+            )
+            tp_book = OrderBook(
+                symbol=filter_sym,
+                timestamp=ts + timedelta(seconds=i),
+                best_bid_price=2700.0,
+                best_bid_qty=5,
+                best_ask_price=2700.5,
+                best_ask_qty=5,
+            )
+            engine.on_order_book(nk_book)
+            engine.on_order_book(tp_book)
+
+        snapshot = engine.nt_spread_snapshot()
+
+        self.assertTrue(snapshot["nt_spread_ready"])
+        self.assertGreater(snapshot["nt_history_length"], 0)
+        self.assertIsNotNone(snapshot["nt_ratio"])
+        self.assertIsNotNone(snapshot["nt_zscore_20"])
 
 
 if __name__ == "__main__":

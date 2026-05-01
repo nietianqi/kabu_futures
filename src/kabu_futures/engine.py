@@ -227,6 +227,32 @@ class DualStrategyEngine:
             portfolio=self.portfolio_exposure,
         )
 
+    def nt_spread_snapshot(self) -> dict[str, object]:
+        """Return current NT-spread state for heartbeat/monitoring."""
+        nt = self.nt_spread
+        last = nt.last_signal
+        if last is None:
+            return {
+                "nt_spread_ready": False,
+                "nt_history_length": len(nt.ratios),
+            }
+        meta = last.metadata
+        return {
+            "nt_spread_ready": True,
+            "nt_history_length": len(nt.ratios),
+            "nt_ratio": meta.get("nt_ratio"),
+            "nt_zscore_20": meta.get("nt_zscore_20"),
+            "nt_zscore_60": meta.get("nt_zscore_60"),
+            "nt_zscore_250": meta.get("nt_zscore_250"),
+            "nt_composite_zscore": meta.get("nt_composite_zscore"),
+            "nt_direction": last.direction,
+            "nt_reason": meta.get("reason"),
+            "nt_hedge_ratio": meta.get("hedge_ratio"),
+            "nt_mode": meta.get("mode"),
+            "nt_structural_bias": meta.get("structural_bias"),
+            "nt_timestamp": meta.get("timestamp"),
+        }
+
     def _position_for(self, symbol: str) -> PositionState:
         if symbol not in self.positions:
             self.positions[symbol] = PositionState(symbol)

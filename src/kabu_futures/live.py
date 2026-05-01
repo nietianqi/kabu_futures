@@ -346,6 +346,80 @@ class MicroCandidateEmitter:
         self._pending_count[key] = 0
         self.emitted_candidates += 1
 
+
+class NTSpreadEmitter:
+    """Emit ``nt_spread_status`` JSONL events on z-score threshold crossings.
+
+    Emits when the NT composite z-score crosses +/-1.0, +/-1.5, or +/-2.0, and
+    also periodically every ``periodic_interval`` books when no crossing
+    occurs, so the dashboard always has a fresh snapshot.
+
+    Band index mapping:
+      0 = inside observe band (|z| < 1.0)
+      1 = approaching       (1.0 <= |z| < 1.5)
+      2 = near entry        (1.5 <= |z| < 2.0)
+      3 = entry zone        (|z| >= 2.0)
+    """
+
+    def __init__(
+        self,
+        recorder: BufferedJsonlMarketRecorder,
+        periodic_interval: int = 1000,
+    ) -> None:
+        self.recorder = recorder
+        self.periodic_interval = max(1, periodic_interval)
+        self._last_state: tuple[int, int] | None = None
+        self._last_emit_books: int = 0
+
+    @staticmethod
+    def _band_for(composite_z: object) -> int:
+        """Map absolute z-score to a band index."""
+        if not isinstance(composite_z, (int, float)):
+            return 0
+        az = abs(float(composite_z))
+        if az >= 2.0:
+            return 3
+        if az >= 1.5:
+            return 2
+        if az >= 1.0:
+            return 1
+        return 0
+
+    @staticmethod
+    def _sign_for(composite_z: object) -> int:
+        if not isinstance(composite_z, (int, float)):
+            return 0
+        value = float(composite_z)
+        if value > 0:
+            return 1
+        if value < 0:
+            return -1
+        return 0
+
+    def check(self, snapshot: dict[str, object], books: int) -> None:
+        if not snapshot.get("nt_spread_ready"):
+            return
+        composite_z = snapshot.get("nt_composite_zscore")
+        band = self._band_for(composite_z)
+        sign = self._sign_for(composite_z)
+        state = (sign, band)
+        periodic = (books - self._last_emit_books) >= self.periodic_interval
+        if state == self._last_state and not periodic:
+            return
+        state_change = state != self._last_state
+        payload: dict[str, object] = {
+            **snapshot,
+            "books": books,
+            "band": band,
+            "zscore_sign": sign,
+            "band_change": state_change,
+            "state_change": state_change,
+        }
+        self.recorder.write("nt_spread_status", payload)
+        self._last_state = state
+        self._last_emit_books = books
+
+
 def _write_execution_events(
     recorder: BufferedJsonlMarketRecorder,
     events: list[ExecutionEvent],
@@ -491,6 +565,7 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
     stream = KabuWebSocketStream(client.websocket_base_url(), normalizer)
     signal_eval_logger = SignalEvaluationLogger(recorder, options.signal_eval_log_mode)
     micro_candidate_emitter = MicroCandidateEmitter(recorder)
+    nt_spread_emitter = NTSpreadEmitter(recorder)
     processed = 0
     market_data_errors = 0
     market_data_skips = 0
@@ -594,6 +669,7 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                     process_elapsed_ms = (time.perf_counter() - event_start) * 1000.0
                     process_time_total_ms += process_elapsed_ms
                     process_time_recent_ms.append(process_elapsed_ms)
+                    nt_spread_emitter.check(engine.nt_spread_snapshot(), processed)
                     if processed % heartbeat_interval == 0:
                         signal_eval_logger.flush()
                         elapsed = max(0.001, time.perf_counter() - started_perf)
@@ -630,6 +706,7 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                                 (datetime.now(timezone.utc) - received_at).total_seconds(),
                                 4,
                             ),
+                            "nt_spread": engine.nt_spread_snapshot(),
                             **_session_state_to_dict(session_state),
                         }
                         heartbeat.update(execution.heartbeat_metadata())
