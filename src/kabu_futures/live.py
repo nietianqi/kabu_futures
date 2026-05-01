@@ -136,6 +136,26 @@ def _process_time_summary(samples: deque[float]) -> dict[str, float | int]:
     }
 
 
+def _live_error_context(
+    *,
+    category: str | None,
+    last_received_at: datetime | None,
+    now: datetime,
+    process_time_recent_ms: deque[float],
+    websocket_recv_timeout_seconds: float,
+    websocket_ping_interval_seconds: float,
+) -> dict[str, object]:
+    process_summary = _process_time_summary(process_time_recent_ms)
+    return {
+        "websocket_error_kind": "remote_closed" if category == "websocket_remote_closed" else "runtime_or_os_error",
+        "websocket_last_receive_at": last_received_at.isoformat() if last_received_at else None,
+        "websocket_seconds_since_last_message": round((now - last_received_at).total_seconds(), 4) if last_received_at else None,
+        "websocket_recv_timeout_seconds": websocket_recv_timeout_seconds,
+        "websocket_ping_interval_seconds": websocket_ping_interval_seconds,
+        "process_time_summary": process_summary,
+    }
+
+
 def _compact_eval_metadata(metadata: dict[str, object]) -> dict[str, object]:
     keys = (
         "spread_ticks",
@@ -485,6 +505,7 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
     websocket_remote_closed_errors = 0
     last_live_error_at: str | None = None
     last_live_error_category: str | None = None
+    last_websocket_receive_at: datetime | None = None
     started_perf = time.perf_counter()
     heartbeat_interval = max(1, options.heartbeat_interval_events)
     error_sample_rate = max(1, options.error_console_sample_rate)
@@ -494,6 +515,7 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
         while True:
             try:
                 for raw, received_at in stream.iter_raw():
+                    last_websocket_receive_at = received_at
                     event_start = time.perf_counter()
                     try:
                         book = normalizer.normalize_raw(raw, received_at=received_at)
@@ -621,10 +643,19 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
             except (RuntimeError, OSError) as exc:
                 signal_eval_logger.flush()
                 live_errors += 1
-                last_live_error_at = datetime.now(timezone.utc).isoformat()
+                error_now = datetime.now(timezone.utc)
+                last_live_error_at = error_now.isoformat()
                 last_live_error_category = classify_kabu_api_error(exc)
                 if last_live_error_category == "websocket_remote_closed":
                     websocket_remote_closed_errors += 1
+                websocket_context = _live_error_context(
+                    category=last_live_error_category,
+                    last_received_at=last_websocket_receive_at,
+                    now=error_now,
+                    process_time_recent_ms=process_time_recent_ms,
+                    websocket_recv_timeout_seconds=stream.recv_timeout_seconds,
+                    websocket_ping_interval_seconds=stream.ping_interval_seconds,
+                )
                 error_payload = {
                     "error": str(exc),
                     "books": processed,
@@ -632,6 +663,7 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                     "timestamp": last_live_error_at,
                     "live_errors": live_errors,
                     "websocket_remote_closed_errors": websocket_remote_closed_errors,
+                    **websocket_context,
                 }
                 recorder.write("live_error", error_payload, force_flush=True)
                 print(

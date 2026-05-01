@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
+import math
 from typing import Any, Callable, TypeVar
 
 from .api import KabuApiError, KabuStationClient
@@ -1574,12 +1575,20 @@ def _order_id(response: dict[str, Any]) -> str | None:
 
 
 def _entry_limit_price(direction: Direction, signal_price: float, slippage_ticks: int, tick_size: float) -> float:
-    if slippage_ticks <= 0:
-        return signal_price
-    offset = slippage_ticks * tick_size
+    offset = max(slippage_ticks, 0) * tick_size
+    raw_price = signal_price + offset if direction == "long" else signal_price - offset
+    return _round_entry_price_to_tick(direction, raw_price, tick_size)
+
+
+def _round_entry_price_to_tick(direction: Direction, price: float, tick_size: float) -> float:
+    if tick_size <= 0:
+        return price
+    ticks = price / tick_size
     if direction == "long":
-        return signal_price + offset
-    return signal_price - offset
+        rounded = math.ceil(ticks - 1e-9) * tick_size
+    else:
+        rounded = math.floor(ticks + 1e-9) * tick_size
+    return round(rounded, 10)
 
 
 def _ratio(numerator: int, denominator: int) -> float:

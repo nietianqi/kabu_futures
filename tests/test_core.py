@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 import json
@@ -28,7 +28,7 @@ from kabu_futures.diagnostics_funnel import diagnosis_notes, latency_summary, mi
 from kabu_futures.engine import DualStrategyEngine
 from kabu_futures.evolution import analyze_micro_log, calculate_markout_ticks
 from kabu_futures.indicators import BarBuilder
-from kabu_futures.live import MicroCandidateEmitter, _should_print_tick, tick_to_dict, signal_to_dict
+from kabu_futures.live import MicroCandidateEmitter, _live_error_context, _should_print_tick, tick_to_dict, signal_to_dict
 from kabu_futures.live_api_health import LiveApiHealth
 from kabu_futures.live_execution import LiveExecutionController
 from kabu_futures.live_safety import LiveSafetyState
@@ -795,6 +795,27 @@ class MarketDataAndExecutionTests(unittest.TestCase):
 
     def test_winerror_10054_is_classified_as_websocket_remote_closed(self) -> None:
         self.assertEqual(classify_kabu_api_error("[WinError 10054] remote host closed"), "websocket_remote_closed")
+
+    def test_live_error_context_marks_remote_close_and_recent_processing(self) -> None:
+        last_received_at = datetime(2026, 5, 1, 3, 56, 6, tzinfo=timezone.utc)
+        now = datetime(2026, 5, 1, 3, 56, 8, 360200, tzinfo=timezone.utc)
+
+        context = _live_error_context(
+            category="websocket_remote_closed",
+            last_received_at=last_received_at,
+            now=now,
+            process_time_recent_ms=deque([100.0, 200.0, 2100.0]),
+            websocket_recv_timeout_seconds=30.0,
+            websocket_ping_interval_seconds=20.0,
+        )
+
+        self.assertEqual(context["websocket_error_kind"], "remote_closed")
+        self.assertEqual(context["websocket_last_receive_at"], last_received_at.isoformat())
+        self.assertEqual(context["websocket_seconds_since_last_message"], 2.3602)
+        self.assertEqual(context["websocket_recv_timeout_seconds"], 30.0)
+        self.assertEqual(context["websocket_ping_interval_seconds"], 20.0)
+        self.assertEqual(context["process_time_summary"]["recent_avg_process_ms"], 800.0)
+        self.assertEqual(context["process_time_summary"]["process_ms_max_recent"], 2100.0)
 
     def test_live_api_health_wrong_instance_cooldown_summary(self) -> None:
         health = LiveApiHealth(default_config())
@@ -2316,6 +2337,44 @@ class MarketDataAndExecutionTests(unittest.TestCase):
 
         self.assertEqual(short_events[0].event_type, "live_order_submitted")
         self.assertEqual(client.sent[1]["Price"], 49995.0)
+
+    def test_live_entry_rounds_fractional_signal_price_to_symbol_tick(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                return {"Result": 0, "OrderId": f"O{len(self.sent)}"}
+
+            def positions(self, **query: object) -> dict[str, object]:
+                return {"data": []}
+
+        client = FakeClient()
+        controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023", "TOPIXmini": "161060006"})  # type: ignore[arg-type]
+        ts = datetime(2026, 5, 1, 12, 49, tzinfo=JST)
+
+        short_events = controller.on_signal(
+            Signal("minute_vwap", "NK225micro", "short", 0.8, 59652.5, "trend_pullback_short", {"atr": 30.0, "execution_score": 10}),
+            book(ts, bid=59650, ask=59655),
+            exchange=23,
+        )
+
+        self.assertEqual(short_events[0].event_type, "live_order_submitted")
+        self.assertEqual(client.sent[0]["Price"], 59650.0)
+        self.assertEqual(short_events[0].metadata["entry_signal_price"], 59652.5)
+        self.assertEqual(short_events[0].metadata["entry_order_price"], 59650.0)
+
+        controller.pending_entry = None
+        controller.entry_signal = None
+        long_events = controller.on_signal(
+            Signal("micro_book", "TOPIXmini", "long", 0.8, 3770.875),
+            topix_book(ts),
+            exchange=23,
+        )
+
+        self.assertEqual(long_events[0].event_type, "live_order_submitted")
+        self.assertEqual(client.sent[1]["Price"], 3771.0)
 
     def test_live_take_profit_widens_to_two_ticks_after_slippage_fill(self) -> None:
         class FakeClient:
