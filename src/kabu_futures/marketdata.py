@@ -316,9 +316,20 @@ class KabuWebSocketStream:
     from strategy logic so tests and replays do not require live dependencies.
     """
 
-    def __init__(self, websocket_url: str, normalizer: KabuBoardNormalizer | None = None) -> None:
+    def __init__(
+        self,
+        websocket_url: str,
+        normalizer: KabuBoardNormalizer | None = None,
+        *,
+        ping_interval_seconds: float = 20.0,
+        ping_timeout_seconds: float = 10.0,
+        recv_timeout_seconds: float = 30.0,
+    ) -> None:
         self.websocket_url = websocket_url
         self.normalizer = normalizer or KabuBoardNormalizer()
+        self.ping_interval_seconds = ping_interval_seconds
+        self.ping_timeout_seconds = ping_timeout_seconds
+        self.recv_timeout_seconds = recv_timeout_seconds
 
     def iter_books(self) -> Iterator[OrderBook]:
         for raw, received_at in self.iter_raw():
@@ -329,10 +340,32 @@ class KabuWebSocketStream:
             import websocket  # type: ignore
         except ImportError as exc:
             raise RuntimeError("Install websocket-client to use KabuWebSocketStream") from exc
-        ws = websocket.create_connection(self.websocket_url)
+        ws = websocket.create_connection(self.websocket_url, timeout=self.recv_timeout_seconds)
+        last_ping = time.monotonic()
         try:
             while True:
+                try:
+                    raw = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    self._send_ping(ws)
+                    last_ping = time.monotonic()
+                    continue
+                now = time.monotonic()
+                if self.ping_interval_seconds > 0 and now - last_ping >= self.ping_interval_seconds:
+                    self._send_ping(ws)
+                    last_ping = now
                 received_at = datetime.now(timezone.utc)
-                yield ws.recv(), received_at
+                yield raw, received_at
         finally:
             ws.close()
+
+    def _send_ping(self, ws: Any) -> None:
+        if not hasattr(ws, "ping"):
+            return
+        if hasattr(ws, "settimeout"):
+            ws.settimeout(self.ping_timeout_seconds)
+        try:
+            ws.ping()
+        finally:
+            if hasattr(ws, "settimeout"):
+                ws.settimeout(self.recv_timeout_seconds)

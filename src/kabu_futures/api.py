@@ -31,6 +31,8 @@ def classify_kabu_api_error(error: object) -> str:
     if isinstance(error, KabuApiError) and error.category:
         return error.category
     text = str(error)
+    if "WinError 10054" in text or "10054" in text:
+        return "websocket_remote_closed"
     if WRONG_INSTANCE_MESSAGE in text:
         return "kabu_station_wrong_instance"
     if "auth_recovery_failed" in text:

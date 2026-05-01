@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 import json
@@ -21,18 +21,19 @@ from kabu_futures.alpha import (
     USJapanLeadLagScorer,
     compute_micro225_per_topix_mini,
 )
-from kabu_futures.api import KabuApiError, KabuStationClient, build_future_registration_symbols, extract_symbol_code
+from kabu_futures.api import KabuApiError, KabuStationClient, build_future_registration_symbols, classify_kabu_api_error, extract_symbol_code
 from kabu_futures.analysis_utils import iter_books, max_drawdown
 from kabu_futures.config import default_config, effective_micro_engine_config, load_json_config
 from kabu_futures.diagnostics_funnel import diagnosis_notes, latency_summary, micro_entry_funnel
 from kabu_futures.engine import DualStrategyEngine
 from kabu_futures.evolution import analyze_micro_log, calculate_markout_ticks
 from kabu_futures.indicators import BarBuilder
-from kabu_futures.live import MicroCandidateEmitter, _should_print_tick, tick_to_dict, signal_to_dict
+from kabu_futures.live import MicroCandidateEmitter, _live_error_context, _should_print_tick, tick_to_dict, signal_to_dict
 from kabu_futures.live_api_health import LiveApiHealth
 from kabu_futures.live_execution import LiveExecutionController
 from kabu_futures.live_safety import LiveSafetyState
 from kabu_futures.live_state import (
+    LivePositionSlot,
     LivePositionState,
     PendingLiveOrder,
     pending_summary,
@@ -42,7 +43,7 @@ from kabu_futures.live_state import (
 )
 from kabu_futures.log_diagnostics import diagnose_log
 from kabu_futures.microstructure import BookFeatureEngine, RollingPercentile, microprice, percentile, weighted_imbalance
-from kabu_futures.marketdata import BufferedJsonlMarketRecorder, KabuBoardNormalizer, MarketDataError, MarketDataSkip, signal_evaluation_to_dict
+from kabu_futures.marketdata import BufferedJsonlMarketRecorder, KabuBoardNormalizer, KabuWebSocketStream, MarketDataError, MarketDataSkip, signal_evaluation_to_dict
 from kabu_futures.models import (
     AlphaSignal,
     Bar,
@@ -735,6 +736,86 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertTrue(health.summary(ts)["auth_failed"])
         health.record_success()
         self.assertFalse(health.summary(ts)["auth_failed"])
+
+    def test_websocket_stream_sets_timeout_and_sends_ping_after_idle_timeout(self) -> None:
+        class FakeWebSocketModule:
+            class WebSocketTimeoutException(Exception):
+                pass
+
+            created: list[dict[str, object]] = []
+
+            @classmethod
+            def create_connection(cls, url: str, timeout: float) -> "FakeSocket":
+                socket = FakeSocket()
+                cls.created.append({"url": url, "timeout": timeout, "socket": socket})
+                return socket
+
+        class FakeSocket:
+            def __init__(self) -> None:
+                self.recv_calls = 0
+                self.pings = 0
+                self.timeouts: list[float] = []
+                self.closed = False
+
+            def recv(self) -> str:
+                self.recv_calls += 1
+                if self.recv_calls == 1:
+                    raise FakeWebSocketModule.WebSocketTimeoutException()
+                return '{"ok": true}'
+
+            def ping(self) -> None:
+                self.pings += 1
+
+            def settimeout(self, timeout: float) -> None:
+                self.timeouts.append(timeout)
+
+            def close(self) -> None:
+                self.closed = True
+
+        with patch.dict(sys.modules, {"websocket": FakeWebSocketModule}):
+            stream = KabuWebSocketStream(
+                "ws://example",
+                recv_timeout_seconds=12.0,
+                ping_interval_seconds=20.0,
+                ping_timeout_seconds=3.0,
+            )
+            iterator = stream.iter_raw()
+            raw, received_at = next(iterator)
+            iterator.close()
+
+        created = FakeWebSocketModule.created[0]
+        socket = created["socket"]
+        self.assertEqual(created["url"], "ws://example")
+        self.assertEqual(created["timeout"], 12.0)
+        self.assertEqual(raw, '{"ok": true}')
+        self.assertIsInstance(received_at, datetime)
+        self.assertEqual(socket.pings, 1)
+        self.assertEqual(socket.timeouts, [3.0, 12.0])
+        self.assertTrue(socket.closed)
+
+    def test_winerror_10054_is_classified_as_websocket_remote_closed(self) -> None:
+        self.assertEqual(classify_kabu_api_error("[WinError 10054] remote host closed"), "websocket_remote_closed")
+
+    def test_live_error_context_marks_remote_close_and_recent_processing(self) -> None:
+        last_received_at = datetime(2026, 5, 1, 3, 56, 6, tzinfo=timezone.utc)
+        now = datetime(2026, 5, 1, 3, 56, 8, 360200, tzinfo=timezone.utc)
+
+        context = _live_error_context(
+            category="websocket_remote_closed",
+            last_received_at=last_received_at,
+            now=now,
+            process_time_recent_ms=deque([100.0, 200.0, 2100.0]),
+            websocket_recv_timeout_seconds=30.0,
+            websocket_ping_interval_seconds=20.0,
+        )
+
+        self.assertEqual(context["websocket_error_kind"], "remote_closed")
+        self.assertEqual(context["websocket_last_receive_at"], last_received_at.isoformat())
+        self.assertEqual(context["websocket_seconds_since_last_message"], 2.3602)
+        self.assertEqual(context["websocket_recv_timeout_seconds"], 30.0)
+        self.assertEqual(context["websocket_ping_interval_seconds"], 20.0)
+        self.assertEqual(context["process_time_summary"]["recent_avg_process_ms"], 800.0)
+        self.assertEqual(context["process_time_summary"]["process_ms_max_recent"], 2100.0)
 
     def test_live_api_health_wrong_instance_cooldown_summary(self) -> None:
         health = LiveApiHealth(default_config())
@@ -1464,6 +1545,40 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertEqual(diagnostics["loss_hold_guard_samples"][0]["snapshot"]["worst_unrealized_ticks"], -20.0)
         self.assertEqual(diagnostics["loss_hold_guard_samples"][0]["later_exit_reason"], "take_profit")
         self.assertEqual(diagnostics["loss_hold_guard_samples"][0]["later_pnl_ticks"], 2.0)
+
+    def test_diagnose_log_classifies_websocket_disconnect_and_process_metrics(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "live_error.jsonl"
+            rows = [
+                {
+                    "kind": "live_error",
+                    "payload": {
+                        "event": "live_error",
+                        "error": "[WinError 10054] remote host closed",
+                        "category": "websocket_remote_closed",
+                    },
+                },
+                {
+                    "kind": "heartbeat",
+                    "payload": {
+                        "event": "heartbeat",
+                        "avg_process_ms": 10.0,
+                        "recent_avg_process_ms": 2.0,
+                        "process_ms_p95": 3.0,
+                        "process_ms_max_recent": 4.0,
+                    },
+                },
+            ]
+            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+
+            diagnostics = diagnose_log(path, default_config())
+
+        self.assertEqual(diagnostics["api_error_categories"]["websocket_remote_closed"], 1)
+        self.assertIn("websocket_remote_closed_reconnects_detected", diagnostics["diagnosis_notes"])
+        process_metrics = diagnostics["process_time_metrics"]
+        self.assertEqual(process_metrics["field_semantics"]["avg_process_ms"], "cumulative_session_average")
+        self.assertEqual(process_metrics["summary"]["avg_process_ms_cumulative"]["p50"], 10.0)
+        self.assertEqual(process_metrics["summary"]["recent_avg_process_ms"]["p50"], 2.0)
 
     def test_micro_trade_manager_exits_on_take_profit(self) -> None:
         cfg = default_config()
@@ -2222,6 +2337,44 @@ class MarketDataAndExecutionTests(unittest.TestCase):
 
         self.assertEqual(short_events[0].event_type, "live_order_submitted")
         self.assertEqual(client.sent[1]["Price"], 49995.0)
+
+    def test_live_entry_rounds_fractional_signal_price_to_symbol_tick(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                return {"Result": 0, "OrderId": f"O{len(self.sent)}"}
+
+            def positions(self, **query: object) -> dict[str, object]:
+                return {"data": []}
+
+        client = FakeClient()
+        controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023", "TOPIXmini": "161060006"})  # type: ignore[arg-type]
+        ts = datetime(2026, 5, 1, 12, 49, tzinfo=JST)
+
+        short_events = controller.on_signal(
+            Signal("minute_vwap", "NK225micro", "short", 0.8, 59652.5, "trend_pullback_short", {"atr": 30.0, "execution_score": 10}),
+            book(ts, bid=59650, ask=59655),
+            exchange=23,
+        )
+
+        self.assertEqual(short_events[0].event_type, "live_order_submitted")
+        self.assertEqual(client.sent[0]["Price"], 59650.0)
+        self.assertEqual(short_events[0].metadata["entry_signal_price"], 59652.5)
+        self.assertEqual(short_events[0].metadata["entry_order_price"], 59650.0)
+
+        controller.pending_entry = None
+        controller.entry_signal = None
+        long_events = controller.on_signal(
+            Signal("micro_book", "TOPIXmini", "long", 0.8, 3770.875),
+            topix_book(ts),
+            exchange=23,
+        )
+
+        self.assertEqual(long_events[0].event_type, "live_order_submitted")
+        self.assertEqual(client.sent[1]["Price"], 3771.0)
 
     def test_live_take_profit_widens_to_two_ticks_after_slippage_fill(self) -> None:
         class FakeClient:
@@ -3029,6 +3182,120 @@ class MarketDataAndExecutionTests(unittest.TestCase):
         self.assertEqual(blocked_events[0].reason, "loss_hold_guard_active")
         self.assertTrue(heartbeat["live_guard_state"]["loss_hold_guard_active"])
         self.assertTrue(heartbeat["live_guard_state"]["auto_loss_close_disabled"])
+        self.assertEqual(len([payload for payload in client.sent if payload["TradeType"] == 2]), 0)
+
+    def test_loss_hold_guard_skips_suspect_jump_mark_price(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+                self.position_open = False
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                if payload["TradeType"] == 1:
+                    self.position_open = True
+                return {"Result": 0, "OrderId": f"O{len(self.sent)}"}
+
+            def positions(self, **query: object) -> dict[str, object]:
+                if not self.position_open:
+                    return {"data": []}
+                return {
+                    "data": [
+                        {
+                            "ExecutionID": "E1",
+                            "Symbol": "161060023",
+                            "Exchange": 24,
+                            "Price": 50005,
+                            "LeavesQty": 1,
+                            "Side": "2",
+                            "HoldID": "H1",
+                        }
+                    ]
+                }
+
+            def orders(self, **query: object) -> dict[str, object]:
+                return {
+                    "data": [
+                        {
+                            "ID": query.get("id", "O1"),
+                            "State": 5,
+                            "OrderState": 5,
+                            "OrderQty": 1,
+                            "CumQty": 1,
+                            "Details": [{"RecType": 8, "State": 0, "Qty": 1, "Price": 50005, "ExecutionID": "E1"}],
+                        }
+                    ]
+                }
+
+        client = FakeClient()
+        controller = LiveExecutionController(client, default_config(), {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+        controller.on_signal(Signal("micro_book", "NK225micro", "long", 0.8, 50005), book(ts), exchange=24)
+        suspect_features = BookFeatures(
+            timestamp=ts + timedelta(seconds=2),
+            symbol="NK225micro",
+            spread_ticks=6.0,
+            imbalance=0.0,
+            ofi=0.0,
+            ofi_ewma=0.0,
+            ofi_threshold=0.0,
+            microprice=49930.0,
+            microprice_edge_ticks=0.0,
+            total_depth=1.0,
+            jump_detected=True,
+            jump_reason="spread_wide",
+        )
+
+        events = controller.on_book(book(ts + timedelta(seconds=2), bid=49925, ask=49955), suspect_features, exchange=24)
+        heartbeat = controller.heartbeat_metadata()
+
+        self.assertIn("loss_hold_guard_mark_price_suspect", [event.reason for event in events])
+        self.assertNotIn("loss_hold_guard_active", [event.reason for event in events])
+        self.assertFalse(heartbeat["live_guard_state"]["loss_hold_guard_active"])
+        self.assertTrue(all(payload.get("FrontOrderType") != 120 for payload in client.sent if payload["TradeType"] == 2))
+
+    def test_loss_hold_guard_clears_when_position_flat_confirmed(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+
+            def sendorder_future(self, payload: dict[str, object]) -> dict[str, object]:
+                self.sent.append(payload)
+                return {"Result": 0, "OrderId": f"O{len(self.sent)}"}
+
+            def positions(self, **query: object) -> dict[str, object]:
+                return {"data": []}
+
+            def orders(self, **query: object) -> dict[str, object]:
+                return {"data": []}
+
+        cfg = default_config()
+        client = FakeClient()
+        controller = LiveExecutionController(client, cfg, {"NK225micro": "161060023"})  # type: ignore[arg-type]
+        ts = datetime(2026, 4, 27, 21, 0, tzinfo=JST)
+        position = LivePositionState("NK225micro", "161060023", 24, "long", 1, 50005.0, ts, "H1")
+        controller.live_positions[position_key(position)] = LivePositionSlot(
+            position,
+            object(),
+            Signal("micro_book", "NK225micro", "long", 0.8, 50005),
+        )
+        controller.loss_hold_guard_active = True
+        controller.loss_hold_guard_since = ts
+        controller.loss_hold_guard_reason = "unrealized_loss_ticks_limit"
+        controller.loss_hold_guard_snapshot = {"worst_unrealized_ticks": -20.0}
+
+        events = controller.on_book(book(ts + timedelta(seconds=1)), None, exchange=24)
+        flat_events = [event for event in events if event.event_type == "live_position_flat"]
+        next_signal_events = controller.on_signal(
+            Signal("micro_book", "NK225micro", "long", 0.8, 50005),
+            book(ts + timedelta(seconds=2)),
+            exchange=24,
+        )
+
+        self.assertEqual(len(flat_events), 1)
+        self.assertTrue(flat_events[0].metadata["loss_hold_guard_cleared"])
+        self.assertFalse(controller.heartbeat_metadata()["live_guard_state"]["loss_hold_guard_active"])
+        self.assertNotEqual(next_signal_events[0].reason, "loss_hold_guard_active")
         self.assertEqual(len([payload for payload in client.sent if payload["TradeType"] == 2]), 0)
 
     def test_loss_hold_guard_after_position_sync_rejects_without_submitting_close_order(self) -> None:

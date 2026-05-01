@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -8,6 +9,7 @@ import time
 from typing import Any, Literal
 
 from .api import KabuStationClient, build_future_registration_symbols
+from .api import classify_kabu_api_error
 from .config import StrategyConfig
 from .engine import DualStrategyEngine
 from .live_execution import LiveExecutionController
@@ -113,6 +115,45 @@ def _should_log_book(mode: BookLogMode, processed: int, sample_interval: int) ->
     if mode == "sample":
         return processed % max(1, sample_interval) == 0
     return False
+
+
+def _process_time_summary(samples: deque[float]) -> dict[str, float | int]:
+    if not samples:
+        return {
+            "recent_avg_process_ms": 0.0,
+            "process_ms_p95": 0.0,
+            "process_ms_max_recent": 0.0,
+            "process_time_window": 0,
+        }
+    values = list(samples)
+    ordered = sorted(values)
+    p95_index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * 0.95))))
+    return {
+        "recent_avg_process_ms": round(sum(values) / len(values), 4),
+        "process_ms_p95": round(ordered[p95_index], 4),
+        "process_ms_max_recent": round(ordered[-1], 4),
+        "process_time_window": len(values),
+    }
+
+
+def _live_error_context(
+    *,
+    category: str | None,
+    last_received_at: datetime | None,
+    now: datetime,
+    process_time_recent_ms: deque[float],
+    websocket_recv_timeout_seconds: float,
+    websocket_ping_interval_seconds: float,
+) -> dict[str, object]:
+    process_summary = _process_time_summary(process_time_recent_ms)
+    return {
+        "websocket_error_kind": "remote_closed" if category == "websocket_remote_closed" else "runtime_or_os_error",
+        "websocket_last_receive_at": last_received_at.isoformat() if last_received_at else None,
+        "websocket_seconds_since_last_message": round((now - last_received_at).total_seconds(), 4) if last_received_at else None,
+        "websocket_recv_timeout_seconds": websocket_recv_timeout_seconds,
+        "websocket_ping_interval_seconds": websocket_ping_interval_seconds,
+        "process_time_summary": process_summary,
+    }
 
 
 def _compact_eval_metadata(metadata: dict[str, object]) -> dict[str, object]:
@@ -459,6 +500,12 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
     signal_reject_count = 0
     execution_events_count = 0
     process_time_total_ms = 0.0
+    process_time_recent_ms: deque[float] = deque(maxlen=1000)
+    live_errors = 0
+    websocket_remote_closed_errors = 0
+    last_live_error_at: str | None = None
+    last_live_error_category: str | None = None
+    last_websocket_receive_at: datetime | None = None
     started_perf = time.perf_counter()
     heartbeat_interval = max(1, options.heartbeat_interval_events)
     error_sample_rate = max(1, options.error_console_sample_rate)
@@ -468,6 +515,7 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
         while True:
             try:
                 for raw, received_at in stream.iter_raw():
+                    last_websocket_receive_at = received_at
                     event_start = time.perf_counter()
                     try:
                         book = normalizer.normalize_raw(raw, received_at=received_at)
@@ -543,17 +591,30 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                             execution_events = execution.on_signal(signal, book)
                         execution_events_count += len(execution_events)
                         _write_execution_events(recorder, execution_events, options.paper_console)
-                    process_time_total_ms += (time.perf_counter() - event_start) * 1000.0
+                    process_elapsed_ms = (time.perf_counter() - event_start) * 1000.0
+                    process_time_total_ms += process_elapsed_ms
+                    process_time_recent_ms.append(process_elapsed_ms)
                     if processed % heartbeat_interval == 0:
                         signal_eval_logger.flush()
                         elapsed = max(0.001, time.perf_counter() - started_perf)
+                        process_summary = _process_time_summary(process_time_recent_ms)
+                        avg_process_ms = round(process_time_total_ms / processed, 4)
                         heartbeat = {
                             "event": "heartbeat",
                             "books": processed,
                             "books_per_sec": round(processed / elapsed, 2),
-                            "avg_process_ms": round(process_time_total_ms / processed, 4),
+                            "avg_process_ms": avg_process_ms,
+                            "avg_process_ms_cumulative": avg_process_ms,
+                            "recent_avg_process_ms": process_summary["recent_avg_process_ms"],
+                            "process_ms_p95": process_summary["process_ms_p95"],
+                            "process_ms_max_recent": process_summary["process_ms_max_recent"],
+                            "process_time_window": process_summary["process_time_window"],
                             "market_data_errors": market_data_errors,
                             "market_data_skips": market_data_skips,
+                            "live_errors": live_errors,
+                            "websocket_remote_closed_errors": websocket_remote_closed_errors,
+                            "last_live_error_at": last_live_error_at,
+                            "last_live_error_category": last_live_error_category,
                             "signals_count": signals_count,
                             "signal_eval_count": signal_eval_count,
                             "signal_allow_count": signal_allow_count,
@@ -581,8 +642,40 @@ def run_live(config: StrategyConfig, password: str, options: LiveRunOptions | No
                         return 0
             except (RuntimeError, OSError) as exc:
                 signal_eval_logger.flush()
-                recorder.write("live_error", {"error": str(exc), "books": processed}, force_flush=True)
-                print(json.dumps({"event": "live_error", "error": str(exc), "reconnect_seconds": options.reconnect_seconds}, ensure_ascii=False))
+                live_errors += 1
+                error_now = datetime.now(timezone.utc)
+                last_live_error_at = error_now.isoformat()
+                last_live_error_category = classify_kabu_api_error(exc)
+                if last_live_error_category == "websocket_remote_closed":
+                    websocket_remote_closed_errors += 1
+                websocket_context = _live_error_context(
+                    category=last_live_error_category,
+                    last_received_at=last_websocket_receive_at,
+                    now=error_now,
+                    process_time_recent_ms=process_time_recent_ms,
+                    websocket_recv_timeout_seconds=stream.recv_timeout_seconds,
+                    websocket_ping_interval_seconds=stream.ping_interval_seconds,
+                )
+                error_payload = {
+                    "error": str(exc),
+                    "books": processed,
+                    "category": last_live_error_category,
+                    "timestamp": last_live_error_at,
+                    "live_errors": live_errors,
+                    "websocket_remote_closed_errors": websocket_remote_closed_errors,
+                    **websocket_context,
+                }
+                recorder.write("live_error", error_payload, force_flush=True)
+                print(
+                    json.dumps(
+                        {
+                            "event": "live_error",
+                            **error_payload,
+                            "reconnect_seconds": options.reconnect_seconds,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
                 time.sleep(options.reconnect_seconds)
     except KeyboardInterrupt:
         signal_eval_logger.flush()
